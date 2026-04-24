@@ -320,12 +320,14 @@ export {
 
 export {
   createIssueWorkProductSchema,
+  issueWorkProductMetadataSchema,
   updateIssueWorkProductSchema,
   attachmentArtifactWorkProductMetadataSchema,
   issueWorkProductTypeSchema,
   issueWorkProductStatusSchema,
   issueWorkProductReviewStateSchema,
   type CreateIssueWorkProduct,
+  type IssueWorkProductMetadata,
   type UpdateIssueWorkProduct,
 } from "./work-product.js";
 
