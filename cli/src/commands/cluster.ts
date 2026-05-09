@@ -77,6 +77,10 @@ export interface TenantPolicy {
   limitRange: Record<string, unknown> | null;
   additionalAllowFqdns: string[];
   imageOverrides: Record<string, string> | null;
+  /** Cilium DSL: tenant-restrictive FQDN allow-list, intersected with M1 baseline. */
+  ciliumDnsAllowlist: string[];
+  /** Cilium DSL: tenant-restrictive CIDR allow-list, intersected with M1 baseline. */
+  ciliumEgressCidrs: string[];
 }
 
 export interface TenantPolicyRow extends TenantPolicy {
@@ -370,6 +374,8 @@ async function cmdEnsureTenant(argv: string[], deps: ClusterCommandDeps): Promis
           limitRange: tp.limitRange,
           additionalAllowFqdns: tp.additionalAllowFqdns,
           imageOverrides: tp.imageOverrides,
+          ciliumDnsAllowlist: tp.ciliumDnsAllowlist,
+          ciliumEgressCidrs: tp.ciliumEgressCidrs,
         }
       : null,
     driverServiceAccount: {
