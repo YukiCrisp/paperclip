@@ -32,3 +32,9 @@ export type {
   ClusterCapabilities,
   KubernetesApiClient,
 } from "./types.js";
+
+export {
+  ADAPTER_DEFAULTS,
+  getAdapterDefaults,
+  type AdapterDefaults,
+} from "./orchestrator/adapter-defaults.js";
