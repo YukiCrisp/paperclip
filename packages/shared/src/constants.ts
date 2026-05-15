@@ -963,6 +963,7 @@ export const PLUGIN_UI_SLOT_ENTITY_TYPES = [
   "run",
   "comment",
   "execution_workspace",
+  "project_workspace",
 ] as const;
 export type PluginUiSlotEntityType = (typeof PLUGIN_UI_SLOT_ENTITY_TYPES)[number];
 

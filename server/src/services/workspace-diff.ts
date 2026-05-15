@@ -44,6 +44,8 @@ interface PatchBudget {
   totalPatchBytes: number;
 }
 
+type WorkspaceDiffTarget = Pick<ExecutionWorkspace, "id" | "companyId" | "cwd" | "baseRef">;
+
 function warning(code: WorkspaceDiffWarningCode, message: string, filePath: string | null = null): WorkspaceDiffWarning {
   return { code, message, path: filePath };
 }
@@ -94,7 +96,7 @@ function isWithinDirectory(childPath: string, parentPath: string) {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-async function resolveWorkspacePaths(workspace: ExecutionWorkspace) {
+async function resolveWorkspacePaths(workspace: WorkspaceDiffTarget) {
   if (!workspace.cwd?.trim()) {
     throw workspaceDiffError(
       "missing_cwd",
@@ -548,7 +550,7 @@ async function resolveHeadSha(cwd: string) {
   }
 }
 
-async function resolveBaseRef(cwd: string, baseRef: string | null, workspace: ExecutionWorkspace) {
+async function resolveBaseRef(cwd: string, baseRef: string | null, workspace: WorkspaceDiffTarget) {
   const resolvedBaseRef = baseRef ?? workspace.baseRef ?? null;
   if (!resolvedBaseRef) {
     throw workspaceDiffError(
@@ -575,7 +577,7 @@ async function resolveBaseRef(cwd: string, baseRef: string | null, workspace: Ex
 
 async function collectFiles(input: {
   cwd: string;
-  workspace: ExecutionWorkspace;
+  workspace: WorkspaceDiffTarget;
   query: WorkspaceDiffQueryOptions;
   paths: string[];
 }) {
@@ -606,7 +608,7 @@ async function collectFiles(input: {
 
 export function workspaceDiffService() {
   return {
-    async getDiff(workspace: ExecutionWorkspace, query: WorkspaceDiffQueryOptions): Promise<WorkspaceDiffResponse> {
+    async getDiff(workspace: WorkspaceDiffTarget, query: WorkspaceDiffQueryOptions): Promise<WorkspaceDiffResponse> {
       const { cwd, repoRoot } = await resolveWorkspacePaths(workspace);
       const paths = normalizePathFilters(query.paths);
       const warnings: WorkspaceDiffWarning[] = [];

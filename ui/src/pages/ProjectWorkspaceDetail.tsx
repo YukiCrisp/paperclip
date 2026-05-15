@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "@/lib/router";
+import { Link, useLocation, useNavigate, useParams } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { isUuidLike, type ProjectWorkspace } from "@paperclipai/shared";
 import { ArrowLeft, Check, ExternalLink, Loader2, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { Tabs } from "@/components/ui/tabs";
 import { ChoosePathButton } from "../components/PathInstructionsModal";
 import { projectsApi } from "../api/projects";
+import { PageTabBar } from "../components/PageTabBar";
+import { PluginSlotMount, usePluginSlots } from "@/plugins/slots";
 import {
   buildWorkspaceRuntimeControlSections,
   WorkspaceRuntimeControls,
@@ -35,6 +38,13 @@ type WorkspaceFormState = {
 
 type ProjectWorkspaceSourceType = ProjectWorkspace["sourceType"];
 type ProjectWorkspaceVisibility = ProjectWorkspace["visibility"];
+type ProjectWorkspaceBaseTab = "configuration";
+type ProjectWorkspacePluginTab = `plugin:${string}`;
+type ProjectWorkspaceTab = ProjectWorkspaceBaseTab | ProjectWorkspacePluginTab;
+
+function isProjectWorkspacePluginTab(value: string | null): value is ProjectWorkspacePluginTab {
+  return typeof value === "string" && value.startsWith("plugin:");
+}
 
 const SOURCE_TYPE_OPTIONS: Array<{ value: ProjectWorkspaceSourceType; label: string; description: string }> = [
   { value: "local_path", label: "Local git checkout", description: "A local path Paperclip can use directly." },
@@ -217,6 +227,7 @@ export function ProjectWorkspaceDetail() {
   }>();
   const { companies, selectedCompanyId, setSelectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const location = useLocation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [form, setForm] = useState<WorkspaceFormState | null>(null);
@@ -224,6 +235,11 @@ export function ProjectWorkspaceDetail() {
   const [runtimeActionMessage, setRuntimeActionMessage] = useState<string | null>(null);
   const routeProjectRef = projectId ?? "";
   const routeWorkspaceId = workspaceId ?? "";
+  const pluginTabFromSearch = useMemo(() => {
+    const tab = new URLSearchParams(location.search).get("tab");
+    return isProjectWorkspacePluginTab(tab) ? tab : null;
+  }, [location.search]);
+  const activeTab: ProjectWorkspaceTab = pluginTabFromSearch ?? "configuration";
 
   const routeCompanyId = useMemo(() => {
     if (!companyPrefix) return null;
@@ -247,6 +263,21 @@ export function ProjectWorkspaceDetail() {
   const canonicalProjectRef = project ? projectRouteRef(project) : routeProjectRef;
   const initialState = useMemo(() => (workspace ? formStateFromWorkspace(workspace) : null), [workspace]);
   const isDirty = Boolean(form && initialState && JSON.stringify(form) !== JSON.stringify(initialState));
+  const { slots: pluginDetailSlots } = usePluginSlots({
+    slotTypes: ["detailTab"],
+    entityType: "project_workspace",
+    companyId: project?.companyId ?? null,
+    enabled: Boolean(project?.companyId),
+  });
+  const pluginTabItems = useMemo(
+    () => pluginDetailSlots.map((slot) => ({
+      value: `plugin:${slot.pluginKey}:${slot.id}` as ProjectWorkspacePluginTab,
+      label: slot.displayName,
+      slot,
+    })),
+    [pluginDetailSlots],
+  );
+  const activePluginTab = pluginTabItems.find((item) => item.value === activeTab) ?? null;
 
   useEffect(() => {
     if (!project?.companyId || project.companyId === selectedCompanyId) return;
@@ -363,6 +394,14 @@ export function ProjectWorkspaceDetail() {
   };
 
   const sourceTypeDescription = SOURCE_TYPE_OPTIONS.find((option) => option.value === form.sourceType)?.description ?? null;
+  const handleTabChange = (tab: ProjectWorkspaceTab) => {
+    const workspacePath = projectWorkspaceUrl(project, routeWorkspaceId);
+    if (isProjectWorkspacePluginTab(tab)) {
+      navigate(`${workspacePath}?tab=${encodeURIComponent(tab)}`);
+      return;
+    }
+    navigate(workspacePath);
+  };
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -378,6 +417,19 @@ export function ProjectWorkspaceDetail() {
         </div>
       </div>
 
+      <Tabs value={activeTab} onValueChange={(value) => handleTabChange(value as ProjectWorkspaceTab)}>
+        <PageTabBar
+          items={[
+            { value: "configuration", label: "Configuration" },
+            ...pluginTabItems.map((item) => ({ value: item.value, label: item.label })),
+          ]}
+          align="start"
+          value={activeTab}
+          onValueChange={(value) => handleTabChange(value as ProjectWorkspaceTab)}
+        />
+      </Tabs>
+
+      {activeTab === "configuration" ? (
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1.4fr)_minmax(18rem,0.9fr)]">
         <div className="space-y-6">
           <div className="rounded-2xl border border-border bg-card p-5">
@@ -643,6 +695,21 @@ export function ProjectWorkspaceDetail() {
           </div>
         </div>
       </div>
+      ) : null}
+
+      {activePluginTab ? (
+        <PluginSlotMount
+          slot={activePluginTab.slot}
+          context={{
+            companyId: project.companyId,
+            companyPrefix: companyPrefix ?? null,
+            projectId: project.id,
+            entityId: workspace.id,
+            entityType: "project_workspace",
+          }}
+          missingBehavior="placeholder"
+        />
+      ) : null}
     </div>
   );
 }

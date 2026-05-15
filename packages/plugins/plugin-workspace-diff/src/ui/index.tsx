@@ -19,6 +19,7 @@ import {
 
 type WorkspaceDiffData = WorkspaceDiffResponse;
 type WorkspacePatchDiffOptions = PatchDiffProps<undefined>["options"];
+type DiffViewMode = "working-tree" | "head";
 
 function buttonClass(active = false) {
   return [
@@ -272,17 +273,22 @@ function CollapsedFilePanel({
 export function ChangesTab({ context }: PluginDetailTabProps) {
   const toast = usePluginToast();
   const [mode, setMode] = useState<DiffRenderMode>("split");
+  const [view, setView] = useState<DiffViewMode>("working-tree");
+  const [baseRef, setBaseRef] = useState("");
   const [includeUntracked, setIncludeUntracked] = useState(false);
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(() => new Set());
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const fileSectionRefs = useRef(new Map<string, HTMLElement>());
+  const diffScrollRef = useRef<HTMLElement | null>(null);
+  const scrollSyncFrameRef = useRef<number | null>(null);
 
   const params = useMemo(() => ({
     workspaceId: context.entityId,
     companyId: context.companyId ?? "",
-    view: "working-tree",
+    view,
+    baseRef: baseRef.trim() || null,
     includeUntracked,
-  }), [context.companyId, context.entityId, includeUntracked]);
+  }), [baseRef, context.companyId, context.entityId, includeUntracked, view]);
 
   const { data, loading, error, refresh } = usePluginData<WorkspaceDiffData>("workspace-diff", params);
   const files = useMemo(() => toFileViewModels(data), [data]);
@@ -305,6 +311,36 @@ export function ChangesTab({ context }: PluginDetailTabProps) {
     });
   }, []);
 
+  const syncSelectedPathFromScroll = useCallback(() => {
+    const container = diffScrollRef.current;
+    if (!container || files.length === 0) return;
+
+    const containerTop = container.getBoundingClientRect().top;
+    let nextPath = files[0]?.path ?? null;
+    for (const file of files) {
+      const section = fileSectionRefs.current.get(file.path);
+      if (!section) continue;
+      const offsetFromScrollTop = section.getBoundingClientRect().top - containerTop;
+      if (offsetFromScrollTop <= 48) {
+        nextPath = file.path;
+      } else {
+        break;
+      }
+    }
+
+    if (nextPath) {
+      setSelectedPath((current) => current === nextPath ? current : nextPath);
+    }
+  }, [files]);
+
+  const handleDiffScroll = useCallback(() => {
+    if (scrollSyncFrameRef.current !== null) return;
+    scrollSyncFrameRef.current = window.requestAnimationFrame(() => {
+      scrollSyncFrameRef.current = null;
+      syncSelectedPathFromScroll();
+    });
+  }, [syncSelectedPathFromScroll]);
+
   useEffect(() => {
     if (files.length === 0) {
       setExpandedFiles(new Set());
@@ -314,6 +350,14 @@ export function ChangesTab({ context }: PluginDetailTabProps) {
     setExpandedFiles(initialExpandedFileSet(files));
     setSelectedPath((current) => files.some((file) => file.path === current) ? current : files[0]?.path ?? null);
   }, [files]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollSyncFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollSyncFrameRef.current);
+      }
+    };
+  }, []);
 
   const copyPath = async (filePath: string) => {
     try {
@@ -352,14 +396,34 @@ export function ChangesTab({ context }: PluginDetailTabProps) {
               Unified
             </button>
           </div>
-          <button
-            key="untracked"
-            type="button"
-            className={buttonClass(includeUntracked)}
-            onClick={() => setIncludeUntracked((value) => !value)}
-          >
-            {includeUntracked ? "Untracked shown" : "Show untracked"}
-          </button>
+          <div key="view" className="inline-flex gap-1" aria-label="Diff comparison">
+            <button key="working-tree" type="button" className={buttonClass(view === "working-tree")} onClick={() => setView("working-tree")}>
+              Working tree
+            </button>
+            <button key="head" type="button" className={buttonClass(view === "head")} onClick={() => setView("head")}>
+              Against ref
+            </button>
+          </div>
+          {view === "head" ? (
+            <input
+              key="base-ref"
+              className="h-8 w-40 rounded-md border border-border bg-background px-2.5 font-mono text-xs outline-none transition-colors placeholder:text-muted-foreground focus:border-foreground/40"
+              value={baseRef}
+              onChange={(event) => setBaseRef(event.target.value)}
+              placeholder="origin/master"
+              aria-label="Base ref"
+            />
+          ) : null}
+          {view === "working-tree" ? (
+            <button
+              key="untracked"
+              type="button"
+              className={buttonClass(includeUntracked)}
+              onClick={() => setIncludeUntracked((value) => !value)}
+            >
+              {includeUntracked ? "Untracked shown" : "Show untracked"}
+            </button>
+          ) : null}
           <button key="refresh" type="button" className={buttonClass(false)} onClick={() => refresh()}>
             Refresh
           </button>
@@ -393,7 +457,12 @@ export function ChangesTab({ context }: PluginDetailTabProps) {
             </div>
           </aside>
 
-          <main key="diffs" className="max-h-[70vh] min-w-0 space-y-3 overflow-auto lg:h-full lg:max-h-none lg:pr-1">
+          <main
+            key="diffs"
+            ref={diffScrollRef}
+            className="max-h-[70vh] min-w-0 space-y-3 overflow-auto lg:h-full lg:max-h-none lg:pr-1"
+            onScroll={handleDiffScroll}
+          >
             {files
               .map((file) => (
                 <section
@@ -402,19 +471,31 @@ export function ChangesTab({ context }: PluginDetailTabProps) {
                   className={file.path === selectedFile?.path ? "scroll-mt-2" : undefined}
                 >
                   <div key="header" className="flex min-w-0 items-center justify-between gap-3 border border-b-0 border-border bg-muted/35 px-3 py-2">
-                    <button
-                      key="select"
-                      type="button"
-                      className="min-w-0 text-left"
-                      onClick={() => selectFile(file.path)}
-                    >
-                      <div key="path" className="truncate text-sm font-medium">{file.path}</div>
-                      {file.oldPath ? (
-                        <div key="old-path" className="truncate font-mono text-[11px] text-muted-foreground">
-                          from {file.oldPath}
-                        </div>
-                      ) : null}
-                    </button>
+                    <div key="left" className="flex min-w-0 items-start gap-2">
+                      <button
+                        key="collapse"
+                        type="button"
+                        className="mt-0.5 text-muted-foreground hover:text-foreground"
+                        title={expandedFiles.has(file.path) ? "Collapse file" : "Expand file"}
+                        aria-label={expandedFiles.has(file.path) ? `Collapse ${file.path}` : `Expand ${file.path}`}
+                        onClick={() => setExpandedFiles((current) => nextExpandedFileSet(current, file.path))}
+                      >
+                        {expandedFiles.has(file.path) ? "−" : "+"}
+                      </button>
+                      <button
+                        key="select"
+                        type="button"
+                        className="min-w-0 text-left"
+                        onClick={() => selectFile(file.path)}
+                      >
+                        <div key="path" className="truncate text-sm font-medium">{file.path}</div>
+                        {file.oldPath ? (
+                          <div key="old-path" className="truncate font-mono text-[11px] text-muted-foreground">
+                            from {file.oldPath}
+                          </div>
+                        ) : null}
+                      </button>
+                    </div>
                     <div key="actions" className="flex shrink-0 items-center gap-1">
                       <button
                         key="copy"
@@ -425,16 +506,6 @@ export function ChangesTab({ context }: PluginDetailTabProps) {
                         onClick={() => void copyPath(file.path)}
                       >
                         ⧉
-                      </button>
-                      <button
-                        key="collapse"
-                        type="button"
-                        className={iconButtonClass(false)}
-                        title={expandedFiles.has(file.path) ? "Collapse file" : "Expand file"}
-                        aria-label={expandedFiles.has(file.path) ? `Collapse ${file.path}` : `Expand ${file.path}`}
-                        onClick={() => setExpandedFiles((current) => nextExpandedFileSet(current, file.path))}
-                      >
-                        {expandedFiles.has(file.path) ? "−" : "+"}
                       </button>
                     </div>
                   </div>

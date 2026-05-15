@@ -21,6 +21,9 @@ const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
 const mockWorkspaceOperationService = vi.hoisted(() => ({}));
+const mockWorkspaceDiffService = vi.hoisted(() => ({
+  getDiff: vi.fn(),
+}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
 
@@ -42,6 +45,10 @@ vi.mock("../services/environments.js", () => ({
 
 vi.mock("../services/secrets.js", () => ({
   secretService: () => mockSecretService,
+}));
+
+vi.mock("../services/workspace-diff.js", () => ({
+  workspaceDiffService: () => mockWorkspaceDiffService,
 }));
 
 vi.mock("../services/workspace-runtime.js", () => ({
@@ -68,6 +75,10 @@ function registerModuleMocks() {
 
   vi.doMock("../services/secrets.js", () => ({
     secretService: () => mockSecretService,
+  }));
+
+  vi.doMock("../services/workspace-diff.js", () => ({
+    workspaceDiffService: () => mockWorkspaceDiffService,
   }));
 
   vi.doMock("../services/workspace-runtime.js", () => ({
@@ -150,6 +161,37 @@ describe("project env routes", () => {
     mockProjectService.resolveByReference.mockResolvedValue({ ambiguous: false, project: null });
     mockProjectService.createWorkspace.mockResolvedValue(null);
     mockProjectService.listWorkspaces.mockResolvedValue([]);
+    mockWorkspaceDiffService.getDiff.mockResolvedValue({
+      workspaceId: "workspace-1",
+      companyId: "company-1",
+      repoRoot: "/tmp/project",
+      cwd: "/tmp/project",
+      view: "head",
+      baseRef: "origin/master",
+      headSha: "abc123",
+      includeUntracked: false,
+      paths: [],
+      files: [],
+      stats: {
+        fileCount: 0,
+        stagedFileCount: 0,
+        unstagedFileCount: 0,
+        untrackedFileCount: 0,
+        binaryFileCount: 0,
+        oversizedFileCount: 0,
+        truncatedFileCount: 0,
+        additions: 0,
+        deletions: 0,
+      },
+      warnings: [],
+      caps: {
+        maxFiles: 200,
+        maxFileBytes: 524288,
+        maxPatchBytes: 262144,
+        maxTotalPatchBytes: 1048576,
+      },
+      truncated: false,
+    });
     mockEnvironmentService.getById.mockReset();
     mockSecretService.normalizeEnvBindingsForPersistence.mockImplementation(async (_companyId, env) => env);
   });
@@ -218,5 +260,50 @@ describe("project env routes", () => {
         },
       }),
     );
+  });
+
+  it("returns project workspace diffs with explicit upstream refs", async () => {
+    mockProjectService.getById.mockResolvedValue(buildProject());
+    mockProjectService.listWorkspaces.mockResolvedValue([
+      {
+        id: "workspace-1",
+        companyId: "company-1",
+        projectId: "project-1",
+        name: "Primary",
+        sourceType: "local_path",
+        cwd: "/tmp/project",
+        repoUrl: null,
+        repoRef: "master",
+        defaultRef: "origin/master",
+        visibility: "default",
+        setupCommand: null,
+        cleanupCommand: null,
+        remoteProvider: null,
+        remoteWorkspaceRef: null,
+        sharedWorkspaceKey: null,
+        metadata: null,
+        runtimeConfig: null,
+        isPrimary: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+
+    const app = await createApp();
+    const res = await request(app)
+      .get("/api/projects/project-1/workspaces/workspace-1/diff?view=head&baseRef=origin/master&includeUntracked=false");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockWorkspaceDiffService.getDiff).toHaveBeenCalledWith({
+      id: "workspace-1",
+      companyId: "company-1",
+      cwd: "/tmp/project",
+      baseRef: "origin/master",
+    }, {
+      view: "head",
+      baseRef: "origin/master",
+      includeUntracked: false,
+      paths: [],
+    });
   });
 });

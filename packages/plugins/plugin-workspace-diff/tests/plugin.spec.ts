@@ -5,13 +5,13 @@ import plugin from "../src/worker.js";
 import { diffResponse } from "./fixtures.js";
 
 describe("workspace diff plugin", () => {
-  it("declares the execution workspace Changes tab and host diff capability", () => {
+  it("declares workspace Changes tabs and host diff capability", () => {
     expect(manifest.capabilities).toContain("ui.detailTab.register");
     expect(manifest.capabilities).toContain("execution.workspaces.read");
     expect(manifest.ui?.slots).toContainEqual(expect.objectContaining({
       type: "detailTab",
       displayName: "Changes",
-      entityTypes: ["execution_workspace"],
+      entityTypes: ["execution_workspace", "project_workspace"],
     }));
   });
 

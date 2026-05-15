@@ -7,6 +7,7 @@ import {
   heartbeatRuns,
   issues as issuesTable,
   pluginLogs,
+  projectWorkspaces as projectWorkspacesTable,
 } from "@paperclipai/db";
 import { eq, and, like, desc, inArray, sql } from "drizzle-orm";
 import type {
@@ -1206,10 +1207,32 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const workspace = await executionWorkspaces.getById(params.workspaceId);
-        if (!inCompany(workspace, companyId)) {
-          throw new Error("Execution workspace not found");
+        if (inCompany(workspace, companyId)) {
+          return workspaceDiff.getDiff(workspace, {
+            view: params.options?.view ?? "working-tree",
+            baseRef: params.options?.baseRef ?? null,
+            includeUntracked: params.options?.includeUntracked ?? true,
+            paths: params.options?.paths ?? [],
+          });
         }
-        return workspaceDiff.getDiff(workspace, {
+
+        const projectWorkspace = await db
+          .select()
+          .from(projectWorkspacesTable)
+          .where(and(
+            eq(projectWorkspacesTable.id, params.workspaceId),
+            eq(projectWorkspacesTable.companyId, companyId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (!projectWorkspace) {
+          throw new Error("Workspace not found");
+        }
+        return workspaceDiff.getDiff({
+          id: projectWorkspace.id,
+          companyId: projectWorkspace.companyId,
+          cwd: projectWorkspace.cwd,
+          baseRef: projectWorkspace.defaultRef ?? projectWorkspace.repoRef ?? null,
+        }, {
           view: params.options?.view ?? "working-tree",
           baseRef: params.options?.baseRef ?? null,
           includeUntracked: params.options?.includeUntracked ?? true,

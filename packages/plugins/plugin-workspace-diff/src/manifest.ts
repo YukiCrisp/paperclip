@@ -26,7 +26,7 @@ const manifest: PaperclipPluginManifestV1 = {
         id: CHANGES_TAB_SLOT_ID,
         displayName: "Changes",
         exportName: "ChangesTab",
-        entityTypes: ["execution_workspace"],
+        entityTypes: ["execution_workspace", "project_workspace"],
         order: 5,
       },
     ],

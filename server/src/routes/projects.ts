@@ -8,12 +8,14 @@ import {
   matchWorkspaceRuntimeServiceToCommand,
   updateProjectSchema,
   updateProjectWorkspaceSchema,
+  workspaceDiffQuerySchema,
   workspaceRuntimeControlTargetSchema,
 } from "@paperclipai/shared";
 import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { trackProjectCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { projectService, logActivity, workspaceOperationService } from "../services/index.js";
+import { workspaceDiffService } from "../services/workspace-diff.js";
 import { conflict, forbidden } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
@@ -42,6 +44,7 @@ export function projectRoutes(db: Db) {
   const router = Router();
   const svc = projectService(db);
   const secretsSvc = secretService(db);
+  const diffSvc = workspaceDiffService();
   const workspaceOperations = workspaceOperationService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
   const environmentsSvc = environmentService(db);
@@ -338,6 +341,29 @@ export function projectRoutes(db: Db) {
       res.json(workspace);
     },
   );
+
+  router.get("/projects/:id/workspaces/:workspaceId/diff", async (req, res) => {
+    const id = req.params.id as string;
+    const workspaceId = req.params.workspaceId as string;
+    const project = await svc.getById(id);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    assertCompanyAccess(req, project.companyId);
+    const workspace = (await svc.listWorkspaces(id)).find((entry) => entry.id === workspaceId);
+    if (!workspace) {
+      res.status(404).json({ error: "Project workspace not found" });
+      return;
+    }
+    const query = workspaceDiffQuerySchema.parse(req.query);
+    res.json(await diffSvc.getDiff({
+      id: workspace.id,
+      companyId: workspace.companyId,
+      cwd: workspace.cwd,
+      baseRef: workspace.defaultRef ?? workspace.repoRef ?? null,
+    }, query));
+  });
 
   async function handleProjectWorkspaceRuntimeCommand(req: Request, res: Response) {
     const id = req.params.id as string;

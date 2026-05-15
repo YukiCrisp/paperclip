@@ -1,6 +1,8 @@
 import type {
   Project,
   ProjectWorkspace,
+  WorkspaceDiffQueryOptions,
+  WorkspaceDiffResponse,
   WorkspaceOperation,
   WorkspaceRuntimeControlTarget,
 } from "@paperclipai/shared";
@@ -33,6 +35,24 @@ export const projectsApi = {
       projectPath(projectId, companyId, `/workspaces/${encodeURIComponent(workspaceId)}`),
       data,
     ),
+  getWorkspaceDiff: (
+    projectId: string,
+    workspaceId: string,
+    options: Partial<WorkspaceDiffQueryOptions> = {},
+    companyId?: string,
+  ) => {
+    const params = new URLSearchParams();
+    if (options.view) params.set("view", options.view);
+    if (options.baseRef) params.set("baseRef", options.baseRef);
+    if (typeof options.includeUntracked === "boolean") {
+      params.set("includeUntracked", String(options.includeUntracked));
+    }
+    for (const filePath of options.paths ?? []) {
+      params.append("path", filePath);
+    }
+    const suffix = `/workspaces/${encodeURIComponent(workspaceId)}/diff${params.toString() ? `?${params}` : ""}`;
+    return api.get<WorkspaceDiffResponse>(projectPath(projectId, companyId, suffix));
+  },
   controlWorkspaceRuntimeServices: (
     projectId: string,
     workspaceId: string,
