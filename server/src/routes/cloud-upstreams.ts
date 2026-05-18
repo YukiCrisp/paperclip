@@ -69,6 +69,16 @@ export function cloudUpstreamRoutes(db: Db, options: { instanceId?: string } = {
     res.json(await service.cancelRun(req.params.connectionId, req.params.runId));
   });
 
+  router.post("/cloud-upstreams/:connectionId/push-runs/:runId/activation", async (req, res) => {
+    assertBoardOrgAccess(req);
+    await assertEnabled();
+    res.json(await service.activateRunEntities({
+      connectionId: req.params.connectionId,
+      runId: req.params.runId,
+      entityType: activationEntityTypeBody(req.body),
+    }));
+  });
+
   return router;
 }
 
@@ -92,4 +102,15 @@ function stringBody(body: unknown, key: string): string {
 
 function optionalString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function activationEntityTypeBody(body: unknown): "agents" | "routines" | "monitors" {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw badRequest("entityType is required");
+  }
+  const value = (body as Record<string, unknown>).entityType;
+  if (value !== "agents" && value !== "routines" && value !== "monitors") {
+    throw badRequest("entityType must be agents, routines, or monitors");
+  }
+  return value;
 }

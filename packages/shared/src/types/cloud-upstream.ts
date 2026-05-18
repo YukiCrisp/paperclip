@@ -2,6 +2,15 @@ export type CloudUpstreamStep = "connect" | "scan" | "preview" | "push" | "verif
 
 export type CloudUpstreamRunStatus = "previewed" | "running" | "succeeded" | "failed" | "cancelled";
 
+export type CloudUpstreamActivationEntityType = "agents" | "routines" | "monitors";
+
+export interface CloudUpstreamActivationDecision {
+  entityType: CloudUpstreamActivationEntityType;
+  count: number;
+  status: "paused" | "activated";
+  activatedAt: string | null;
+}
+
 export interface CloudUpstreamTarget {
   stackId: string;
   stackSlug: string | null;

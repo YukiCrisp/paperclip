@@ -684,6 +684,8 @@ export {
 
 export type {
   CloudUpstreamConnectStartResponse,
+  CloudUpstreamActivationDecision,
+  CloudUpstreamActivationEntityType,
   CloudUpstreamConnection,
   CloudUpstreamConflict,
   CloudUpstreamPreview,

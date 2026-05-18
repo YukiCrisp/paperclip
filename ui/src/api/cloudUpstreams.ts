@@ -1,4 +1,5 @@
 import type {
+  CloudUpstreamActivationEntityType,
   CloudUpstreamConnectStartResponse,
   CloudUpstreamConnection,
   CloudUpstreamPreview,
@@ -26,5 +27,14 @@ export const cloudUpstreamsApi = {
     api.post<CloudUpstreamRun>(
       `/cloud-upstreams/${encodeURIComponent(connectionId)}/push-runs/${encodeURIComponent(runId)}/cancel`,
       {},
+    ),
+  activateEntities: (
+    connectionId: string,
+    runId: string,
+    input: { entityType: CloudUpstreamActivationEntityType },
+  ) =>
+    api.post<CloudUpstreamRun>(
+      `/cloud-upstreams/${encodeURIComponent(connectionId)}/push-runs/${encodeURIComponent(runId)}/activation`,
+      input,
     ),
 };

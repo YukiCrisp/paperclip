@@ -11,7 +11,13 @@ import {
   RefreshCcw,
   ShieldAlert,
 } from "lucide-react";
-import type { CloudUpstreamPreview, CloudUpstreamRun, CloudUpstreamStep } from "@paperclipai/shared";
+import type {
+  CloudUpstreamActivationDecision,
+  CloudUpstreamActivationEntityType,
+  CloudUpstreamPreview,
+  CloudUpstreamRun,
+  CloudUpstreamStep,
+} from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cloudUpstreamsApi } from "@/api/cloudUpstreams";
@@ -29,6 +35,31 @@ const STEPS: Array<{ key: CloudUpstreamStep; label: string }> = [
   { key: "push", label: "Push" },
   { key: "verify", label: "Verify" },
   { key: "activate", label: "Activate" },
+];
+const ACTIVATION_CATEGORIES: Array<{
+  key: CloudUpstreamActivationEntityType;
+  label: string;
+  singular: string;
+  detail: string;
+}> = [
+  {
+    key: "agents",
+    label: "Agents",
+    singular: "agent",
+    detail: "Confirm cloud secrets and adapter credentials before unpausing imported agents.",
+  },
+  {
+    key: "routines",
+    label: "Routines",
+    singular: "routine",
+    detail: "Review schedules and trigger settings before enabling imported routines.",
+  },
+  {
+    key: "monitors",
+    label: "Monitors",
+    singular: "monitor",
+    detail: "Activate after the target stack has been smoke tested.",
+  },
 ];
 
 export function CloudUpstream() {
@@ -135,6 +166,17 @@ export function CloudUpstream() {
       await invalidateUpstreams();
     },
     onError: (error) => setActionError(error instanceof Error ? error.message : "Failed to run push."),
+  });
+  const activationMutation = useMutation({
+    mutationFn: (input: { run: CloudUpstreamRun; entityType: CloudUpstreamActivationEntityType }) =>
+      cloudUpstreamsApi.activateEntities(input.run.connectionId, input.run.id, { entityType: input.entityType }),
+    onSuccess: async (run) => {
+      setActiveRun(run);
+      setNotice("Activation checklist updated.");
+      setActionError(null);
+      await invalidateUpstreams();
+    },
+    onError: (error) => setActionError(error instanceof Error ? error.message : "Failed to activate imported entities."),
   });
 
   async function invalidateUpstreams() {
@@ -273,15 +315,27 @@ export function CloudUpstream() {
                 <FileJson className="h-4 w-4" />
                 Download report
               </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => runMutation.mutate({ connectionId: latestRun.connectionId, retryOfRunId: latestRun.id })}
-                disabled={runMutation.isPending}
-              >
-                <RefreshCcw className="h-4 w-4" />
-                Retry
-              </Button>
+              {latestRun.status === "failed" || latestRun.status === "cancelled" ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => runMutation.mutate({ connectionId: latestRun.connectionId, retryOfRunId: latestRun.id })}
+                  disabled={runMutation.isPending}
+                >
+                  <RefreshCcw className="h-4 w-4" />
+                  Retry
+                </Button>
+              ) : latestRun.status === "succeeded" ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => runMutation.mutate({ connectionId: latestRun.connectionId })}
+                  disabled={runMutation.isPending}
+                >
+                  <RefreshCcw className="h-4 w-4" />
+                  Re-run
+                </Button>
+              ) : null}
             </div>
           </div>
           <div className="rounded-md border border-border px-4 py-4">
@@ -308,7 +362,14 @@ export function CloudUpstream() {
             </div>
           </div>
 
-          <ActivationChecklist />
+          {latestRun.status === "succeeded" ? (
+            <ActivationChecklist
+              run={latestRun}
+              pendingEntityType={activationMutation.variables?.entityType ?? null}
+              isPending={activationMutation.isPending}
+              onActivate={(entityType) => activationMutation.mutate({ run: latestRun, entityType })}
+            />
+          ) : null}
         </section>
       ) : null}
 
@@ -414,26 +475,100 @@ function ConflictTable({ conflicts }: { conflicts: CloudUpstreamPreview["conflic
   );
 }
 
-function ActivationChecklist() {
-  const rows = [
-    ["Agents", "Keep paused until cloud secrets and adapter credentials are verified."],
-    ["Routines", "Review schedules before enabling triggers."],
-    ["Monitors", "Activate after the target instance has been smoke tested."],
-  ];
+function ActivationChecklist({
+  run,
+  pendingEntityType,
+  isPending,
+  onActivate,
+}: {
+  run: CloudUpstreamRun;
+  pendingEntityType: CloudUpstreamActivationEntityType | null;
+  isPending: boolean;
+  onActivate: (entityType: CloudUpstreamActivationEntityType) => void;
+}) {
+  const rows = buildActivationRows(run);
   return (
     <div className="rounded-md border border-border px-4 py-3">
       <div className="mb-2 text-sm font-medium">Activation checklist</div>
       <div className="divide-y divide-border">
-        {rows.map(([label, detail]) => (
-          <div key={label} className="grid gap-2 py-2 text-sm sm:grid-cols-[8rem_1fr_auto]">
-            <span className="font-medium">{label}</span>
-            <span className="text-muted-foreground">{detail}</span>
-            <Button variant="outline" size="sm">Activate later</Button>
-          </div>
-        ))}
+        {rows.map((row) => {
+          const pending = isPending && pendingEntityType === row.key;
+          const activated = row.status === "activated";
+          return (
+            <div key={row.key} className="grid gap-2 py-2 text-sm sm:grid-cols-[8rem_1fr_auto] sm:items-center">
+              <div>
+                <div className="font-medium">{row.label}</div>
+                <div className="text-xs text-muted-foreground">{row.statusLabel}</div>
+              </div>
+              <div className="text-muted-foreground">
+                {row.count === 0 ? `0 imported ${row.pluralLabel} in this run.` : row.detail}
+              </div>
+              <div className="flex flex-wrap gap-2 sm:justify-end">
+                <Button
+                  variant={activated ? "secondary" : "default"}
+                  size="sm"
+                  onClick={() => onActivate(row.key)}
+                  disabled={row.count === 0 || activated || isPending}
+                >
+                  {pending ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {activated ? "Activated" : "Activate"}
+                </Button>
+                <Button variant="ghost" size="sm" disabled={activated || isPending}>
+                  Keep paused
+                </Button>
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
+}
+
+export function buildActivationRows(run: CloudUpstreamRun) {
+  const activationChecklist = activationChecklistFromReport(run.report);
+  return ACTIVATION_CATEGORIES.map((category) => {
+    const decision = activationChecklist[category.key];
+    const count = summaryCount(run.summary, category.key);
+    const status = decision?.status === "activated" ? "activated" : "paused";
+    const pluralLabel = `${category.singular}${count === 1 ? "" : "s"}`;
+    return {
+      ...category,
+      count,
+      pluralLabel,
+      status,
+      detail: `${count} imported ${pluralLabel} are paused by default. ${category.detail}`,
+      statusLabel: status === "activated"
+        ? `${count} activated`
+        : count === 0
+          ? "0 imported"
+          : `${count} paused`,
+    };
+  });
+}
+
+function summaryCount(summary: CloudUpstreamRun["summary"], key: CloudUpstreamActivationEntityType): number {
+  return summary.find((item) => item.key === key)?.count ?? 0;
+}
+
+function activationChecklistFromReport(report: CloudUpstreamRun["report"]): Partial<Record<CloudUpstreamActivationEntityType, CloudUpstreamActivationDecision>> {
+  const value = optionalRecord(report.activationChecklist);
+  const decisions: Partial<Record<CloudUpstreamActivationEntityType, CloudUpstreamActivationDecision>> = {};
+  for (const key of ["agents", "routines", "monitors"] as const) {
+    const item = optionalRecord(value[key]);
+    if (!item) continue;
+    decisions[key] = {
+      entityType: key,
+      count: typeof item.count === "number" ? item.count : 0,
+      status: item.status === "activated" ? "activated" : "paused",
+      activatedAt: typeof item.activatedAt === "string" ? item.activatedAt : null,
+    };
+  }
+  return decisions;
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 function downloadRunReport(run: CloudUpstreamRun) {

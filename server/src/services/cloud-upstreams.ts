@@ -2,6 +2,8 @@ import crypto, { sign } from "node:crypto";
 import { and, count, desc, eq } from "drizzle-orm";
 import type {
   CloudUpstreamConnectStartResponse,
+  CloudUpstreamActivationDecision,
+  CloudUpstreamActivationEntityType,
   CloudUpstreamConnection,
   CloudUpstreamConflict,
   CloudUpstreamPreview,
@@ -412,6 +414,44 @@ export function cloudUpstreamService(db: Db, options: { instanceId?: string } = 
         events: [
           ...row.events,
           event(new Date().toISOString(), "push", "failed", "Push cancelled locally before remote apply completed."),
+        ],
+      });
+    },
+
+    activateRunEntities: async (input: {
+      connectionId: string;
+      runId: string;
+      entityType: CloudUpstreamActivationEntityType;
+    }): Promise<CloudUpstreamRun> => {
+      const row = await getRunRow(input.connectionId, input.runId);
+      assertActivationEntityType(input.entityType);
+      if (row.status !== "succeeded") {
+        throw badRequest("Only succeeded cloud upstream runs can activate imported entities");
+      }
+
+      const activatedAt = new Date().toISOString();
+      const count = summaryCount(row.summary, input.entityType);
+      const nextDecision: CloudUpstreamActivationDecision = {
+        entityType: input.entityType,
+        count,
+        status: "activated",
+        activatedAt,
+      };
+      const report = asRecord(row.report);
+      const activationChecklist = activationChecklistFromReport(report);
+      const label = activationEntityLabel(input.entityType, count);
+
+      return updateRun(row.id, {
+        report: {
+          ...report,
+          activationChecklist: {
+            ...activationChecklist,
+            [input.entityType]: nextDecision,
+          },
+        },
+        events: [
+          ...row.events,
+          event(activatedAt, "activate", "completed", `Activated ${count} imported ${label}.`),
         ],
       });
     },
@@ -940,6 +980,40 @@ function eventsFromRemote(value: unknown): CloudUpstreamRunEvent[] {
       `Cloud importer ${action.replace(/_/g, " ")}${index >= 0 ? "." : "."}`,
     );
   });
+}
+
+function assertActivationEntityType(value: string): asserts value is CloudUpstreamActivationEntityType {
+  if (value !== "agents" && value !== "routines" && value !== "monitors") {
+    throw badRequest("entityType must be agents, routines, or monitors");
+  }
+}
+
+function summaryCount(summary: unknown, key: CloudUpstreamActivationEntityType): number {
+  if (!Array.isArray(summary)) return 0;
+  const item = summary.find((entry) => asRecord(entry).key === key);
+  const count = asRecord(item).count;
+  return typeof count === "number" && Number.isFinite(count) ? count : 0;
+}
+
+function activationChecklistFromReport(report: Record<string, unknown>): Record<string, CloudUpstreamActivationDecision> {
+  const value = asRecord(report.activationChecklist);
+  const decisions: Record<string, CloudUpstreamActivationDecision> = {};
+  for (const [key, decision] of Object.entries(value)) {
+    if (key !== "agents" && key !== "routines" && key !== "monitors") continue;
+    const item = asRecord(decision);
+    decisions[key] = {
+      entityType: key,
+      count: typeof item.count === "number" && Number.isFinite(item.count) ? item.count : 0,
+      status: item.status === "activated" ? "activated" : "paused",
+      activatedAt: optionalString(item.activatedAt),
+    };
+  }
+  return decisions;
+}
+
+function activationEntityLabel(entityType: CloudUpstreamActivationEntityType, count: number): string {
+  const singular = entityType === "agents" ? "agent" : entityType === "routines" ? "routine" : "monitor";
+  return `${singular}${count === 1 ? "" : "s"}`;
 }
 
 function mergeWarnings(base: CloudUpstreamWarning[], extra: CloudUpstreamWarning[]): CloudUpstreamWarning[] {
