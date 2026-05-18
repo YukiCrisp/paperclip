@@ -10,6 +10,7 @@ const sidebarNavItemMock = vi.hoisted(() => vi.fn());
 const mockSidebarBadgesApi = vi.hoisted(() => ({
   get: vi.fn(),
 }));
+const mockUsePluginSlots = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/router", () => ({
   Link: ({
@@ -61,6 +62,10 @@ vi.mock("@/api/sidebarBadges", () => ({
   sidebarBadgesApi: mockSidebarBadgesApi,
 }));
 
+vi.mock("@/plugins/slots", () => ({
+  usePluginSlots: mockUsePluginSlots,
+}));
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -82,6 +87,11 @@ describe("CompanySettingsSidebar", () => {
       approvals: 0,
       failedRuns: 0,
       joinRequests: 2,
+    });
+    mockUsePluginSlots.mockReturnValue({
+      slots: [],
+      isLoading: false,
+      errorMessage: null,
     });
   });
 
@@ -146,6 +156,52 @@ describe("CompanySettingsSidebar", () => {
       expect.objectContaining({
         to: "/company/settings/secrets",
         label: "Secrets",
+        end: true,
+      }),
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("renders company settings pages contributed by ready plugins", async () => {
+    mockUsePluginSlots.mockReturnValue({
+      slots: [
+        {
+          type: "companySettingsPage",
+          id: "permissions",
+          displayName: "Permissions",
+          exportName: "PermissionsPage",
+          routePath: "permissions",
+          pluginId: "plugin-1",
+          pluginKey: "paperclip-ee",
+          pluginDisplayName: "Paperclip EE",
+          pluginVersion: "0.1.0",
+        },
+      ],
+      isLoading: false,
+      errorMessage: null,
+    });
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanySettingsSidebar />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Permissions");
+    expect(sidebarNavItemMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "/company/settings/permissions",
+        label: "Permissions",
         end: true,
       }),
     );

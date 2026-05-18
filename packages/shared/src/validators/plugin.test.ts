@@ -128,4 +128,30 @@ describe("plugin UI slot validators", () => {
 
     expect(parsed.entityTypes).toEqual(["execution_workspace"]);
   });
+
+  it("accepts company settings page slots with a non-core settings route", () => {
+    const parsed = pluginUiSlotDeclarationSchema.parse({
+      type: "companySettingsPage",
+      id: "permissions-settings",
+      displayName: "Permissions",
+      exportName: "PermissionsSettingsPage",
+      routePath: "permissions",
+    });
+
+    expect(parsed.routePath).toBe("permissions");
+  });
+
+  it("prevents company settings page slots from shadowing core settings routes", () => {
+    const parsed = pluginUiSlotDeclarationSchema.safeParse({
+      type: "companySettingsPage",
+      id: "access-settings",
+      displayName: "Access",
+      exportName: "AccessSettingsPage",
+      routePath: "access",
+    });
+
+    expect(parsed.success).toBe(false);
+    if (parsed.success) return;
+    expect(parsed.error.issues.some((issue) => issue.message.includes("reserved by the host"))).toBe(true);
+  });
 });
