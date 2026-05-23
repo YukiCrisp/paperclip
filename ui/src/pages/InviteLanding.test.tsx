@@ -559,6 +559,59 @@ describe("InviteLandingPage", () => {
     });
   });
 
+  it("shows invite details instead of auto-redirecting for signed-in existing members", async () => {
+    getSessionMock.mockResolvedValue({
+      session: { id: "session-1", userId: "user-1" },
+      user: {
+        id: "user-1",
+        name: "Jane Example",
+        email: "jane@example.com",
+        image: null,
+      },
+    });
+    listCompaniesMock.mockResolvedValue([{ id: "company-1", name: "Acme Robotics" }]);
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={["/invite/pcp_invite_test"]}>
+          <QueryClientProvider client={queryClient}>
+            <Routes>
+              <Route path="/invite/:token" element={<InviteLandingPage />} />
+            </Routes>
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Join Acme Robotics");
+    expect(container.textContent).toContain("Already in this company");
+    expect(container.textContent).toContain("This account already belongs to Acme Robotics.");
+    expect(acceptInviteMock).not.toHaveBeenCalled();
+
+    const openButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Open company",
+    );
+    expect(openButton).not.toBeNull();
+
+    await act(async () => {
+      openButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(setSelectedCompanyIdMock).toHaveBeenCalledWith("company-1", { source: "manual" });
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("falls back to the generated company icon when the invite logo fails to load", async () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({

@@ -280,9 +280,8 @@ export function InviteLandingPage() {
     );
     if (isMember) {
       clearPendingInviteToken(token);
-      navigate("/", { replace: true });
     }
-  }, [accessibleCompanies, companiesQuery.data, inviteQuery.data, token, navigate]);
+  }, [accessibleCompanies, companiesQuery.data, inviteQuery.data, token]);
 
   const invite = inviteQuery.data;
   const isCheckingExistingMembership =
@@ -423,10 +422,11 @@ export function InviteLandingPage() {
 
   const joinButtonLabel = useMemo(() => {
     if (!invite) return "Continue";
+    if (isCurrentMember) return "Open company";
     if (invite.inviteType === "bootstrap_ceo") return "Accept invite";
     if (showsAgentForm) return "Submit request";
     return sessionQuery.data ? "Accept invite" : "Continue";
-  }, [invite, sessionQuery.data, showsAgentForm]);
+  }, [invite, isCurrentMember, sessionQuery.data, showsAgentForm]);
 
   if (!token) {
     return <div className="mx-auto max-w-xl py-10 text-sm text-destructive">Invalid invite token.</div>;
@@ -797,7 +797,9 @@ export function InviteLandingPage() {
               <div className="space-y-4">
                 <div>
                   <h2 className="text-lg font-semibold">
-                    {shouldAutoAcceptHumanInvite
+                    {isCurrentMember
+                      ? "Already in this company"
+                      : shouldAutoAcceptHumanInvite
                       ? "Submitting join request"
                       : invite.inviteType === "bootstrap_ceo"
                         ? "Accept bootstrap invite"
@@ -821,8 +823,16 @@ export function InviteLandingPage() {
                 ) : (
                   <Button
                     className="w-full rounded-none"
-                    disabled={acceptMutation.isPending || isCurrentMember}
-                    onClick={() => acceptMutation.mutate()}
+                    disabled={acceptMutation.isPending}
+                    onClick={() => {
+                      if (isCurrentMember && invite.companyId) {
+                        clearPendingInviteToken(token);
+                        setSelectedCompanyId(invite.companyId, { source: "manual" });
+                        navigate("/", { replace: true });
+                        return;
+                      }
+                      acceptMutation.mutate();
+                    }}
                   >
                     {acceptMutation.isPending ? "Working..." : joinButtonLabel}
                   </Button>
