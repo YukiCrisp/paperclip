@@ -119,26 +119,93 @@ export function parseIssueExecutionWorkspaceSettings(raw: unknown): IssueExecuti
   };
 }
 
+export type ExecutionWorkspaceEnvironmentSource =
+  | "workspace"
+  | "issue"
+  | "project"
+  | "agent"
+  | "default";
+
+export type ExecutionWorkspaceEnvironmentConflict = {
+  reason: "reused_workspace_environment_mismatch";
+  workspaceEnvironmentId: string;
+  assigneeIntendedEnvironmentId: string;
+  assigneeIntendedSource: Exclude<ExecutionWorkspaceEnvironmentSource, "workspace">;
+};
+
+export type ExecutionWorkspaceEnvironmentResolution = {
+  environmentId: string;
+  source: ExecutionWorkspaceEnvironmentSource;
+  conflict: ExecutionWorkspaceEnvironmentConflict | null;
+};
+
+function resolveAssigneeIntendedExecutionWorkspaceEnvironment(input: {
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  issueSettings: IssueExecutionWorkspaceSettings | null;
+  agentDefaultEnvironmentId: string | null;
+  defaultEnvironmentId: string;
+}): {
+  environmentId: string;
+  source: Exclude<ExecutionWorkspaceEnvironmentSource, "workspace">;
+} {
+  // Companion bug to PAPA-380 / PAPA-431: when the assignee has no explicit
+  // defaultEnvironmentId, the agent is deliberately scoped to the local
+  // default. Such agents (e.g. Manual QA today) must NOT silently inherit an
+  // issue/project environment that may have been promoted from a different
+  // agent's identity via inheritExecutionWorkspaceFromIssueId or sibling
+  // assignment. Treat null as a positive "local default" signal rather than
+  // "inherit anything."
+  if (input.agentDefaultEnvironmentId === null) {
+    return { environmentId: input.defaultEnvironmentId, source: "default" };
+  }
+  if (input.issueSettings?.environmentId !== undefined) {
+    return {
+      environmentId: input.issueSettings.environmentId ?? input.defaultEnvironmentId,
+      source: "issue",
+    };
+  }
+  if (input.projectPolicy?.environmentId !== undefined) {
+    return {
+      environmentId: input.projectPolicy.environmentId ?? input.defaultEnvironmentId,
+      source: "project",
+    };
+  }
+  return { environmentId: input.agentDefaultEnvironmentId, source: "agent" };
+}
+
 export function resolveExecutionWorkspaceEnvironmentId(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   workspaceConfig: { environmentId?: string | null } | null;
   agentDefaultEnvironmentId: string | null;
   defaultEnvironmentId: string;
-}) {
+}): ExecutionWorkspaceEnvironmentResolution {
+  const assigneeIntended = resolveAssigneeIntendedExecutionWorkspaceEnvironment(input);
+
   if (input.workspaceConfig?.environmentId !== undefined) {
-    return input.workspaceConfig.environmentId ?? input.defaultEnvironmentId;
+    const workspaceEnvironmentId =
+      input.workspaceConfig.environmentId ?? input.defaultEnvironmentId;
+    // PAPA-380 / PAPA-431: a reused workspace's persisted environmentId must
+    // never silently shadow the current assignee's environment identity.
+    // When they disagree, refuse the silent reuse: return the assignee's
+    // intended env and surface a conflict signal so the caller forces a fresh
+    // workspace realization (or otherwise alerts the operator) instead of
+    // running the agent on someone else's environment.
+    if (workspaceEnvironmentId !== assigneeIntended.environmentId) {
+      return {
+        environmentId: assigneeIntended.environmentId,
+        source: assigneeIntended.source,
+        conflict: {
+          reason: "reused_workspace_environment_mismatch",
+          workspaceEnvironmentId,
+          assigneeIntendedEnvironmentId: assigneeIntended.environmentId,
+          assigneeIntendedSource: assigneeIntended.source,
+        },
+      };
+    }
+    return { environmentId: workspaceEnvironmentId, source: "workspace", conflict: null };
   }
-  if (input.issueSettings?.environmentId !== undefined) {
-    return input.issueSettings.environmentId ?? input.defaultEnvironmentId;
-  }
-  if (input.projectPolicy?.environmentId !== undefined) {
-    return input.projectPolicy.environmentId ?? input.defaultEnvironmentId;
-  }
-  if (input.agentDefaultEnvironmentId !== null) {
-    return input.agentDefaultEnvironmentId;
-  }
-  return input.defaultEnvironmentId;
+  return { environmentId: assigneeIntended.environmentId, source: assigneeIntended.source, conflict: null };
 }
 
 export function defaultIssueExecutionWorkspaceSettingsForProject(
