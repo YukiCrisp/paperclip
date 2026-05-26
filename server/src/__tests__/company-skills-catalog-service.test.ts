@@ -158,6 +158,76 @@ describeEmbeddedPostgres("companySkillService.installFromCatalog", () => {
     await expect(fs.readFile(path.join(result.skill.sourceLocator!, "references/checklist.md"), "utf8")).resolves.toBe(sampleReferenceMarkdown);
   });
 
+  it("restores portable catalog provenance when importing packaged skills", async () => {
+    const companyId = await createCompany();
+    const importedFiles = {
+      "skills/paperclipai/bundled/software-development/review/SKILL.md": [
+        "---",
+        `key: "${sampleCatalogSkill.key}"`,
+        'slug: "review"',
+        'name: "review"',
+        "metadata:",
+        "  paperclip:",
+        `    skillKey: "${sampleCatalogSkill.key}"`,
+        '    slug: "review"',
+        "    catalog:",
+        `      skillKey: "${sampleCatalogSkill.key}"`,
+        `      sourceRef: "${sampleCatalogSkill.contentHash}"`,
+        `      originHash: "${sampleCatalogSkill.contentHash}"`,
+        `      catalogId: "${sampleCatalogSkill.id}"`,
+        `      catalogKey: "${sampleCatalogSkill.key}"`,
+        '      catalogKind: "bundled"',
+        '      catalogPath: "catalog/bundled/software-development/review"',
+        '      packageName: "@paperclipai/skills-catalog"',
+        '      packageVersion: "0.3.1"',
+        `      installedHash: "${sampleCatalogSkill.contentHash}"`,
+        '      userModifiedAt: "2026-05-01T00:00:00.000Z"',
+        '      updateHoldReason: "local_modifications"',
+        '      auditVerdict: "warning"',
+        "      auditCodes:",
+        '        - "local_modifications"',
+        '      auditScannedAt: "2026-05-02T00:00:00.000Z"',
+        '      auditScanVersion: "skills-audit-v1"',
+        "---",
+        "",
+        "# Review",
+        "",
+      ].join("\n"),
+      "skills/paperclipai/bundled/software-development/review/references/checklist.md": sampleReferenceMarkdown,
+    };
+
+    const [result] = await svc.importPackageFiles(companyId, importedFiles, { onConflict: "replace" });
+
+    expect(result?.action).toBe("created");
+    expect(result?.skill).toMatchObject({
+      companyId,
+      key: sampleCatalogSkill.key,
+      slug: "review",
+      sourceType: "catalog",
+      sourceRef: sampleCatalogSkill.contentHash,
+      metadata: expect.objectContaining({
+        sourceKind: "catalog",
+        skillKey: sampleCatalogSkill.key,
+        originHash: sampleCatalogSkill.contentHash,
+        catalogId: sampleCatalogSkill.id,
+        catalogKey: sampleCatalogSkill.key,
+        catalogKind: "bundled",
+        catalogPath: "catalog/bundled/software-development/review",
+        packageName: "@paperclipai/skills-catalog",
+        packageVersion: "0.3.1",
+        installedHash: sampleCatalogSkill.contentHash,
+        userModifiedAt: "2026-05-01T00:00:00.000Z",
+        updateHoldReason: "local_modifications",
+        auditVerdict: "warning",
+        auditCodes: ["local_modifications"],
+        auditScannedAt: "2026-05-02T00:00:00.000Z",
+        auditScanVersion: "skills-audit-v1",
+      }),
+    });
+    expect(result?.skill.sourceLocator).toEqual(expect.any(String));
+    await expect(fs.readFile(path.join(result!.skill.sourceLocator!, "SKILL.md"), "utf8")).resolves.toContain("# Review");
+  });
+
   it("returns unchanged for an already-current catalog skill", async () => {
     const companyId = await createCompany();
     await svc.installFromCatalog(companyId, { catalogSkillId: sampleCatalogSkill.id });

@@ -771,6 +771,62 @@ function deriveImportedSkillSlug(frontmatter: Record<string, unknown>, fallback:
     ?? "skill";
 }
 
+const PORTABLE_CATALOG_PROVENANCE_STRING_KEYS = [
+  "sourceRef",
+  "originHash",
+  "catalogId",
+  "catalogKey",
+  "catalogKind",
+  "catalogCategory",
+  "catalogPath",
+  "packageName",
+  "packageVersion",
+  "originVersion",
+  "installedHash",
+  "userModifiedAt",
+  "updateHoldReason",
+  "auditVerdict",
+  "auditScannedAt",
+  "auditScanVersion",
+] as const;
+
+function readStringList(value: unknown) {
+  if (!Array.isArray(value)) return null;
+  const entries = value.map((entry) => asString(entry)).filter((entry): entry is string => Boolean(entry));
+  return entries.length === value.length ? entries : null;
+}
+
+function readPortableCatalogProvenance(
+  metadata: Record<string, unknown> | null,
+  canonicalKey: string | null,
+) {
+  const paperclip = isPlainRecord(metadata?.paperclip) ? metadata.paperclip as Record<string, unknown> : null;
+  const catalog = isPlainRecord(paperclip?.catalog) ? paperclip.catalog as Record<string, unknown> : null;
+  if (!catalog) return null;
+
+  const sourceRef = asString(catalog.sourceRef) ?? asString(catalog.originHash);
+  const normalized: Record<string, unknown> = {
+    ...(canonicalKey ? { skillKey: canonicalKey } : {}),
+    sourceKind: "catalog",
+  };
+  const catalogSkillKey = asString(catalog.skillKey);
+  if (!canonicalKey && catalogSkillKey) normalized.skillKey = catalogSkillKey;
+
+  for (const key of PORTABLE_CATALOG_PROVENANCE_STRING_KEYS) {
+    if (key === "sourceRef") continue;
+    const value = asString(catalog[key]);
+    if (value) normalized[key] = value;
+  }
+  if (sourceRef && !normalized.originHash) normalized.originHash = sourceRef;
+  const auditCodes = readStringList(catalog.auditCodes);
+  if (auditCodes) normalized.auditCodes = auditCodes;
+
+  return {
+    sourceRef,
+    metadata: normalized,
+  };
+}
+
 function deriveImportedSkillSource(
   frontmatter: Record<string, unknown>,
   fallbackSlug: string,
@@ -824,6 +880,16 @@ function deriveImportedSkillSource(
         },
       };
     }
+  }
+
+  const catalogProvenance = readPortableCatalogProvenance(metadata, canonicalKey);
+  if (catalogProvenance) {
+    return {
+      sourceType: "catalog",
+      sourceLocator: null,
+      sourceRef: catalogProvenance.sourceRef,
+      metadata: catalogProvenance.metadata,
+    };
   }
 
   return {

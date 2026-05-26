@@ -228,6 +228,79 @@ function readSkillSourceKind(skill: CompanySkill) {
   return asString(metadata?.sourceKind);
 }
 
+const PORTABLE_CATALOG_PROVENANCE_STRING_KEYS = [
+  "sourceRef",
+  "originHash",
+  "catalogId",
+  "catalogKey",
+  "catalogKind",
+  "catalogCategory",
+  "catalogPath",
+  "packageName",
+  "packageVersion",
+  "originVersion",
+  "installedHash",
+  "userModifiedAt",
+  "updateHoldReason",
+  "auditVerdict",
+  "auditScannedAt",
+  "auditScanVersion",
+] as const;
+
+function readStringList(value: unknown) {
+  if (!Array.isArray(value)) return null;
+  const entries = value.map((entry) => asString(entry)).filter((entry): entry is string => Boolean(entry));
+  return entries.length === value.length ? entries : null;
+}
+
+function buildPortableCatalogProvenance(skill: CompanySkill) {
+  if (skill.sourceType !== "catalog") return null;
+  const metadata = isPlainRecord(skill.metadata) ? skill.metadata : null;
+  const provenance: Record<string, unknown> = {
+    skillKey: skill.key,
+  };
+
+  const sourceRef = asString(skill.sourceRef) ?? asString(metadata?.originHash);
+  if (sourceRef) provenance.sourceRef = sourceRef;
+
+  for (const key of PORTABLE_CATALOG_PROVENANCE_STRING_KEYS) {
+    if (key === "sourceRef") continue;
+    const value = asString(metadata?.[key]);
+    if (value) provenance[key] = value;
+  }
+
+  const auditCodes = readStringList(metadata?.auditCodes);
+  if (auditCodes) provenance.auditCodes = auditCodes;
+
+  return Object.keys(provenance).length > 1 ? provenance : null;
+}
+
+function readPortableCatalogProvenance(metadata: Record<string, unknown> | null) {
+  const paperclip = isPlainRecord(metadata?.paperclip) ? metadata.paperclip as Record<string, unknown> : null;
+  const catalog = isPlainRecord(paperclip?.catalog) ? paperclip.catalog as Record<string, unknown> : null;
+  if (!catalog) return null;
+
+  const sourceRef = asString(catalog.sourceRef) ?? asString(catalog.originHash);
+  const normalized: Record<string, unknown> = {
+    sourceKind: "catalog",
+  };
+  const skillKey = asString(catalog.skillKey);
+  if (skillKey) normalized.skillKey = skillKey;
+  for (const key of PORTABLE_CATALOG_PROVENANCE_STRING_KEYS) {
+    if (key === "sourceRef") continue;
+    const value = asString(catalog[key]);
+    if (value) normalized[key] = value;
+  }
+  if (sourceRef && !normalized.originHash) normalized.originHash = sourceRef;
+  const auditCodes = readStringList(catalog.auditCodes);
+  if (auditCodes) normalized.auditCodes = auditCodes;
+
+  return {
+    sourceRef,
+    metadata: normalized,
+  };
+}
+
 function deriveLocalExportNamespace(skill: CompanySkill, slug: string) {
   const metadata = isPlainRecord(skill.metadata) ? skill.metadata : null;
   const candidates = [
@@ -2126,12 +2199,14 @@ async function withSkillSourceMetadata(skill: CompanySkill, markdown: string) {
   if (sourceEntry) {
     metadata.sources = [...existingSources, sourceEntry];
   }
+  const catalogProvenance = buildPortableCatalogProvenance(skill);
   metadata.skillKey = skill.key;
   metadata.paperclipSkillKey = skill.key;
   metadata.paperclip = {
     ...(isPlainRecord(metadata.paperclip) ? metadata.paperclip : {}),
     skillKey: skill.key,
     slug: skill.slug,
+    ...(catalogProvenance ? { catalog: catalogProvenance } : {}),
   };
   const frontmatter = {
     ...parsed.frontmatter,
@@ -2668,10 +2743,17 @@ function buildManifestFromPackageFiles(
       normalizedMetadata = {
         sourceKind: "url",
       };
-    } else if (metadata) {
-      normalizedMetadata = {
-        sourceKind: "catalog",
-      };
+    } else {
+      const catalogProvenance = readPortableCatalogProvenance(metadata);
+      if (catalogProvenance) {
+        sourceType = "catalog";
+        sourceRef = catalogProvenance.sourceRef;
+        normalizedMetadata = catalogProvenance.metadata;
+      } else if (metadata) {
+        normalizedMetadata = {
+          sourceKind: "catalog",
+        };
+      }
     }
     const key = deriveManifestSkillKey(frontmatter, slug, normalizedMetadata, sourceType, sourceLocator);
 
