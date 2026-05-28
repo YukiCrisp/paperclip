@@ -2179,11 +2179,15 @@ export function companySkillService(db: Db) {
       originHash: audit?.originHash ?? asString(metadata.originHash),
       userModifiedAt: audit && audit.originHash && audit.installedHash !== audit.originHash
         ? asString(metadata.userModifiedAt) ?? audit.scannedAt
+        : audit && audit.originHash
+          ? null
         : asString(metadata.userModifiedAt),
       updateHoldReason: (audit?.verdict === "fail"
         ? "audit_hard_stop"
         : audit && audit.originHash && audit.installedHash !== audit.originHash
           ? "local_modifications"
+          : audit && audit.originHash
+            ? null
           : asString(metadata.updateHoldReason)) as CompanySkillUpdateHoldReason | null,
       auditVerdict: audit?.verdict ?? (asString(metadata.auditVerdict) as CompanySkillAuditVerdict | null),
       auditCodes: audit?.codes ?? (Array.isArray(metadata.auditCodes) ? metadata.auditCodes.map(String) : []),
@@ -2972,8 +2976,12 @@ export function companySkillService(db: Db) {
           };
         }
         if (!input.force) {
-          throw unprocessable("Catalog skill has local modifications; rerun with --force to replace it.", {
-            updateHoldReason: "local_modifications",
+          const holdReason = audit.verdict === "fail" ? "audit_hard_stop" : "local_modifications";
+          const message = audit.verdict === "fail"
+            ? "Catalog skill has hard-stop audit findings; rerun with --force to replace it."
+            : "Catalog skill has local modifications; rerun with --force to replace it.";
+          throw unprocessable(message, {
+            updateHoldReason: holdReason,
             audit,
           });
         }

@@ -301,6 +301,37 @@ describeEmbeddedPostgres("companySkillService.installFromCatalog", () => {
     expect(status?.installedHash).not.toBe(sampleCatalogSkill.contentHash);
   });
 
+  it("clears stale local modification hold status when catalog files are restored", async () => {
+    const companyId = await createCompany();
+    const installed = await svc.installFromCatalog(companyId, { catalogSkillId: sampleCatalogSkill.id });
+    const skillPath = path.join(installed.skill.sourceLocator!, "SKILL.md");
+    await fs.writeFile(skillPath, `${sampleSkillMarkdown}\nTampered\n`, "utf8");
+    await svc.auditSkill(companyId, installed.skill.id);
+    await fs.writeFile(skillPath, sampleSkillMarkdown, "utf8");
+
+    const status = await svc.updateStatus(companyId, installed.skill.id);
+
+    expect(status).toMatchObject({
+      updateHoldReason: null,
+      userModifiedAt: null,
+      installedHash: sampleCatalogSkill.contentHash,
+    });
+  });
+
+  it("reports hard-stop audit findings for idempotent catalog reinstall drift", async () => {
+    const companyId = await createCompany();
+    const installed = await svc.installFromCatalog(companyId, { catalogSkillId: sampleCatalogSkill.id });
+    await fs.rm(path.join(installed.skill.sourceLocator!, "SKILL.md"));
+
+    await expect(svc.installFromCatalog(companyId, { catalogSkillId: sampleCatalogSkill.id })).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("hard-stop audit findings"),
+      details: expect.objectContaining({
+        updateHoldReason: "audit_hard_stop",
+      }),
+    });
+  });
+
   it("resets a modified catalog skill back to the pinned origin when forced", async () => {
     const companyId = await createCompany();
     const installed = await svc.installFromCatalog(companyId, { catalogSkillId: sampleCatalogSkill.id });
