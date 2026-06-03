@@ -93,6 +93,11 @@ export interface CatalogTeamPreparedSource {
   errors: string[];
 }
 
+interface CatalogTargetManagerReference {
+  agentId: string;
+  slug: string;
+}
+
 export interface CatalogTeamImportPreviewResult {
   team: CatalogTeam;
   portabilityPreview: CompanyPortabilityPreviewResult;
@@ -372,7 +377,7 @@ function catalogProvenance(team: CatalogTeam) {
   };
 }
 
-function renderCatalogProvenanceYaml(team: CatalogTeam, targetManagerSlug: string | null) {
+function renderCatalogProvenanceYaml(team: CatalogTeam, targetManager: CatalogTargetManagerReference | null) {
   const provenance = catalogProvenance(team);
   const agentSlugs = Array.from(new Set(team.agentSlugs)).sort();
   const projectSlugs = Array.from(new Set(team.projectSlugs)).sort();
@@ -383,7 +388,10 @@ function renderCatalogProvenanceYaml(team: CatalogTeam, targetManagerSlug: strin
 
   const renderEntity = (slug: string, opts?: { reparentRoot?: boolean }) => [
     `  ${slug}:`,
-    ...(opts?.reparentRoot ? [`    reportsTo: ${yamlScalar(targetManagerSlug)}`] : []),
+    ...(opts?.reparentRoot && targetManager ? [
+      `    reportsToExistingAgentId: ${yamlScalar(targetManager.agentId)}`,
+      `    reportsToExistingAgentSlug: ${yamlScalar(targetManager.slug)}`,
+    ] : []),
     "    metadata:",
     "      paperclip:",
     "        catalogTeam:",
@@ -402,7 +410,7 @@ function renderCatalogProvenanceYaml(team: CatalogTeam, targetManagerSlug: strin
     "agents:",
     ...agentSlugs.flatMap((slug) =>
       renderEntity(slug, {
-        reparentRoot: Boolean(targetManagerSlug && team.rootAgentSlugs.includes(slug)),
+        reparentRoot: Boolean(targetManager && team.rootAgentSlugs.includes(slug)),
       }),
     ),
   ];
@@ -708,11 +716,17 @@ export function teamsCatalogService(db: Db) {
   const companySkills = companySkillService(db);
   const agents = agentService(db);
 
-  async function resolveTargetManagerSlug(companyId: string, options: CatalogTeamImportOptions) {
+  async function resolveTargetManagerReference(
+    companyId: string,
+    options: CatalogTeamImportOptions,
+  ): Promise<CatalogTargetManagerReference | null> {
     if (options.targetManagerSlug) {
       const slug = normalizeAgentUrlKey(options.targetManagerSlug);
       if (!slug) throw unprocessable("Target manager slug is invalid.");
-      return slug;
+      const managers = await agents.list(companyId);
+      const manager = managers.find((candidate) => normalizeAgentUrlKey(candidate.name) === slug);
+      if (!manager) throw notFound("Target manager agent not found");
+      return { agentId: manager.id, slug };
     }
     if (!options.targetManagerAgentId) return null;
     const manager = await agents.getById(options.targetManagerAgentId);
@@ -720,7 +734,10 @@ export function teamsCatalogService(db: Db) {
     if (manager.companyId !== companyId) {
       throw forbidden("Target manager agent must belong to the target company.");
     }
-    return normalizeAgentUrlKey(manager.name) ?? manager.id;
+    return {
+      agentId: manager.id,
+      slug: normalizeAgentUrlKey(manager.name) ?? manager.id,
+    };
   }
 
   async function prepareCatalogTeamSource(
@@ -746,9 +763,9 @@ export function teamsCatalogService(db: Db) {
     warnings.push(...skillPrep.warnings);
     errors.push(...skillPrep.errors);
 
-    const targetManagerSlug = await resolveTargetManagerSlug(companyId, options);
+    const targetManager = await resolveTargetManagerReference(companyId, options);
     const files = await readCatalogTeamSourceFiles(team);
-    files[".paperclip.yaml"] = renderCatalogProvenanceYaml(team, targetManagerSlug);
+    files[".paperclip.yaml"] = renderCatalogProvenanceYaml(team, targetManager);
     rewriteAgentCatalogSkillRefs(team, files);
 
     return {

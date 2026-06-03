@@ -56,6 +56,19 @@ function catalogTeam(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function installedCatalogTeam(overrides: Record<string, unknown> = {}) {
+  return {
+    catalogId: "paperclipai:bundled:software-development:product-engineering",
+    catalogKey: "paperclipai/bundled/software-development/product-engineering",
+    present: true,
+    currentContentHash: "sha256:catalog-team",
+    installedOriginHashes: ["sha256:catalog-team"],
+    agentCount: 3,
+    outOfDate: false,
+    ...overrides,
+  };
+}
+
 describe("teams CLI commands", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -128,6 +141,103 @@ describe("teams CLI commands", () => {
       expect.objectContaining({ method: "GET" }),
     );
     expect(JSON.parse(String(logSpy.mock.calls[0]?.[0]))).toEqual(rows);
+  });
+
+  it("lists catalog teams with installed status for a company", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([
+        catalogTeam(),
+        catalogTeam({
+          id: "paperclipai:optional:content:content-machine",
+          key: "paperclipai/optional/content/content-machine",
+          kind: "optional",
+          category: "content",
+          slug: "content-machine",
+          name: "Content Machine",
+          contentHash: "sha256:content-current",
+        }),
+      ]))
+      .mockResolvedValueOnce(jsonResponse([
+        installedCatalogTeam({
+          currentContentHash: "sha256:catalog-team",
+          installedOriginHashes: ["sha256:older"],
+          outOfDate: true,
+        }),
+      ]));
+
+    await runCommand([
+      "teams",
+      "list",
+      "--kind",
+      "bundled",
+      "--company-id",
+      "company-1",
+      "--api-base",
+      "http://paperclip.test",
+      "--api-key",
+      "token",
+    ]);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://paperclip.test/api/teams/catalog?kind=bundled",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://paperclip.test/api/companies/company-1/teams/catalog/installed",
+      expect.objectContaining({ method: "GET" }),
+    );
+    const rendered = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(rendered).toContain("installedStatus");
+    expect(rendered).toContain("out_of_date");
+    expect(rendered).toContain("not_installed");
+  });
+
+  it("lists installed status as JSON including removed catalog teams", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([catalogTeam()]))
+      .mockResolvedValueOnce(jsonResponse([
+        installedCatalogTeam(),
+        installedCatalogTeam({
+          catalogId: "paperclipai:removed:team",
+          catalogKey: "paperclipai/removed/team",
+          present: false,
+          currentContentHash: null,
+          installedOriginHashes: ["sha256:removed"],
+          agentCount: 2,
+        }),
+      ]));
+
+    await runCommand([
+      "teams",
+      "list",
+      "--company-id",
+      "company-1",
+      "--api-base",
+      "http://paperclip.test",
+      "--api-key",
+      "token",
+      "--json",
+    ]);
+
+    const rows = JSON.parse(String(logSpy.mock.calls[0]?.[0]));
+    expect(rows).toMatchObject([
+      {
+        catalogId: "paperclipai:bundled:software-development:product-engineering",
+        catalogKey: "paperclipai/bundled/software-development/product-engineering",
+        installedStatus: "installed",
+        installedAgentCount: 3,
+        outOfDate: false,
+      },
+      {
+        catalogId: "paperclipai:removed:team",
+        catalogKey: "paperclipai/removed/team",
+        installedStatus: "installed_missing",
+        installedAgentCount: 2,
+        present: false,
+      },
+    ]);
   });
 
   it("inspects catalog team detail by query ref so keys with slashes work", async () => {

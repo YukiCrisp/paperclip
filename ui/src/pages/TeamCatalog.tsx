@@ -2182,6 +2182,17 @@ export function TeamCatalog() {
   const categoryFilter = searchParams.get("category") ?? "";
   const riskFilter = (searchParams.get("risk") as RiskFilter) ?? "any";
 
+  // Preserve the active filter query (search/kind/category/risk) across in-page
+  // navigation. Without this, auto-select and team-row / file-tree clicks rebuild
+  // a fresh `/teams/<key>` path from `teamRoute()` and drop the query string, so a
+  // landing `?search=…` unfiltered the list and emptied the search box (PAP-10257
+  // follow-up). `applyCompanyPrefix` already preserves query strings.
+  const filterQuery = searchParams.toString();
+  const withFilters = useCallback(
+    (path: string) => (filterQuery ? `${path}?${filterQuery}` : path),
+    [filterQuery],
+  );
+
   const [installOpen, setInstallOpen] = useState(false);
   const isDesktop = useMediaQuery(`(min-width: ${DESKTOP_MIN}px)`);
 
@@ -2225,9 +2236,9 @@ export function TeamCatalog() {
   // (design §11).
   useEffect(() => {
     if (isDesktop && !selectedRef && filtered[0]) {
-      navigate(teamRoute(filtered[0].id), { replace: true });
+      navigate(withFilters(teamRoute(filtered[0].id)), { replace: true });
     }
-  }, [isDesktop, selectedRef, filtered, navigate]);
+  }, [isDesktop, selectedRef, filtered, navigate, withFilters]);
 
   const fileQuery = useQuery({
     queryKey: queryKeys.teamCatalog.catalogFile(selectedTeam?.id ?? "", selectedFilePath ?? ""),
@@ -2423,7 +2434,7 @@ export function TeamCatalog() {
                       key={team.id}
                       team={team}
                       selected={team.id === selectedTeam?.id}
-                      onSelect={() => navigate(teamRoute(team.id))}
+                      onSelect={() => navigate(withFilters(teamRoute(team.id)))}
                     />
                   ))}
                 </>
@@ -2438,7 +2449,7 @@ export function TeamCatalog() {
                       key={team.id}
                       team={team}
                       selected={team.id === selectedTeam?.id}
-                      onSelect={() => navigate(teamRoute(team.id))}
+                      onSelect={() => navigate(withFilters(teamRoute(team.id)))}
                     />
                   ))}
                 </>
@@ -2453,7 +2464,7 @@ export function TeamCatalog() {
                       key={team.id}
                       team={team}
                       selected={team.id === selectedTeam?.id}
-                      onSelect={() => navigate(teamRoute(team.id))}
+                      onSelect={() => navigate(withFilters(teamRoute(team.id)))}
                       installed={installedById.get(team.id) ?? null}
                     />
                   ))}
@@ -2474,7 +2485,7 @@ export function TeamCatalog() {
             {!isDesktop && selectedTeam && (
               <button
                 type="button"
-                onClick={() => navigate("/teams")}
+                onClick={() => navigate(withFilters("/teams"))}
                 className="flex items-center gap-1.5 border-b border-border px-4 py-2 text-sm text-muted-foreground hover:text-foreground"
               >
                 <ChevronLeft className="h-4 w-4" /> Back to catalog
@@ -2485,7 +2496,7 @@ export function TeamCatalog() {
                 team={selectedTeam}
                 selectedPath={selectedFilePath}
                 onSelectFile={(path) =>
-                  navigate(path ? teamRoute(selectedTeam.id, path) : teamRoute(selectedTeam.id))
+                  navigate(withFilters(path ? teamRoute(selectedTeam.id, path) : teamRoute(selectedTeam.id)))
                 }
                 onInstall={() => setInstallOpen(true)}
                 canInstall={canInstall}

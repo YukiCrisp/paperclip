@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/teams-catalog",
   "packageVersion": "0.1.0",
-  "generatedAt": "2026-06-03T17:31:32.494Z",
+  "generatedAt": "2026-06-03T19:51:52.952Z",
   "teams": [
     {
       "id": "paperclipai:bundled:company-defaults:core-exec-team",
@@ -392,7 +392,7 @@
       ],
       "counts": {
         "agents": 1,
-        "projects": 0,
+        "projects": 1,
         "tasks": 0,
         "routines": 1,
         "localSkills": 1,
@@ -405,7 +405,9 @@
       "agentSlugs": [
         "content-lead"
       ],
-      "projectSlugs": [],
+      "projectSlugs": [
+        "content-operations"
+      ],
       "requiredSkills": [
         {
           "type": "local",
@@ -423,8 +425,8 @@
         {
           "path": "TEAM.md",
           "kind": "team",
-          "sizeBytes": 670,
-          "sha256": "07a02f4a7503db77867a664bc0d30000bef19790f46b494a0ca94162cd378019"
+          "sizeBytes": 1032,
+          "sha256": "f7c272c8b0c183fc840d49eb4851b7cdd1a30a5aa8d6415d215110f3238f6f13"
         },
         {
           "path": "agents/content-lead/AGENTS.md",
@@ -433,21 +435,27 @@
           "sha256": "6fc2071ff463b6981780d5b40b2c0784cb119900062f8dc40ed372e7b8415bf7"
         },
         {
+          "path": "projects/content-operations/PROJECT.md",
+          "kind": "project",
+          "sizeBytes": 338,
+          "sha256": "1471f61cb0b3ffbb9c639a99d2d370f08217a0c63f97b3e24dbbd47861110206"
+        },
+        {
+          "path": "projects/content-operations/tasks/weekly-content-review/TASK.md",
+          "kind": "task",
+          "sizeBytes": 236,
+          "sha256": "3777de716334f2c3f24176f0fe121584ce9c53a7f59e1fca942a2f57995cef77"
+        },
+        {
           "path": "skills/content-calendar/SKILL.md",
           "kind": "skill",
           "sizeBytes": 340,
           "sha256": "aa62a332fc3149d6c0d58ca589c6b3910a373d542f16f749ec68ef2f3d7f29e9"
-        },
-        {
-          "path": "tasks/weekly-content-review/TASK.md",
-          "kind": "task",
-          "sizeBytes": 208,
-          "sha256": "b42faffd7ce3267bae5d04472bcba5a880c578a538ecc0339f8df90f352650d5"
         }
       ],
       "trustLevel": "markdown_only",
       "compatibility": "compatible",
-      "contentHash": "sha256:0127b5a93fc1efe8265a2720e4d18f34b9c9a7ba6dd54b2032c3eb2722af2e17"
+      "contentHash": "sha256:06822cec5f2b6910cb37ba0ebd5e04ed5c7e34f77225564ddddc2470779cdaa6"
     }
   ]
 }

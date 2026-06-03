@@ -109,7 +109,34 @@ describe("teamsCatalogService", () => {
     expect(prepared.source.files["COMPANY.md"]).toEqual(expect.stringContaining("Core Exec Team"));
     expect(prepared.source.files["agents/ceo/AGENTS.md"]).toEqual(expect.stringContaining("paperclipai/bundled/paperclip-operations/task-planning"));
     expect(prepared.source.files["agents/cto/AGENTS.md"]).toEqual(expect.stringContaining("paperclipai/bundled/software-development/github-pr-workflow"));
-    expect(prepared.source.files[".paperclip.yaml"]).toEqual(expect.stringContaining("reportsTo: \"engineering-manager\""));
+    expect(prepared.source.files[".paperclip.yaml"]).toEqual(expect.stringContaining("reportsToExistingAgentId: \"manager-1\""));
+    expect(prepared.source.files[".paperclip.yaml"]).toEqual(expect.stringContaining("reportsToExistingAgentSlug: \"engineering-manager\""));
+  });
+
+  it("resolves target-manager slug against same-company agents before rendering reparent metadata", async () => {
+    mockAgentService.list.mockResolvedValue([
+      { id: "manager-1", companyId: "company-1", name: "CEO" },
+    ]);
+    const svc = teamsCatalogService({} as any);
+
+    const prepared = await svc.prepareCatalogTeamSource("company-1", "core-exec-team", {
+      targetManagerSlug: "ceo",
+    });
+
+    expect(mockAgentService.list).toHaveBeenCalledWith("company-1");
+    expect(prepared.source.files[".paperclip.yaml"]).toEqual(expect.stringContaining("reportsToExistingAgentId: \"manager-1\""));
+    expect(prepared.source.files[".paperclip.yaml"]).toEqual(expect.stringContaining("reportsToExistingAgentSlug: \"ceo\""));
+  });
+
+  it("rejects missing target-manager slugs instead of emitting unresolved reparent metadata", async () => {
+    mockAgentService.list.mockResolvedValue([]);
+    const svc = teamsCatalogService({} as any);
+
+    await expect(
+      svc.prepareCatalogTeamSource("company-1", "core-exec-team", {
+        targetManagerSlug: "missing-manager",
+      }),
+    ).rejects.toMatchObject({ status: 404 });
   });
 
   it("previews through company portability in agent-safe mode", async () => {

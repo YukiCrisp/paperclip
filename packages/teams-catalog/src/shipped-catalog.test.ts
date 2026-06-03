@@ -1,5 +1,9 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { catalogManifest, catalogTeams, resolveCatalogTeamRef } from "./index.js";
+import { asBoolean, asString, parseFrontmatterMarkdown } from "./frontmatter.js";
 import type { CatalogTeam } from "./types.js";
 
 const EXPECTED_BUNDLED_KEYS = [
@@ -11,6 +15,8 @@ const EXPECTED_BUNDLED_KEYS = [
 const EXPECTED_OPTIONAL_KEYS = [
   "paperclipai/optional/content/content-machine",
 ];
+
+const PACKAGE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("shipped teams catalog", () => {
   it("ships the expected bundled and optional team fixtures", () => {
@@ -81,6 +87,29 @@ describe("shipped teams catalog", () => {
     expect(resolveCatalogTeamRef(sample.id)).toMatchObject({ key: sample.key });
     expect(resolveCatalogTeamRef(sample.key)).toMatchObject({ key: sample.key });
     expect(resolveCatalogTeamRef(sample.slug)).toMatchObject({ key: sample.key });
+  });
+
+  it("declares a valid project for every shipped recurring task", () => {
+    const issues: string[] = [];
+
+    for (const team of catalogTeams) {
+      for (const file of team.files.filter((entry) => entry.kind === "task")) {
+        const absolutePath = path.join(PACKAGE_DIR, team.path, file.path);
+        const parsed = parseFrontmatterMarkdown(fs.readFileSync(absolutePath, "utf8"));
+        if (!asBoolean(parsed.frontmatter.recurring)) continue;
+
+        const project = asString(parsed.frontmatter.project);
+        if (!project) {
+          issues.push(`${team.key}/${file.path} recurring task must declare a project`);
+          continue;
+        }
+        if (!team.projectSlugs.includes(project)) {
+          issues.push(`${team.key}/${file.path} project=${project} must match a team project`);
+        }
+      }
+    }
+
+    expect(issues).toEqual([]);
   });
 });
 

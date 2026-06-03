@@ -138,6 +138,8 @@ export interface CompanyPortabilityAgentManifestEntry {
   icon: string | null;
   capabilities: string | null;
   reportsToSlug: string | null;
+  reportsToExistingAgentId: string | null;
+  reportsToExistingAgentSlug: string | null;
   adapterType: string;
   adapterConfig: Record<string, unknown>;
   runtimeConfig: Record<string, unknown>;

@@ -1896,6 +1896,8 @@ const YAML_KEY_PRIORITY = [
   "kind",
   "slug",
   "reportsTo",
+  "reportsToExistingAgentId",
+  "reportsToExistingAgentSlug",
   "skills",
   "owner",
   "assignee",
@@ -2699,6 +2701,8 @@ function buildManifestFromPackageFiles(
       icon: asString(extension.icon),
       capabilities: asString(extension.capabilities),
       reportsToSlug: asString(frontmatter.reportsTo) ?? asString(extension.reportsTo),
+      reportsToExistingAgentId: asString(extension.reportsToExistingAgentId),
+      reportsToExistingAgentSlug: asString(extension.reportsToExistingAgentSlug),
       adapterType: asString(extensionAdapter?.type) ?? "process",
       adapterConfig,
       runtimeConfig,
@@ -4021,6 +4025,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
 
     const agentPlans: CompanyPortabilityPreviewAgentPlan[] = [];
     const existingSlugToAgent = new Map<string, { id: string; name: string }>();
+    const existingAgentIds = new Set<string>();
     const existingSlugs = new Set<string>();
     const projectPlans: CompanyPortabilityPreviewResult["plan"]["projectPlans"] = [];
     const issuePlans: CompanyPortabilityPreviewResult["plan"]["issuePlans"] = [];
@@ -4032,6 +4037,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       for (const existing of existingAgents) {
         const slug = normalizeAgentUrlKey(existing.name) ?? existing.id;
         if (!existingSlugToAgent.has(slug)) existingSlugToAgent.set(slug, existing);
+        existingAgentIds.add(existing.id);
         existingSlugs.add(slug);
       }
       const existingProjects = await projects.list(input.target.companyId);
@@ -4058,6 +4064,22 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     }
 
     for (const manifestAgent of selectedAgents) {
+      if (
+        manifestAgent.reportsToExistingAgentId
+        && !existingAgentIds.has(manifestAgent.reportsToExistingAgentId)
+      ) {
+        warnings.push(
+          `Agent ${manifestAgent.slug} references existing manager id ${manifestAgent.reportsToExistingAgentId}, but that agent is not present in the target company.`,
+        );
+      }
+      if (
+        manifestAgent.reportsToExistingAgentSlug
+        && !existingSlugToAgent.has(manifestAgent.reportsToExistingAgentSlug)
+      ) {
+        warnings.push(
+          `Agent ${manifestAgent.slug} references existing manager slug ${manifestAgent.reportsToExistingAgentSlug}, but that agent is not present in the target company.`,
+        );
+      }
       const existing = existingSlugToAgent.get(manifestAgent.slug) ?? null;
       if (!existing) {
         agentPlans.push({
@@ -4424,10 +4446,15 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     const resultProjects: CompanyPortabilityImportResult["projects"] = [];
     const importedSlugToAgentId = new Map<string, string>();
     const existingSlugToAgentId = new Map<string, string>();
+    const preImportExistingSlugToAgentId = new Map<string, string>();
+    const preImportExistingAgentIds = new Set<string>();
     const agentStatusById = new Map<string, string | null | undefined>();
     const existingAgents = await agents.list(targetCompany.id);
     for (const existing of existingAgents) {
-      existingSlugToAgentId.set(normalizeAgentUrlKey(existing.name) ?? existing.id, existing.id);
+      const slug = normalizeAgentUrlKey(existing.name) ?? existing.id;
+      existingSlugToAgentId.set(slug, existing.id);
+      preImportExistingSlugToAgentId.set(slug, existing.id);
+      preImportExistingAgentIds.add(existing.id);
       agentStatusById.set(existing.id, existing.status);
     }
     const importedSlugToProjectId = new Map<string, string>();
@@ -4610,13 +4637,31 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         const agentId = importedSlugToAgentId.get(manifestAgent.slug);
         if (!agentId) continue;
         const managerSlug = manifestAgent.reportsToSlug;
-        if (!managerSlug) continue;
-        const managerId = importedSlugToAgentId.get(managerSlug) ?? existingSlugToAgentId.get(managerSlug) ?? null;
+        let existingManagerId: string | null = null;
+        if (
+          manifestAgent.reportsToExistingAgentId
+          && preImportExistingAgentIds.has(manifestAgent.reportsToExistingAgentId)
+        ) {
+          existingManagerId = manifestAgent.reportsToExistingAgentId;
+        } else if (manifestAgent.reportsToExistingAgentSlug) {
+          existingManagerId =
+            preImportExistingSlugToAgentId.get(manifestAgent.reportsToExistingAgentSlug) ?? null;
+        }
+        if (!managerSlug && !existingManagerId) continue;
+        const managerId =
+          existingManagerId
+          ?? (managerSlug
+            ? importedSlugToAgentId.get(managerSlug) ?? existingSlugToAgentId.get(managerSlug) ?? null
+            : null);
         if (!managerId || managerId === agentId) continue;
         try {
           await agents.update(agentId, { reportsTo: managerId });
         } catch {
-          warnings.push(`Could not assign manager ${managerSlug} for imported agent ${manifestAgent.slug}.`);
+          const managerRef =
+            managerSlug
+            ?? manifestAgent.reportsToExistingAgentSlug
+            ?? manifestAgent.reportsToExistingAgentId;
+          warnings.push(`Could not assign manager ${managerRef} for imported agent ${manifestAgent.slug}.`);
         }
       }
     }

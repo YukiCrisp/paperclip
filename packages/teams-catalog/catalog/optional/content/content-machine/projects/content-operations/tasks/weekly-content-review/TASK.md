@@ -2,6 +2,7 @@
 name: Weekly Content Review
 slug: weekly-content-review
 assignee: content-lead
+project: content-operations
 recurring: true
 ---
 

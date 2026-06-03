@@ -6,6 +6,7 @@ import type {
   CatalogTeamInstallOptions,
   CatalogTeamImportOptions,
   CatalogTeamSourcePolicy,
+  InstalledCatalogTeam,
 } from "@paperclipai/shared";
 import {
   addCommonClientOptions,
@@ -22,6 +23,8 @@ interface TeamBrowseOptions extends BaseClientOptions {
   category?: string;
   query?: string;
 }
+
+interface TeamListOptions extends TeamBrowseOptions {}
 
 interface TeamPreviewOptions extends BaseClientOptions {
   companyId?: string;
@@ -61,6 +64,29 @@ export function registerTeamCommands(program: Command): void {
           handleCommandError(err);
         }
       }),
+  );
+
+  addCommonClientOptions(
+    teams
+      .command("list")
+      .description("List app-shipped catalog teams with installed status for a company")
+      .option("--kind <kind>", "Catalog kind filter (bundled or optional)")
+      .option("--category <slug>", "Catalog category filter")
+      .option("--query <text>", "Search catalog text")
+      .action(async (opts: TeamListOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const rows = await listCatalogTeamStatusRows(ctx, opts);
+          if (ctx.json) {
+            printOutput(rows, { json: true });
+            return;
+          }
+          printCatalogTeamStatusRows(rows);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: true },
   );
 
   addCommonClientOptions(
@@ -198,6 +224,58 @@ async function listCatalogTeams(
   return (await ctx.api.get<CatalogTeam[]>(`/api/teams/catalog${query ? `?${query}` : ""}`)) ?? [];
 }
 
+type CatalogTeamInstalledStatus = "not_installed" | "installed" | "out_of_date" | "installed_missing";
+
+interface CatalogTeamStatusRow {
+  catalogId: string;
+  catalogKey: string | null;
+  kind: CatalogTeam["kind"] | null;
+  category: string | null;
+  slug: string | null;
+  name: string;
+  installedStatus: CatalogTeamInstalledStatus;
+  installedAgentCount: number;
+  catalogAgentCount: number | null;
+  projectCount: number | null;
+  trustLevel: CatalogTeam["trustLevel"] | null;
+  present: boolean;
+  outOfDate: boolean;
+  currentContentHash: string | null;
+  installedOriginHashes: string[];
+}
+
+async function listCatalogTeamStatusRows(
+  ctx: ResolvedClientContext,
+  opts: TeamListOptions,
+): Promise<CatalogTeamStatusRow[]> {
+  if (!ctx.companyId) {
+    throw new Error("Company ID is required.");
+  }
+
+  const [teams, installed] = await Promise.all([
+    listCatalogTeams(ctx, opts),
+    ctx.api.get<InstalledCatalogTeam[]>(
+      `/api/companies/${encodeURIComponent(ctx.companyId)}/teams/catalog/installed`,
+    ),
+  ]);
+
+  const installedByCatalogId = new Map((installed ?? []).map((row) => [row.catalogId, row]));
+  const rows = teams.map((team) => {
+    const installedTeam = installedByCatalogId.get(team.id);
+    if (installedTeam) {
+      installedByCatalogId.delete(team.id);
+    }
+    return buildCatalogTeamStatusRow(team, installedTeam ?? null);
+  });
+
+  for (const installedTeam of installedByCatalogId.values()) {
+    if (installedTeam.present) continue;
+    rows.push(buildMissingInstalledTeamStatusRow(installedTeam));
+  }
+
+  return rows;
+}
+
 async function getCatalogTeam(ctx: ResolvedClientContext, catalogRef: string): Promise<CatalogTeam> {
   const ref = catalogRef.trim();
   if (!ref) {
@@ -307,6 +385,70 @@ function printCatalogTeamRows(rows: CatalogTeam[]): void {
     trust: row.trustLevel,
     agents: row.counts.agents,
     projects: row.counts.projects,
+  })));
+}
+
+function buildCatalogTeamStatusRow(
+  team: CatalogTeam,
+  installed: InstalledCatalogTeam | null,
+): CatalogTeamStatusRow {
+  return {
+    catalogId: team.id,
+    catalogKey: team.key,
+    kind: team.kind,
+    category: team.category,
+    slug: team.slug,
+    name: team.name,
+    installedStatus: installed ? (installed.outOfDate ? "out_of_date" : "installed") : "not_installed",
+    installedAgentCount: installed?.agentCount ?? 0,
+    catalogAgentCount: team.counts.agents,
+    projectCount: team.counts.projects,
+    trustLevel: team.trustLevel,
+    present: true,
+    outOfDate: installed?.outOfDate ?? false,
+    currentContentHash: team.contentHash,
+    installedOriginHashes: installed?.installedOriginHashes ?? [],
+  };
+}
+
+function buildMissingInstalledTeamStatusRow(installed: InstalledCatalogTeam): CatalogTeamStatusRow {
+  const name = installed.catalogKey ?? installed.catalogId;
+  return {
+    catalogId: installed.catalogId,
+    catalogKey: installed.catalogKey,
+    kind: null,
+    category: null,
+    slug: null,
+    name,
+    installedStatus: "installed_missing",
+    installedAgentCount: installed.agentCount,
+    catalogAgentCount: null,
+    projectCount: null,
+    trustLevel: null,
+    present: false,
+    outOfDate: false,
+    currentContentHash: installed.currentContentHash,
+    installedOriginHashes: installed.installedOriginHashes,
+  };
+}
+
+function printCatalogTeamStatusRows(rows: CatalogTeamStatusRow[]): void {
+  if (rows.length === 0) {
+    printOutput([], { json: false });
+    return;
+  }
+  printTable(rows.map((row) => ({
+    id: row.catalogId,
+    key: row.catalogKey,
+    kind: row.kind,
+    category: row.category,
+    slug: row.slug,
+    name: row.name,
+    installedStatus: row.installedStatus,
+    installedAgents: row.installedAgentCount,
+    catalogAgents: row.catalogAgentCount,
+    projects: row.projectCount,
+    trust: row.trustLevel,
   })));
 }
 
