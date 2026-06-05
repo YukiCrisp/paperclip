@@ -1071,8 +1071,7 @@ export function issueRoutes(
       throw forbidden(resolution.detail);
     }
     if (resolution?.kind === "low_trust_review") return false;
-    const sourceTrust = await sourceTrustForActorWrite(issue, actor);
-    return !sourceTrust;
+    return true;
   }
 
   async function lookupLowTrustSourceArtifact(input: {

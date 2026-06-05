@@ -814,6 +814,22 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
       });
       expectNoCanary(higherTrustContext.body, fixture.canaries.raw);
 
+      const bogusRunStandardApp = createApp(db, {
+        ...agentActor(fixture, fixture.agents.standard.id),
+        runId: randomUUID(),
+      });
+      const bogusRunContext = await request(bogusRunStandardApp)
+        .get(`/api/issues/${fixture.issues.reviewRoot.id}/heartbeat-context`);
+      expect(bogusRunContext.status, JSON.stringify(bogusRunContext.body)).toBe(200);
+      expect(bogusRunContext.body.continuationSummary).toMatchObject({
+        body: LOW_TRUST_QUARANTINED_BODY,
+        sourceTrust: {
+          preset: LOW_TRUST_REVIEW_PRESET,
+          disposition: "quarantined",
+        },
+      });
+      expectNoCanary(bogusRunContext.body, fixture.canaries.raw);
+
       await db.update(agents).set({
         status: "idle",
         adapterType: "openclaw_gateway",
