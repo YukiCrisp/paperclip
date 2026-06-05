@@ -20,6 +20,7 @@ const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   getRelationSummaries: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  list: vi.fn(),
   listAttachments: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   remove: vi.fn(),
@@ -68,6 +69,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
+  listActiveForIssues: vi.fn(async () => new Map()),
   resolveActiveForIssue: vi.fn(async () => null),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -114,8 +116,11 @@ function registerRouteMocks() {
   }));
 
   vi.doMock("../services/index.js", () => ({
+    ISSUE_LIST_DEFAULT_LIMIT: 100,
+    ISSUE_LIST_MAX_LIMIT: 500,
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
+    clampIssueListLimit: (value: number) => Math.min(Math.max(value, 1), 500),
     companyService: () => mockCompanyService,
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentService,
@@ -204,8 +209,12 @@ function createRunContextDb(
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
+          orderBy: vi.fn(async () => []),
           then: async (resolve: (rows: unknown[]) => unknown) => {
             const keys = Object.keys(selection);
+            if (keys.includes("entityId")) {
+              return resolve([]);
+            }
             if (keys.includes("contextSnapshot")) {
               return resolve([{
                 id: runId,
@@ -332,10 +341,13 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getById.mockReset();
     mockIssueService.getRelationSummaries.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
+    mockIssueService.list.mockReset();
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.listActiveForIssues.mockReset();
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
     mockIssueRecoveryActionService.resolveActiveForIssue.mockReset();
     mockIssueRecoveryActionService.resolveActiveForIssue.mockResolvedValue({
       id: recoveryActionId,
@@ -403,6 +415,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockResolvedValue({ id: companyId, issuePrefix: "PAP" });
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
+    mockIssueService.list.mockResolvedValue([makeIssue()]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
@@ -507,6 +520,41 @@ describe("agent issue mutation checkout ownership", () => {
       contentLength: 6,
     });
     mockStorageService.deleteObject.mockResolvedValue(undefined);
+  });
+
+  it("uses the company-scope fast path on the issue list route", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "company_scope:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test company scope.",
+        };
+      }
+      if (input.action === "issue:read") {
+        throw new Error("issue:read should not be evaluated for company-scope readers");
+      }
+      return {
+        allowed: true,
+        action: input.action,
+        reason: "allow_test_default",
+        explanation: "Allowed by test default.",
+      };
+    });
+
+    const app = await createApp(boardActor());
+    const res = await request(app).get(`/api/companies/${companyId}/issues`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual([expect.objectContaining({ id: issueId })]);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    }));
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+      action: "issue:read",
+    }));
   });
 
   it.each([

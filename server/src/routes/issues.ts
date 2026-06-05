@@ -1735,6 +1735,15 @@ export function issueRoutes(
     return rows.filter((_, index) => decisions[index]?.allowed);
   }
 
+  async function actorCanReadCompanyScope(req: Request, companyId: string) {
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    return decision.allowed;
+  }
+
   function requireAgentRunId(req: Request, res: Response) {
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
@@ -2358,7 +2367,9 @@ export function issueRoutes(
       sortField: sortField === "updated" ? "updated" : undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
     });
-    const result = await filterIssuesForActor(req, rawResult);
+    const result = await actorCanReadCompanyScope(req, companyId)
+      ? rawResult
+      : await filterIssuesForActor(req, rawResult);
     const issueIds = result.map((issue) => issue.id);
     const [handoffStates, recoveryActionByIssue] = await Promise.all([
       listSuccessfulRunHandoffStates(db, companyId, issueIds),
@@ -2429,12 +2440,7 @@ export function issueRoutes(
       q: req.query.q as string | undefined,
     } as const;
 
-    const companyScopeDecision = await access.decide({
-      actor: req.actor,
-      action: "company_scope:read",
-      resource: { type: "company", companyId },
-    });
-    if (!companyScopeDecision.allowed) {
+    if (!(await actorCanReadCompanyScope(req, companyId))) {
       let offset = 0;
       let visibleCount = 0;
       while (true) {

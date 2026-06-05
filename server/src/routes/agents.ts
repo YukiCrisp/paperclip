@@ -580,6 +580,9 @@ export function agentRoutes(
   }
 
   async function resolveAgentSelfTrustPreset(req: Request, agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {
+    if (req.actor.type !== "agent" || req.actor.agentId !== agent.id) {
+      return { kind: "standard" as const };
+    }
     const run = req.actor.type === "agent" && req.actor.runId
       ? await db
           .select({
