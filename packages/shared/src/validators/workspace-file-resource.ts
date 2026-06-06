@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const workspaceFileWorkspaceKindSchema = z.enum(["execution_workspace", "project_workspace"]);
 export const workspaceFileSelectorSchema = z.enum(["auto", "execution", "project"]).default("auto");
+export const workspaceFileListModeSchema = z.enum(["all", "recent", "changed"]).default("all");
 export const workspaceFilePreviewKindSchema = z.enum(["text", "image", "pdf", "unsupported"]);
 export const workspaceFileResourceKindSchema = z.enum(["file", "remote_resource"]);
 
@@ -25,6 +26,20 @@ export const workspaceFileResourceQuerySchema = z.object({
       params: { code: "invalid_path" },
     }),
   workspace: workspaceFileSelectorSchema.optional(),
+});
+
+export const workspaceFileListQuerySchema = z.object({
+  workspace: workspaceFileSelectorSchema.optional(),
+  mode: workspaceFileListModeSchema.optional(),
+  q: z
+    .string()
+    .max(200)
+    .refine((value) => !/[\x00-\x1f\x7f]/.test(value), {
+      message: "Workspace file search contains an invalid character",
+      params: { code: "invalid_query" },
+    })
+    .optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 
 export const resolvedWorkspaceResourceSchema = z.object({
@@ -55,3 +70,4 @@ export const workspaceFileContentSchema = z.object({
 });
 
 export type WorkspaceFileResourceQuery = z.infer<typeof workspaceFileResourceQuerySchema>;
+export type WorkspaceFileListQuery = z.infer<typeof workspaceFileListQuerySchema>;

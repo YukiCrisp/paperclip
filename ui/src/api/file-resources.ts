@@ -1,6 +1,8 @@
 import type {
   ResolvedWorkspaceResource,
   WorkspaceFileContent,
+  WorkspaceFileListMode,
+  WorkspaceFileListResponse,
   WorkspaceFileSelector,
 } from "@paperclipai/shared";
 import { api } from "./client";
@@ -10,16 +12,34 @@ export interface FileResourceQuery {
   workspace?: WorkspaceFileSelector;
 }
 
-function buildQuery(query: FileResourceQuery): string {
+export interface FileResourceListQuery {
+  workspace?: WorkspaceFileSelector;
+  mode?: WorkspaceFileListMode;
+  q?: string | null;
+  limit?: number;
+}
+
+function buildQuery(query: FileResourceQuery | FileResourceListQuery): string {
   const params = new URLSearchParams();
-  params.set("path", query.path);
+  if ("path" in query) params.set("path", query.path);
   if (query.workspace && query.workspace !== "auto") {
     params.set("workspace", query.workspace);
   }
+  if ("mode" in query && query.mode && query.mode !== "all") params.set("mode", query.mode);
+  if ("q" in query && query.q) params.set("q", query.q);
+  if ("limit" in query && query.limit) params.set("limit", String(query.limit));
   return params.toString();
 }
 
 export const fileResourcesApi = {
+  list(issueId: string, query: FileResourceListQuery = {}): Promise<WorkspaceFileListResponse> {
+    const search = buildQuery(query);
+    const suffix = search ? `?${search}` : "";
+    return api.get<WorkspaceFileListResponse>(
+      `/issues/${encodeURIComponent(issueId)}/file-resources/list${suffix}`,
+    );
+  },
+
   resolve(issueId: string, query: FileResourceQuery): Promise<ResolvedWorkspaceResource> {
     return api.get<ResolvedWorkspaceResource>(
       `/issues/${encodeURIComponent(issueId)}/file-resources/resolve?${buildQuery(query)}`,

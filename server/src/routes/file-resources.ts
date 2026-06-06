@@ -2,9 +2,11 @@ import { Router } from "express";
 import { ZodError } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
+  workspaceFileListQuerySchema,
   workspaceFileResourceQuerySchema,
   type ResolvedWorkspaceResource,
   type WorkspaceFileContent,
+  type WorkspaceFileListResponse,
 } from "@paperclipai/shared";
 import { HttpError, unprocessable } from "../errors.js";
 import { workspaceFileResourceService } from "../services/index.js";
@@ -13,6 +15,12 @@ import { logActivity } from "../services/activity-log.js";
 
 export type WorkspaceFileResourceService = {
   getIssue(issueId: string): Promise<{ companyId: string }>;
+  list(issueId: string, input: {
+    workspace?: "auto" | "execution" | "project" | null;
+    mode?: "all" | "recent" | "changed" | null;
+    q?: string | null;
+    limit?: number | null;
+  }): Promise<WorkspaceFileListResponse>;
   resolve(issueId: string, input: { path: string; workspace?: "auto" | "execution" | "project" | null }): Promise<ResolvedWorkspaceResource>;
   readContent(issueId: string, input: { path: string; workspace?: "auto" | "execution" | "project" | null }): Promise<WorkspaceFileContent>;
 };
@@ -85,8 +93,29 @@ function readQuery(query: unknown) {
   };
 }
 
+function readListQuery(query: unknown) {
+  let parsed;
+  try {
+    parsed = workspaceFileListQuerySchema.parse(query);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      const refinement = error.errors.find(
+        (issue) => (issue as { params?: { code?: string } }).params?.code === "invalid_query",
+      );
+      if (refinement) throw unprocessable(refinement.message, { code: "invalid_query" });
+    }
+    throw error;
+  }
+  return {
+    workspace: parsed.workspace ?? "auto",
+    mode: parsed.mode ?? "all",
+    q: parsed.q?.trim() || null,
+    limit: parsed.limit,
+  };
+}
+
 function activityDetails(input: {
-  outcome: "success" | "denied";
+  outcome: "success" | "denied" | "unavailable";
   workspaceKind?: string | null;
   workspaceId?: string | null;
   displayPath?: string | null;
@@ -146,6 +175,37 @@ export function fileResourceRoutes(db: Db, opts: {
       }),
     });
   }
+
+  router.get("/issues/:issueId/file-resources/list", async (req, res) => {
+    assertBoard(req);
+    const issue = await svc.getIssue(req.params.issueId);
+    assertCompanyAccess(req, issue.companyId);
+    const actor = getActorInfo(req);
+    const query = readListQuery(req.query);
+    const release = limiter.acquire(limiterKey(issue.companyId, actor.actorId, req.params.issueId));
+    try {
+      const result = await svc.list(req.params.issueId, query);
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        action: "issue.file_resource_list_read",
+        entityType: "issue",
+        entityId: req.params.issueId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        details: activityDetails({
+          outcome: result.state === "available" ? "success" : "unavailable",
+          workspaceKind: result.workspace?.workspaceKind ?? null,
+          workspaceId: result.workspace?.workspaceId ?? null,
+          denialReason: result.unavailableReason ?? null,
+        }),
+      });
+      res.json(result);
+    } finally {
+      release();
+    }
+  });
 
   router.get("/issues/:issueId/file-resources/resolve", async (req, res) => {
     assertBoard(req);

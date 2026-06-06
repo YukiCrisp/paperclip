@@ -1,11 +1,16 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issues, projectWorkspaces } from "@paperclipai/db";
 import type {
   ResolvedWorkspaceResource,
   WorkspaceFileContent,
+  WorkspaceFileListItem,
+  WorkspaceFileListMode,
+  WorkspaceFileListResponse,
   WorkspaceFilePreviewKind,
   WorkspaceFileSelector,
   WorkspaceFileWorkspaceKind,
@@ -14,8 +19,14 @@ import { HttpError, notFound, unprocessable } from "../errors.js";
 
 export const WORKSPACE_FILE_TEXT_MAX_BYTES = 512 * 1024;
 export const WORKSPACE_FILE_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+export const WORKSPACE_FILE_LIST_DEFAULT_LIMIT = 100;
+export const WORKSPACE_FILE_LIST_MAX_LIMIT = 500;
+export const WORKSPACE_FILE_LIST_MAX_SCANNED_ENTRIES = 5_000;
 const MAX_RELATIVE_PATH_BYTES = 4096;
 const TEXT_SNIFF_BYTES = 4096;
+const MAX_LIST_DEPTH = 16;
+const GIT_STATUS_MAX_BUFFER_BYTES = 1024 * 1024;
+const execFileAsync = promisify(execFile);
 
 const DENIED_SEGMENTS = new Set([
   ".git",
@@ -99,12 +110,24 @@ type LocalResolvedFile = {
   realPath: string;
 };
 
+type WorkspaceFileListQueryInput = {
+  workspace?: WorkspaceFileSelector | null;
+  mode?: WorkspaceFileListMode | null;
+  q?: string | null;
+  limit?: number | null;
+};
+
 function previewCapForKind(kind: WorkspaceFilePreviewKind) {
   return kind === "image" || kind === "pdf" ? WORKSPACE_FILE_MEDIA_MAX_BYTES : WORKSPACE_FILE_TEXT_MAX_BYTES;
 }
 
 function relativePathFromReal(rootReal: string, targetReal: string) {
   return path.relative(rootReal, targetReal).split(path.sep).join(path.posix.sep);
+}
+
+function isInsideRoot(rootReal: string, targetReal: string) {
+  const realRelative = path.relative(rootReal, targetReal);
+  return realRelative === "" || (!realRelative.startsWith("..") && !path.isAbsolute(realRelative));
 }
 
 function normalizeWorkspaceRelativePath(input: string): NormalizedPath {
@@ -154,6 +177,10 @@ function throwIfDenied(segments: string[]) {
   }
 }
 
+function shouldPruneSegments(segments: string[]) {
+  return denyReasonForPathSegments(segments) != null;
+}
+
 function contentTypeForPath(filePath: string): string | null {
   const ext = path.extname(filePath).toLowerCase();
   if (IMAGE_CONTENT_TYPES.has(ext)) return IMAGE_CONTENT_TYPES.get(ext) ?? null;
@@ -171,6 +198,37 @@ function previewKindForKnownContentType(contentType: string | null): WorkspaceFi
   if (contentType === "text/html") return "unsupported";
   if (contentType === "image/svg+xml" || contentType.startsWith("text/")) return "text";
   return "unsupported";
+}
+
+function listItemFromStat(input: {
+  candidate: WorkspaceCandidate;
+  relativePath: string;
+  stat: { size: number; mtime: Date };
+}): WorkspaceFileListItem | null {
+  const contentType = contentTypeForPath(input.relativePath);
+  const previewKind = previewKindForKnownContentType(contentType);
+  if (!previewKind || previewKind === "unsupported") return null;
+  if (input.stat.size > previewCapForKind(previewKind)) return null;
+
+  return {
+    kind: "file",
+    provider: input.candidate.provider,
+    title: path.posix.basename(input.relativePath),
+    relativePath: input.relativePath,
+    displayPath: input.relativePath,
+    workspaceLabel: input.candidate.label,
+    workspaceKind: input.candidate.workspaceKind,
+    workspaceId: input.candidate.workspaceId,
+    contentType: contentType ?? (previewKind === "text" ? "text/plain; charset=utf-8" : "application/octet-stream"),
+    byteSize: input.stat.size,
+    modifiedAt: input.stat.mtime.toISOString(),
+    previewKind,
+    capabilities: {
+      preview: true,
+      download: false,
+      listChildren: false,
+    },
+  };
 }
 
 function looksLikeText(buffer: Buffer) {
@@ -326,6 +384,237 @@ async function readStableFile(realPath: string, maxBytes: number) {
   }
 }
 
+function unavailableFileList(input: {
+  selector: WorkspaceFileSelector;
+  mode: WorkspaceFileListMode;
+  q: string | null;
+  limit: number;
+  candidate?: WorkspaceCandidate | null;
+  reason: string;
+}): WorkspaceFileListResponse {
+  return {
+    kind: "workspace_file_list",
+    state: "unavailable",
+    unavailableReason: input.reason,
+    workspace: input.candidate
+      ? {
+          provider: input.candidate.provider,
+          workspaceLabel: input.candidate.label,
+          workspaceKind: input.candidate.workspaceKind,
+          workspaceId: input.candidate.workspaceId,
+        }
+      : null,
+    query: {
+      workspace: input.selector,
+      mode: input.mode,
+      q: input.q,
+      limit: input.limit,
+    },
+    items: [],
+    scannedCount: 0,
+    truncated: false,
+  };
+}
+
+function availableFileList(input: {
+  selector: WorkspaceFileSelector;
+  mode: WorkspaceFileListMode;
+  q: string | null;
+  limit: number;
+  candidate: WorkspaceCandidate;
+  items: WorkspaceFileListItem[];
+  scannedCount: number;
+  truncated: boolean;
+}): WorkspaceFileListResponse {
+  return {
+    kind: "workspace_file_list",
+    state: "available",
+    workspace: {
+      provider: input.candidate.provider,
+      workspaceLabel: input.candidate.label,
+      workspaceKind: input.candidate.workspaceKind,
+      workspaceId: input.candidate.workspaceId,
+    },
+    query: {
+      workspace: input.selector,
+      mode: input.mode,
+      q: input.q,
+      limit: input.limit,
+    },
+    items: input.items,
+    scannedCount: input.scannedCount,
+    truncated: input.truncated,
+  };
+}
+
+function matchesSearch(relativePath: string, normalizedQuery: string | null) {
+  return !normalizedQuery || relativePath.toLowerCase().includes(normalizedQuery);
+}
+
+async function listLocalFileCandidate(input: {
+  candidate: WorkspaceCandidate;
+  rootReal: string;
+  relativePath: string;
+  normalizedQuery: string | null;
+}): Promise<WorkspaceFileListItem | null> {
+  let normalized: NormalizedPath;
+  try {
+    normalized = normalizeWorkspaceRelativePath(input.relativePath);
+  } catch {
+    return null;
+  }
+  if (shouldPruneSegments(normalized.segments)) return null;
+  if (!matchesSearch(normalized.relativePath, input.normalizedQuery)) return null;
+
+  const targetLexical = path.resolve(input.rootReal, ...normalized.segments);
+  let targetReal: string;
+  let stat;
+  try {
+    targetReal = await fs.realpath(targetLexical);
+    if (!isInsideRoot(input.rootReal, targetReal)) return null;
+    const realRelative = relativePathFromReal(input.rootReal, targetReal);
+    if (shouldPruneSegments(realRelative.split("/").filter(Boolean))) return null;
+    stat = await fs.lstat(targetLexical);
+  } catch {
+    return null;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) return null;
+  return listItemFromStat({ candidate: input.candidate, relativePath: normalized.relativePath, stat });
+}
+
+async function enumerateWorkspaceFiles(input: {
+  candidate: WorkspaceCandidate;
+  rootReal: string;
+  mode: WorkspaceFileListMode;
+  normalizedQuery: string | null;
+  limit: number;
+}) {
+  const dirs: Array<{ realPath: string; relativePath: string; depth: number }> = [
+    { realPath: input.rootReal, relativePath: "", depth: 0 },
+  ];
+  const items: WorkspaceFileListItem[] = [];
+  let scannedCount = 0;
+  let truncated = false;
+  let hitScanCap = false;
+
+  while (dirs.length > 0) {
+    const dir = dirs.shift()!;
+    let entries;
+    try {
+      entries = await fs.readdir(dir.realPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      scannedCount += 1;
+      if (scannedCount > WORKSPACE_FILE_LIST_MAX_SCANNED_ENTRIES) {
+        truncated = true;
+        hitScanCap = true;
+        break;
+      }
+      if (entry.name.includes("\0") || entry.name.includes("/") || entry.name.includes("\\")) continue;
+
+      const relativePath = dir.relativePath ? `${dir.relativePath}/${entry.name}` : entry.name;
+      const segments = relativePath.split("/").filter(Boolean);
+      if (shouldPruneSegments(segments)) continue;
+      if (entry.isSymbolicLink()) continue;
+
+      if (entry.isDirectory()) {
+        if (dir.depth >= MAX_LIST_DEPTH) {
+          truncated = true;
+          continue;
+        }
+        dirs.push({
+          realPath: path.join(dir.realPath, entry.name),
+          relativePath,
+          depth: dir.depth + 1,
+        });
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      const item = await listLocalFileCandidate({
+        candidate: input.candidate,
+        rootReal: input.rootReal,
+        relativePath,
+        normalizedQuery: input.normalizedQuery,
+      });
+      if (item) items.push(item);
+
+      if (input.mode !== "recent" && items.length >= input.limit) {
+        truncated = true;
+        break;
+      }
+    }
+    if (hitScanCap || (truncated && input.mode !== "recent")) break;
+  }
+
+  if (input.mode === "recent") {
+    items.sort((a, b) => (b.modifiedAt ?? "").localeCompare(a.modifiedAt ?? "") || a.displayPath.localeCompare(b.displayPath));
+    truncated = truncated || items.length > input.limit;
+    return { items: items.slice(0, input.limit), scannedCount, truncated };
+  }
+
+  return { items, scannedCount, truncated };
+}
+
+function parseGitStatusPaths(stdout: string) {
+  const tokens = stdout.split("\0").filter(Boolean);
+  const paths: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i]!;
+    if (token.length < 4) continue;
+    const status = token.slice(0, 2);
+    const filePath = token.slice(3);
+    if (filePath) paths.push(filePath);
+    if (status.includes("R") || status.includes("C")) i += 1;
+    if (paths.length >= WORKSPACE_FILE_LIST_MAX_SCANNED_ENTRIES) break;
+  }
+  return paths;
+}
+
+async function listChangedWorkspaceFiles(input: {
+  candidate: WorkspaceCandidate;
+  rootReal: string;
+  normalizedQuery: string | null;
+  limit: number;
+}) {
+  let stdout: string;
+  try {
+    const result = await execFileAsync(
+      "git",
+      ["-C", input.rootReal, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+      { maxBuffer: GIT_STATUS_MAX_BUFFER_BYTES },
+    );
+    stdout = result.stdout;
+  } catch {
+    return { unavailableReason: "changed_unavailable" as const };
+  }
+
+  const paths = parseGitStatusPaths(stdout);
+  const items: WorkspaceFileListItem[] = [];
+  let scannedCount = 0;
+  for (const filePath of paths) {
+    scannedCount += 1;
+    const item = await listLocalFileCandidate({
+      candidate: input.candidate,
+      rootReal: input.rootReal,
+      relativePath: filePath,
+      normalizedQuery: input.normalizedQuery,
+    });
+    if (item) items.push(item);
+    if (items.length >= input.limit) break;
+  }
+  items.sort((a, b) => a.displayPath.localeCompare(b.displayPath));
+  return {
+    items,
+    scannedCount,
+    truncated: paths.length > scannedCount || items.length >= input.limit,
+  };
+}
+
 export function workspaceFileResourceService(db: Db) {
   async function getIssue(issueId: string): Promise<IssueRow> {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId)).limit(1);
@@ -426,6 +715,93 @@ export function workspaceFileResourceService(db: Db) {
     throw unprocessable("No local-readable workspace is available for this issue", { code: "no_local_workspace" });
   }
 
+  async function list(issueId: string, input: WorkspaceFileListQueryInput = {}): Promise<WorkspaceFileListResponse> {
+    const issue = await getIssue(issueId);
+    const selector = input.workspace ?? "auto";
+    const mode = input.mode ?? "all";
+    const limit = Math.min(
+      WORKSPACE_FILE_LIST_MAX_LIMIT,
+      Math.max(1, Math.floor(input.limit ?? WORKSPACE_FILE_LIST_DEFAULT_LIMIT)),
+    );
+    const q = input.q?.trim() || null;
+    const normalizedQuery = q?.toLowerCase() ?? null;
+    const candidates = await listCandidates(issue, selector);
+    if (candidates.length === 0) {
+      return unavailableFileList({ selector, mode, q, limit, reason: "no_workspace" });
+    }
+
+    let firstUnavailable: { candidate: WorkspaceCandidate; reason: string } | null = null;
+    for (const candidate of candidates) {
+      if (candidate.remote) {
+        firstUnavailable ??= { candidate, reason: "remote_workspace" };
+        if (selector !== "auto") {
+          return unavailableFileList({ selector, mode, q, limit, candidate, reason: "remote_workspace" });
+        }
+        continue;
+      }
+
+      let rootReal: string;
+      try {
+        rootReal = await fs.realpath(candidate.rootPath!);
+      } catch {
+        firstUnavailable ??= { candidate, reason: "workspace_unavailable" };
+        if (selector !== "auto") {
+          return unavailableFileList({ selector, mode, q, limit, candidate, reason: "workspace_unavailable" });
+        }
+        continue;
+      }
+
+      if (mode === "changed") {
+        const changed = await listChangedWorkspaceFiles({ candidate, rootReal, normalizedQuery, limit });
+        if ("unavailableReason" in changed) {
+          const reason = changed.unavailableReason ?? "changed_unavailable";
+          firstUnavailable ??= { candidate, reason };
+          if (selector !== "auto") {
+            return unavailableFileList({ selector, mode, q, limit, candidate, reason });
+          }
+          continue;
+        }
+        return availableFileList({
+          selector,
+          mode,
+          q,
+          limit,
+          candidate,
+          items: changed.items,
+          scannedCount: changed.scannedCount,
+          truncated: changed.truncated,
+        });
+      }
+
+      const listed = await enumerateWorkspaceFiles({
+        candidate,
+        rootReal,
+        mode,
+        normalizedQuery,
+        limit,
+      });
+      return availableFileList({
+        selector,
+        mode,
+        q,
+        limit,
+        candidate,
+        items: listed.items,
+        scannedCount: listed.scannedCount,
+        truncated: listed.truncated,
+      });
+    }
+
+    return unavailableFileList({
+      selector,
+      mode,
+      q,
+      limit,
+      candidate: firstUnavailable?.candidate ?? null,
+      reason: firstUnavailable?.reason ?? "no_local_workspace",
+    });
+  }
+
   async function readContent(issueId: string, input: {
     path: string;
     workspace?: WorkspaceFileSelector | null;
@@ -479,6 +855,7 @@ export function workspaceFileResourceService(db: Db) {
 
   return {
     getIssue,
+    list,
     resolve,
     readContent,
   };

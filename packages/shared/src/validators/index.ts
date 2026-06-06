@@ -360,6 +360,8 @@ export {
 
 export {
   resolvedWorkspaceResourceSchema,
+  workspaceFileListModeSchema,
+  workspaceFileListQuerySchema,
   workspaceFileContentSchema,
   workspaceFilePreviewKindSchema,
   workspaceFileRefSchema,
@@ -367,6 +369,7 @@ export {
   workspaceFileResourceQuerySchema,
   workspaceFileSelectorSchema,
   workspaceFileWorkspaceKindSchema,
+  type WorkspaceFileListQuery,
   type WorkspaceFileResourceQuery,
 } from "./workspace-file-resource.js";
 

@@ -1,5 +1,6 @@
 export type WorkspaceFileWorkspaceKind = "execution_workspace" | "project_workspace";
 export type WorkspaceFileSelector = "auto" | "execution" | "project";
+export type WorkspaceFileListMode = "all" | "recent" | "changed";
 export type WorkspaceFilePreviewKind = "text" | "image" | "pdf" | "unsupported";
 export type WorkspaceFileResourceKind = "file" | "remote_resource";
 export type WorkspaceFileContentEncoding = "utf8" | "base64";
@@ -40,4 +41,45 @@ export interface WorkspaceFileContent {
     encoding: WorkspaceFileContentEncoding;
     data: string;
   };
+}
+
+export interface WorkspaceFileListItem {
+  kind: "file";
+  provider: "local_fs" | "git_worktree" | string;
+  title: string;
+  relativePath: string;
+  displayPath: string;
+  workspaceLabel: string;
+  workspaceKind: WorkspaceFileWorkspaceKind;
+  workspaceId: string;
+  contentType?: string | null;
+  byteSize?: number | null;
+  modifiedAt?: string | null;
+  previewKind: Exclude<WorkspaceFilePreviewKind, "unsupported">;
+  capabilities: {
+    preview: true;
+    download: false;
+    listChildren: false;
+  };
+}
+
+export interface WorkspaceFileListResponse {
+  kind: "workspace_file_list";
+  state: "available" | "unavailable";
+  unavailableReason?: string | null;
+  workspace: {
+    provider: "local_fs" | "git_worktree" | string;
+    workspaceLabel: string;
+    workspaceKind: WorkspaceFileWorkspaceKind;
+    workspaceId: string;
+  } | null;
+  query: {
+    workspace: WorkspaceFileSelector;
+    mode: WorkspaceFileListMode;
+    q: string | null;
+    limit: number;
+  };
+  items: WorkspaceFileListItem[];
+  scannedCount: number;
+  truncated: boolean;
 }

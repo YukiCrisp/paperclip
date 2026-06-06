@@ -206,6 +206,68 @@ describeEmbeddedPostgres("workspace file resources", () => {
     expect(resolved.capabilities.preview).toBe(true);
   });
 
+  it("lists and searches safe file candidates from the preferred execution workspace", async () => {
+    const { root, projectRoot, executionRoot } = await makeWorkspace();
+    const graph = await seedGraph(db, { projectRoot, executionRoot });
+    await fs.mkdir(path.join(executionRoot, "src"), { recursive: true });
+    await fs.mkdir(path.join(executionRoot, "node_modules", "pkg"), { recursive: true });
+    await fs.writeFile(path.join(executionRoot, "src", "app.ts"), "export const ok = true;\n", "utf8");
+    await fs.writeFile(path.join(executionRoot, ".env"), "TOKEN=secret\n", "utf8");
+    await fs.writeFile(path.join(executionRoot, "node_modules", "pkg", "index.ts"), "export {}\n", "utf8");
+    await fs.writeFile(path.join(executionRoot, "blob.bin"), Buffer.from([0, 1, 2, 3]));
+    await fs.writeFile(path.join(projectRoot, "src-project.ts"), "export const project = true;\n", "utf8");
+    await fs.writeFile(path.join(root, "outside.ts"), "secret\n", "utf8");
+    await fs.symlink(path.join(root, "outside.ts"), path.join(executionRoot, "escape.ts"));
+
+    const app = createApp(db, {
+      type: "board",
+      userId: "board-user",
+      companyIds: [graph.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    const res = await request(app)
+      .get(`/api/issues/${graph.issueId}/file-resources/list`)
+      .query({ workspace: "auto", q: "src", limit: 10 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("available");
+    expect(res.body.workspace.workspaceKind).toBe("execution_workspace");
+    expect(res.body.items.map((item: { displayPath: string }) => item.displayPath)).toEqual(["src/app.ts"]);
+    expect(JSON.stringify(res.body)).not.toContain(root);
+    expect(JSON.stringify(res.body)).not.toContain(".env");
+    expect(JSON.stringify(res.body)).not.toContain("node_modules");
+    expect(JSON.stringify(res.body)).not.toContain("escape.ts");
+    expect(JSON.stringify(res.body)).not.toContain("blob.bin");
+  });
+
+  it("supports recent mode, limit caps, and list activity logging", async () => {
+    const { projectRoot, executionRoot } = await makeWorkspace();
+    const graph = await seedGraph(db, { projectRoot, executionRoot });
+    await fs.writeFile(path.join(projectRoot, "old.ts"), "export const old = true;\n", "utf8");
+    await fs.writeFile(path.join(projectRoot, "new.ts"), "export const newer = true;\n", "utf8");
+
+    const app = createApp(db, {
+      type: "board",
+      userId: "board-user",
+      companyIds: [graph.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    const res = await request(app)
+      .get(`/api/issues/${graph.issueId}/file-resources/list`)
+      .query({ workspace: "project", mode: "recent", limit: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.truncated).toBe(true);
+
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, graph.issueId));
+    const listRead = rows.find((row) => row.action === "issue.file_resource_list_read");
+    expect(listRead).toBeTruthy();
+    expect(JSON.stringify(listRead?.details)).not.toContain(projectRoot);
+  });
+
   it("rejects control characters in the path without crashing the audit log", async () => {
     const { projectRoot, executionRoot } = await makeWorkspace();
     const graph = await seedGraph(db, { projectRoot, executionRoot });
@@ -335,6 +397,21 @@ describeEmbeddedPostgres("workspace file resources", () => {
       path: "http://169.254.169.254/latest/meta-data/",
       workspace: "project",
     })).rejects.toMatchObject({ status: 422 });
+
+    const app = createApp(db, {
+      type: "board",
+      userId: "board-user",
+      companyIds: [graph.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    const listed = await request(app)
+      .get(`/api/issues/${graph.issueId}/file-resources/list`)
+      .query({ workspace: "project" });
+    expect(listed.status).toBe(200);
+    expect(listed.body.state).toBe("unavailable");
+    expect(listed.body.unavailableReason).toBe("remote_workspace");
+    expect(listed.body.items).toEqual([]);
   });
 
   it("blocks agents and cross-company board users before content reads", async () => {
@@ -358,6 +435,8 @@ describeEmbeddedPostgres("workspace file resources", () => {
 
     expect((await request(agentApp).get(`/api/issues/${graph.issueId}/file-resources/content`).query({ path: "README.md" })).status).toBe(403);
     expect((await request(boardApp).get(`/api/issues/${graph.issueId}/file-resources/content`).query({ path: "README.md" })).status).toBe(403);
+    expect((await request(agentApp).get(`/api/issues/${graph.issueId}/file-resources/list`)).status).toBe(403);
+    expect((await request(boardApp).get(`/api/issues/${graph.issueId}/file-resources/list`)).status).toBe(403);
   });
 
   it("logs successful content reads and denied security-relevant attempts", async () => {
@@ -395,6 +474,9 @@ describe("file resource route guards", () => {
     });
     const service: WorkspaceFileResourceService = {
       getIssue: vi.fn(async () => ({ companyId: "company-1" })),
+      list: vi.fn(async () => {
+        throw new Error("not used");
+      }),
       resolve: vi.fn(async () => {
         slowReadStarted?.();
         await slowRead;
