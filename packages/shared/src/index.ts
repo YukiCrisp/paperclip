@@ -814,6 +814,12 @@ export {
 } from "./issue-references.js";
 
 export {
+  buildDocumentReferenceHref,
+  parseDocumentReferenceHref,
+  type ParsedDocumentReference,
+} from "./document-references.js";
+
+export {
   anchorSnapshotToSelector,
   createDocumentAnchorSelector,
   normalizeAnchorText,
