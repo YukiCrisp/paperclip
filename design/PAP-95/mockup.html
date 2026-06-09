@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>PAP-95 · Unified Chat — Conference Room ↔ Task Comments (rev 3)</title>
+<title>PAP-95 · Unified Chat — Conference Room ↔ Task Comments (rev 4)</title>
 <style>
   /* ------------------------------------------------------------------ *
-   * Brand tokens (paperclip.ing/brand) — liveness blue = #2563EB        *
-   * rev 3 — board feedback: planning mode = YELLOW (chip + whole box),   *
-   * conf-room mode recommendation, @-mention answer, no blue outline.    *
+   * Brand tokens (paperclip.ing/brand · PAP-75 status guide)            *
+   * blue #2563EB = liveness (human + in_progress) · amber = planning    *
+   * rev 4 — board feedback: brand status chips (in_progress=blue),      *
+   * no room mode, neutral Approve CTA, plans render as a distinct card. *
    * ------------------------------------------------------------------ */
   :root {
-    --blue: #2563EB; --blue-soft: #DBEAFE; --blue-ink: #1D4ED8;
-    --amber: #F59E0B; --green: #22C55E; --violet: #7C3AED; --red: #DC2626;
+    --blue: #2563EB; --amber: #F59E0B; --green: #22C55E; --violet: #7C3AED; --red: #DC2626;
     --radius: 15px; font-synthesis: none;
   }
   [data-theme="light"] {
@@ -99,7 +99,7 @@
   .bubble p { margin: 0 0 6px; } .bubble p:last-child { margin: 0; }
   .bubble code { font-size: 12px; background: color-mix(in srgb, var(--ink) 8%, transparent); padding: 1px 5px; border-radius: 5px; }
   .bubble.me code { background: rgba(255,255,255,.18); }
-  .bubble ul { margin: 4px 0 0; padding-left: 18px; }
+
   .stamp { font-size: 10px; color: var(--faint); margin-top: 3px; padding: 0 4px; }
 
   /* ---- Metadata rows (#3): NOT a bubble ---- */
@@ -109,24 +109,44 @@
   .meta .ic svg { width: 11px; height: 11px; color: var(--faint); }
   .meta b { color: var(--ink); font-weight: 600; }
   .meta .when { color: var(--faint); }
-  .meta .statuschip { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid; font-weight: 600; }
-  .sc-prog { background: color-mix(in srgb, var(--amber) 16%, transparent); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, transparent); }
-  .sc-done { background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
   .arrow { color: var(--faint); }
 
-  .approval { border: 1px solid color-mix(in srgb, var(--violet) 45%, transparent); background: color-mix(in srgb, var(--violet) 9%, transparent); border-radius: 12px; padding: 12px 14px; font-size: 13px; }
-  .approval .hd { font-weight: 650; display: flex; align-items: center; gap: 8px; }
-  .approval .hd .badge { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; border:1px solid color-mix(in srgb, var(--violet) 50%, transparent); color: var(--violet); border-radius: 999px; padding: 1px 8px; }
-  .approval .acts { display: flex; gap: 8px; margin-top: 10px; }
-  .btn { font: inherit; font-size: 12px; font-weight: 600; border-radius: 8px; padding: 6px 14px; cursor: pointer; border: 1px solid var(--rule); background: var(--card); color: var(--ink); }
-  .btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  /* ---- Brand status chips (PAP-75) — light defaults + dark overrides ---- */
+  .statuschip { font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 999px; border: 1px solid; line-height: 1.5; display: inline-flex; align-items: center; gap: 5px; }
+  .sc-backlog { background:#F5F3F0; color:#52585D; border-color:#A8AEB2; }
+  .sc-todo    { background:#FEF3C7; color:#B45309; border-color:#F59E0B; }
+  .sc-prog    { background:#DBEAFE; color:#1D4ED8; border-color:#2563EB; }  /* in_progress = BLUE (liveness) */
+  .sc-review  { background:#EDE9FE; color:#5B21B6; border-color:#7C3AED; }
+  .sc-done    { background:#DCFCE7; color:#188A3C; border-color:#22C55E; }
+  .sc-blocked { background:#FEE2E2; color:#991B1B; border-color:#DC2626; }
+  [data-theme="dark"] .sc-backlog { background:#6e696024; color:#9A958A; border-color:#9e958a73; }
+  [data-theme="dark"] .sc-todo    { background:#f59e0b24; color:#F59E0B; border-color:#f59e0b73; }
+  [data-theme="dark"] .sc-prog    { background:#2563eb2e; color:#5b8def; border-color:#2563eb73; }
+  [data-theme="dark"] .sc-review  { background:#7c3aed2e; color:#a78bfa; border-color:#7c3aed73; }
+  [data-theme="dark"] .sc-done    { background:#22c55e1f; color:#34d06f; border-color:#22c55e73; }
+  [data-theme="dark"] .sc-blocked { background:#dc26262e; color:#ef4444; border-color:#dc262673; }
 
-  /* ---- Shared composer (#1): attach + MODE + send. No formatting, no blue outline. ---- */
+  /* ---- Plan card (#stands out from comments): document/artifact, not a bubble ---- */
+  .plan-card { border: 1px solid var(--rule); border-left: 3px solid var(--violet);
+    border-radius: 12px; background: var(--pane-2); padding: 13px 15px; }
+  .plan-card .ph-row { display: flex; align-items: center; gap: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .12em; color: var(--violet); font-weight: 700; }
+  .plan-card .ph-row svg { width: 13px; height: 13px; }
+  .plan-card .rev-badge { color: var(--muted); border: 1px solid var(--rule); border-radius: 5px; padding: 0 6px; letter-spacing: .04em; }
+  .plan-card h5 { margin: 7px 0 2px; font-size: 14.5px; letter-spacing: -0.01em; }
+  .plan-card p { margin: 0; font-size: 12.5px; color: var(--muted); }
+  .plan-card .acts { display: flex; align-items: center; gap: 8px; margin-top: 11px; }
+  .plan-card .acts .hint { margin-left: 2px; font-size: 11px; color: var(--faint); display: inline-flex; align-items: center; gap: 4px; }
+  .plan-card .acts .hint svg { width: 12px; height: 12px; }
+
+  .btn { font: inherit; font-size: 12px; font-weight: 600; border-radius: 8px; padding: 6px 13px; cursor: pointer; border: 1px solid var(--rule); background: var(--card); color: var(--ink); display: inline-flex; align-items: center; gap: 6px; }
+  .btn svg { width: 13px; height: 13px; }
+  /* neutral CTA: white-on-dark / black-on-light (NOT blue) */
+  .btn.cta { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+
+  /* ---- Shared composer (#1): attach + (task mode) + send. No formatting, no blue ring. ---- */
   .composer { border-top: 1px solid var(--rule); background: var(--pane); padding: 12px 16px 16px; position: relative; }
   .composer-box { border: 1px solid var(--rule); border-radius: 12px; background: var(--card); padding: 9px 10px 8px; transition: border-color .15s, background .15s; }
-  /* focus = neutral (board: no blue outline) */
   .composer-box.focus { border-color: color-mix(in srgb, var(--ink) 24%, var(--rule)); }
-  /* planning mode = the WHOLE box turns yellow (matches today's app behavior) */
   .composer-box.planning { border-color: color-mix(in srgb, var(--amber) 60%, var(--rule)); background: color-mix(in srgb, var(--amber) 8%, var(--card)); }
   .composer .ph { font-size: 13.5px; color: var(--faint); min-height: 22px; }
   .composer-tools { display: flex; align-items: center; gap: 7px; margin-top: 8px; }
@@ -134,19 +154,15 @@
   .tool:hover { background: var(--pane-2); }
   .tool svg { width: 15px; height: 15px; }
   .composer-tools .grow { flex: 1; }
-  /* mode chip — planning = YELLOW, standard = neutral */
   .mode-chip { font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 3px 9px;
     background: color-mix(in srgb, var(--amber) 18%, transparent); color: var(--amber); border: 1px solid color-mix(in srgb, var(--amber) 50%, transparent); }
   .mode-chip svg { width: 11px; height: 11px; }
   .mode-chip.standard { background: var(--pane-2); color: var(--muted); border-color: var(--rule); }
   .assignee { font-size: 12px; color: var(--muted); border: 1px solid var(--rule); border-radius: 7px; padding: 4px 9px; display: inline-flex; align-items: center; gap: 6px; }
-  .assignee .d { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+  .assignee .d { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); }
   .send { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: var(--blue); color: #fff; border: none; }
   .send svg { width: 15px; height: 15px; }
-  .reco { display:inline-block; font-size:9px; font-weight:800; letter-spacing:.07em; text-transform:uppercase;
-    color:var(--amber); border:1px solid color-mix(in srgb,var(--amber) 50%,transparent); border-radius:5px; padding:0 5px; margin-left:6px; vertical-align:1px; }
 
-  /* @-mention popover illustration */
   .mention-pop { border:1px solid var(--rule); border-radius:10px; background:var(--card); box-shadow:var(--shadow); padding:6px; width:260px; }
   .mention-pop .grp { font-size:9px; text-transform:uppercase; letter-spacing:.1em; color:var(--faint); padding:5px 8px 3px; }
   .mention-pop .opt { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:7px; font-size:12.5px; }
@@ -181,16 +197,14 @@
   table.cmp th { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
   table.cmp td:first-child { font-weight: 600; width: 24%; }
 
-  .feedback { margin: 22px 0 0; border: 1px solid color-mix(in srgb, var(--amber) 38%, transparent);
-    background: color-mix(in srgb, var(--amber) 7%, transparent); border-radius: 12px; padding: 14px 16px; font-size: 13px; }
+  .feedback { margin: 22px 0 0; border: 1px solid color-mix(in srgb, var(--blue) 35%, transparent);
+    background: color-mix(in srgb, var(--blue) 6%, transparent); border-radius: 12px; padding: 14px 16px; font-size: 13px; }
   .feedback b { color: var(--ink); }
   .feedback ul { margin: 8px 0 0; padding-left: 18px; }
   .feedback li { margin: 4px 0; color: var(--muted); }
   .feedback li b { color: var(--ink); }
 
-  .deck { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-  @media (max-width:880px){ .deck{ grid-template-columns:1fr; } }
-  .reco-card { border:1px solid var(--rule); border-radius:12px; background:var(--pane); padding:16px; font-size:13px; }
+  .reco-card { border:1px solid var(--rule); border-radius:12px; background:var(--pane); padding:16px; font-size:13px; max-width: 560px; }
   .reco-card h4 { margin:0 0 6px; font-size:13px; }
   .reco-card .verdict { font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.08em; padding:2px 8px; border-radius:6px; }
   .v-yes { color:var(--green); border:1px solid color-mix(in srgb,var(--green) 45%,transparent); }
@@ -210,36 +224,37 @@
 </header>
 
 <div class="wrap">
-  <span class="rev">Revision 3 · board feedback</span>
+  <span class="rev">Revision 4 · board feedback</span>
   <div class="lede">
     <h2>One conversation language, two surfaces</h2>
     <p>The conference room and task/issue comments should feel like the same product. Each surface already owns <em>half</em> of the right design, so the proposal cross-pollinates rather than rebuilds.</p>
-    <p><b>Conference room</b> already has the blue/agent bubble language but a stripped-down input. <b>Task comments</b> already have attach + a metadata-row system, but human comments render grey and bot status reads like a comment.</p>
   </div>
 
   <div class="feedback">
-    <b>What changed in rev 3 (your feedback):</b>
+    <b>What changed in rev 4 (your feedback):</b>
     <ul>
-      <li><b>Planning mode = yellow.</b> The mode chip is yellow, and the <b>whole composer tints yellow</b> in planning mode — matching how the task composer already behaves today.</li>
-      <li><b>No blue outline.</b> Removed the blue focus ring; the composer focus is a quiet neutral border.</li>
-      <li><b>Conference-room mode</b> and <b>@-mention</b>: recommendations below (Section D). Short version — yes to a room mode (reframed as Discuss/Build); yes to <b>@agent</b> now, <b>@project / @task</b> noted as a fast-follow.</li>
+      <li><b>Status chips follow the PAP-75 guide</b> — <code>in_progress</code> is now <b style="color:var(--blue)">blue</b> (liveness), <code>todo</code> amber, <code>done</code> green, <code>in_review</code> violet, <code>blocked</code> red.</li>
+      <li><b>Conference room: mode removed.</b> No Discuss/Build chip — the room stays a clean attach + send box, so jumping between room and task chat isn't confusing.</li>
+      <li><b>Approve = standard CTA</b> (white on dark / black on light), no longer blue.</li>
+      <li><b>Plans stand out from comments</b> — a plan posts as a distinct <b>plan card</b> (document, not a bubble), with Approve / Request changes.</li>
+      <li><b>Request changes can include screenshots</b> 📎 — shown on the plan card; tracked as PAP-95g.</li>
     </ul>
   </div>
 
   <div class="principles">
     <div class="principle"><b><span class="dot" style="background:var(--blue)"></span>Blue is liveness</b>
-      <p>A human comment, a sent message, an active run — all blue. Blue means "someone or something is live."</p></div>
+      <p>Human messages, sent chats, and <code>in_progress</code> tasks — all blue. Blue = "live right now."</p></div>
     <div class="principle"><b><span class="dot" style="background:var(--amber)"></span>Yellow is planning</b>
-      <p>Planning / advisory mode tints the composer yellow — a calm "we're thinking, not acting yet" signal, in both surfaces.</p></div>
+      <p>A task's planning mode tints its composer yellow — "thinking, not acting yet." (Task only.)</p></div>
     <div class="principle"><b><span class="dot" style="background:var(--faint)"></span>Status is metadata</b>
       <p>"Worked 2m", "updated this task", status changes — quiet rows on a rail, never bubbles.</p></div>
-    <div class="principle"><b><span class="dot" style="background:var(--green)"></span>One simple composer</b>
-      <p>Same input both places: attach + mode + send. No formatting toolbar. Task adds an assignee.</p></div>
+    <div class="principle"><b><span class="dot" style="background:var(--violet)"></span>Plans are documents</b>
+      <p>A plan isn't a comment — it renders as its own card with Approve / Request changes.</p></div>
   </div>
 
   <!-- ============================ SURFACES ============================ -->
   <div class="section-label"><span class="num">A</span> The two surfaces, converged</div>
-  <div class="section-title">Same bubble language · same simple composer · yellow = planning</div>
+  <div class="section-title">Same bubble language · same simple composer · brand status colours</div>
 
   <div class="cols">
     <!-- CONFERENCE ROOM -->
@@ -253,24 +268,21 @@
                 <p>Morning — Q2 hiring is the open question. Want me to draft a plan, or talk through trade-offs first?</p></div>
               <div class="stamp">9:02 AM</div></div></div>
           <div class="row me"><div class="stack">
-              <div class="bubble me"><p>Let's just talk it through for now — don't create anything yet.</p></div>
+              <div class="bubble me"><p>Let's talk it through. What's the gap to shipping the onboarding revamp?</p></div>
               <div class="stamp">9:03 AM</div></div><div class="av you">YOU</div></div>
           <div class="row"><div class="av">CEO</div>
             <div class="stack">
               <div class="bubble agent"><div class="name">CEO</div>
-                <p>Got it — staying in <b>Discuss</b>. Two roles stand out: a <code>frontend</code> lead and a <code>design</code> partner. Flip me to <b>Build</b> when you want these as real tasks.</p></div>
+                <p>Two roles stand out: a <code>frontend</code> lead for the chat surfaces and a <code>design</code> partner. I can scope both into a plan you approve.</p></div>
               <div class="stamp">9:03 AM</div></div></div>
           <div class="chips"><span class="chip">Draft the hiring plan</span><span class="chip">Map our first 30 days</span></div>
         </div>
-        <!-- shared composer + room mode chip (recommended) -->
+        <!-- shared composer: attach + send ONLY (no mode chip) -->
         <div class="composer">
-          <div class="composer-box planning">
+          <div class="composer-box">
             <div class="ph">Message the CEO…</div>
             <div class="composer-tools">
               <span class="tool" title="Attach files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8.5 11.5 18a4 4 0 0 1-5.66-5.66l8.49-8.49a2.5 2.5 0 0 1 3.54 3.54l-8.49 8.49a1 1 0 0 1-1.42-1.42L15 6.5"/></svg></span>
-              <span class="mode-chip" title="Discuss = advisory only">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 12h8M8 8h8M8 16h5"/><rect x="3" y="3" width="18" height="18" rx="3"/></svg>
-                Discuss ▾</span>
               <span class="grow"></span>
               <button class="send" title="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></button>
             </div>
@@ -280,8 +292,8 @@
       <div class="callout">
         <b>What changes here <span class="new-flag">new</span></b>
         <ul>
-          <li>Gains <b>file attach</b>, the shared send styling, and a <b>Discuss / Build</b> mode chip <span class="reco">recommended</span> — see Section D.</li>
-          <li>Bubble language is <span class="yes">already correct</span> — it's the reference. No blue outline on the box.</li>
+          <li>Gains <b>file attach</b> + the shared send styling. <b>No mode chip</b> — the room has no task lifecycle, so it stays a clean chat box.</li>
+          <li>Bubble language is <span class="yes">already correct</span> — it's the reference.</li>
         </ul>
       </div>
     </div>
@@ -296,22 +308,34 @@
               <b>ClaudeCoder</b> worked for 2 minutes <span class="when">· 5d ago</span></div>
             <div class="meta"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg></span>
               <b>ClaudeCoder</b> updated this task
-              <span class="statuschip sc-prog">In progress</span><span class="arrow">→</span><span class="statuschip sc-done">Done</span></div>
+              <span class="statuschip sc-prog">in progress</span><span class="arrow">→</span><span class="statuschip sc-done">done</span></div>
           </div>
+          <!-- PLAN: a distinct card, NOT a bubble -->
+          <div class="plan-card">
+            <div class="ph-row">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13h6M9 17h4"/></svg>
+              Plan <span class="rev-badge">rev 3</span>
+            </div>
+            <h5>Team-centric onboarding plan</h5>
+            <p>Convergence plan to unify the chat surfaces — shared composer, blue liveness bubbles, status-as-metadata.</p>
+            <div class="acts">
+              <button class="btn cta">Approve</button>
+              <button class="btn">Request changes</button>
+              <span class="hint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8.5 11.5 18a4 4 0 0 1-5.66-5.66l8.49-8.49a2.5 2.5 0 0 1 3.54 3.54l-8.49 8.49a1 1 0 0 1-1.42-1.42L15 6.5"/></svg> screenshots ok</span>
+            </div>
+          </div>
+          <!-- agent comment = a normal chat bubble -->
           <div class="row"><div class="av">CC</div>
             <div class="stack">
               <div class="bubble agent"><div class="name">ClaudeCoder</div>
-                <p><b>Plan approved → implementation delegated.</b></p>
-                <p>Board accepted the team-centric onboarding plan. Opened a single implementation child issue.</p>
-                <ul><li>✅ Approved plan: <a href="#">plan document</a></li><li>🛠 Implementation: <a href="#">PAP-67a</a></li></ul></div>
+                <p>Approved — implementation delegated to <a href="#">PAP-67a</a>. I'll post here when the first diff is up.</p></div>
               <div class="stamp">5d ago</div></div></div>
+          <!-- human comment = blue liveness bubble, right -->
           <div class="row me"><div class="stack">
-              <div class="bubble me"><p>Looks good. Keep <code>ceo-instructions.ts</code> in scope so the demo stays consistent.</p></div>
+              <div class="bubble me"><p>Great. Keep <code>ceo-instructions.ts</code> in scope so the demo stays consistent.</p></div>
               <div class="stamp">5d ago</div></div><div class="av you">YOU</div></div>
-          <div class="approval"><div class="hd"><span class="badge">Approval</span> Approve team-centric onboarding plan</div>
-            <div class="acts"><button class="btn primary">Approve</button><button class="btn">Request changes</button></div></div>
         </div>
-        <!-- shared composer, planning mode = yellow box + yellow chip -->
+        <!-- shared composer, planning mode = yellow box + yellow chip + assignee -->
         <div class="composer">
           <div class="composer-box planning">
             <div class="ph">Reply…</div>
@@ -330,9 +354,9 @@
       <div class="callout">
         <b>What changes here <span class="new-flag">new</span></b>
         <ul>
-          <li>Human bubble: grey → <b style="color:var(--blue)">blue liveness</b>, right by your avatar (matches the room).</li>
-          <li>Bot status &amp; runs → quiet <span class="diff">metadata rows</span>; only real comments wear a bubble.</li>
-          <li>Composer turns <b style="color:var(--amber)">yellow in planning mode</b> (kept from today) + shows the assignee.</li>
+          <li>Human bubble: grey → <b style="color:var(--blue)">blue liveness</b>, right by your avatar; bot status → quiet <span class="diff">metadata rows</span> with brand chips (<b style="color:var(--blue)">in&nbsp;progress = blue</b>).</li>
+          <li><b>Plans render as a card</b>, clearly distinct from chat bubbles; Approve is a neutral CTA; Request changes accepts screenshots.</li>
+          <li>Composer keeps its <b style="color:var(--amber)">yellow planning</b> state + assignee.</li>
         </ul>
       </div>
     </div>
@@ -340,7 +364,7 @@
 
   <!-- ============================ COMPOSER BEFORE/AFTER ============================ -->
   <div class="section-label"><span class="num">B</span> The composer, simplified</div>
-  <div class="section-title">Attach + mode + send · planning tints the box yellow · no formatting, no blue ring</div>
+  <div class="section-title">Attach + send · task adds the yellow planning mode · no formatting, no blue ring</div>
   <div class="ba">
     <div class="panel before">
       <h4>Before — rich-editor chrome</h4>
@@ -369,34 +393,25 @@
           <button class="send" title="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></button>
         </div>
       </div>
-      <div class="callout" style="margin-top:10px">Standard mode → the box returns to a <b>neutral</b> card and the chip greys out.</div>
+      <div class="callout" style="margin-top:10px">Standard mode → neutral box, chip greys out. Conference room shows no mode chip at all.</div>
     </div>
   </div>
 
-  <!-- ============================ RECOMMENDATIONS ============================ -->
-  <div class="section-label"><span class="num">C</span> Two questions you asked</div>
-  <div class="section-title">Conference-room mode · @-mentions — my recommendations</div>
-  <div class="deck">
-    <div class="reco-card">
-      <h4>Conference-room mode? <span class="verdict v-yes">Recommend yes — reframed</span></h4>
-      <p>A task's "planning vs standard" doesn't map cleanly to the room (no task lifecycle, and the CEO already proposes-and-waits). But the same chip slot earns its keep as a <b>Discuss ⇄ Build</b> toggle:</p>
-      <p>• <b style="color:var(--amber)">Discuss</b> (yellow, default) — CEO advises and drafts, but <b>won't create tasks or take actions</b>.<br>
-         • <b>Build</b> (neutral) — CEO may turn the conversation into real tasks/proposals.</p>
-      <p>This keeps both composers visually parallel, reuses the yellow=planning language, and gives you a direct agency switch — "just brainstorm" vs "you can act." Default to Discuss. Easy to drop if you'd rather the room stay chip-free.</p>
+  <!-- ============================ @-MENTION ============================ -->
+  <div class="section-label"><span class="num">C</span> One question still answered</div>
+  <div class="section-title">@-mentions — @agent now, @project / @task as a fast-follow</div>
+  <div class="reco-card">
+    <h4>Type @ to reference <span class="verdict v-yes">@agent now</span> <span class="verdict v-later">@project / @task later</span></h4>
+    <p><b>@agent</b> already works in the task composer today — it carries into the unified composer for free. Keep it.</p>
+    <div class="mention-pop" style="margin:10px 0 0">
+      <div class="grp">Agents — available now</div>
+      <div class="opt on"><span class="av2">CC</span> ClaudeCoder</div>
+      <div class="opt"><span class="av2" style="background:linear-gradient(135deg,#10B981,#059669)">DP</span> DesignPartner</div>
+      <div class="grp">Projects · Tasks — proposed fast-follow</div>
+      <div class="opt later"><span class="sq" style="background:var(--violet)"></span> Onboarding revamp <span class="soon">later</span></div>
+      <div class="opt later"><span class="sq" style="background:var(--blue)"></span> PAP-67 · onboarding copy <span class="soon">later</span></div>
     </div>
-    <div class="reco-card">
-      <h4>@-mentions pulling up references? <span class="verdict v-yes">@agent now</span> <span class="verdict v-later">@project / @task later</span></h4>
-      <p><b>@agent</b> already works in the task composer today — it carries into the unified composer essentially for free. Keep it.</p>
-      <div class="mention-pop" style="margin:10px 0 0">
-        <div class="grp">Agents — available now</div>
-        <div class="opt on"><span class="av2">CC</span> ClaudeCoder</div>
-        <div class="opt"><span class="av2" style="background:linear-gradient(135deg,#10B981,#059669)">DP</span> DesignPartner</div>
-        <div class="grp">Projects · Tasks — proposed fast-follow</div>
-        <div class="opt later"><span class="sq" style="background:var(--violet)"></span> Onboarding revamp <span class="soon">later</span></div>
-        <div class="opt later"><span class="sq" style="background:var(--blue)"></span> PAP-67 · onboarding copy <span class="soon">later</span></div>
-      </div>
-      <p style="margin-top:10px"><b>@project / @task</b> needs a unified reference picker + linkification — real value, but its own slice of work. Recommend tracking it as <b>PAP-95f</b> rather than v1, so the first pass stays simple.</p>
-    </div>
+    <p style="margin-top:10px"><b>@project / @task</b> needs a reference picker + linkification → tracked as <b>PAP-95f</b>, not v1, so the first pass stays simple.</p>
   </div>
 
   <!-- ============================ COMPARISON ============================ -->
@@ -407,29 +422,28 @@
     <tbody>
       <tr><td>Human message</td><td>Blue bubble, right, by avatar</td><td>Blue bubble, right, by avatar</td><td class="yes">Identical</td></tr>
       <tr><td>Agent message</td><td>Card bubble, left, by avatar</td><td>Card bubble, left, by avatar</td><td class="yes">Identical</td></tr>
-      <tr><td>Avatar placement</td><td>At the bubble tail</td><td>At the bubble tail</td><td class="yes">Identical</td></tr>
       <tr><td>Composer essentials</td><td>Attach + send</td><td>Attach + send</td><td class="yes">Shared component</td></tr>
-      <tr><td>Planning = yellow box</td><td>Discuss (yellow)</td><td>Planning (yellow)</td><td class="yes">Identical treatment</td></tr>
-      <tr><td>Mode chip meaning</td><td>Discuss / Build (recommended)</td><td>Planning / Standard (task work mode)</td><td class="diff">Same UI, surface meaning</td></tr>
+      <tr><td>Mode chip</td><td>None</td><td>Planning / Standard (yellow)</td><td class="diff">Task only</td></tr>
+      <tr><td>Composer footer</td><td>Send</td><td>Mode + assignee + send</td><td class="diff">Surface-specific</td></tr>
+      <tr><td>Status chips</td><td>n/a</td><td>Brand PAP-75 (in&nbsp;progress = blue)</td><td class="diff">Task only</td></tr>
+      <tr><td>Plans</td><td>n/a</td><td>Distinct plan card + screenshots on request-changes</td><td class="diff">Task only</td></tr>
       <tr><td>@-mentions</td><td>@agent</td><td>@agent · @project/@task later</td><td class="diff">Phased</td></tr>
-      <tr><td>Composer footer</td><td>Mode + send</td><td>Mode + assignee + send</td><td class="diff">Surface-specific</td></tr>
-      <tr><td>Status / run events</td><td>n/a</td><td>Quiet metadata rows</td><td class="diff">Surface-specific</td></tr>
     </tbody>
   </table>
 
-  <div class="callout" style="margin-top:18px;max-width:860px">
+  <div class="callout" style="margin-top:18px;max-width:870px">
     <b>Implementation shape (for the plan — not built here).</b>
     <ul>
-      <li><b>Shared <code>ChatComposer</code></b> = textarea + <b>attach</b> + <b>send</b> (no formatting toolbar, no blue focus ring), consumed by <code>BoardChat</code> and <code>IssueChatThread</code>.</li>
-      <li><b>Mode = yellow.</b> Planning/Discuss tints the whole box yellow (reuse the task composer's existing planning treatment); standard/Build is neutral. Chip switches the mode inline.</li>
-      <li><b>Room mode</b> (Discuss/Build) gates whether the CEO may create tasks — defaults to Discuss.</li>
-      <li><b>@agent</b> autocomplete carried into the shared composer now; <b>@project/@task</b> tracked as <b>PAP-95f</b>.</li>
-      <li><b>Liveness-blue human bubble</b> + tail-hugging avatars + right/left stagger in <code>IssueChatThread</code>; all non-comment events → subdued metadata rows.</li>
+      <li><b>Shared <code>ChatComposer</code></b> = textarea + attach + send (no formatting, no blue ring). Conference room uses it bare; task adds the yellow planning chip + assignee.</li>
+      <li><b>Liveness-blue human bubble</b> + tail-hugging avatars + stagger in <code>IssueChatThread</code>; all non-comment events → subdued metadata rows.</li>
+      <li><b>Status chips adopt the PAP-75 palette</b> — <code>in_progress = blue</code>, <code>todo = amber</code>, <code>done = green</code>, <code>in_review = violet</code>, <code>blocked = red</code>, <code>backlog/cancelled = gray</code>.</li>
+      <li><b>Plan renders as a distinct card</b> (not a comment), Approve = neutral CTA; <b>Request changes supports screenshot attachments</b> (PAP-95g).</li>
+      <li><b>@agent</b> carried into the composer now; <b>@project/@task</b> tracked as PAP-95f.</li>
     </ul>
   </div>
 </div>
 
-<footer>PAP-95 · planning artifact · rev 3 · static mockup, no app code · brand tokens from paperclip.ing/brand · blue #2563EB = liveness · amber #F59E0B = planning</footer>
+<footer>PAP-95 · planning artifact · rev 4 · static mockup, no app code · brand + PAP-75 status guide · blue #2563EB = liveness · amber #F59E0B = planning</footer>
 
 <script>
   const root = document.documentElement;
