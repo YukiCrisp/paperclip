@@ -15,6 +15,7 @@ import { goalsApi } from "../api/goals";
 import { queryKeys } from "../lib/queryKeys";
 import { MarkdownBody } from "../components/MarkdownBody";
 import { Button } from "@/components/ui/button";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   Tooltip,
   TooltipContent,
@@ -23,7 +24,13 @@ import {
 import { Activity, ArrowDown, History, MessageSquarePlus, X } from "lucide-react";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { ChatComposer, type ChatComposerHandle } from "../components/ChatComposer";
-import { cn } from "../lib/utils";
+import {
+  AgentBubbleActionRow,
+  agentBubbleDateLabel,
+} from "../components/AgentBubbleActionRow";
+import { AgentIcon } from "../components/AgentIconPicker";
+import { cn, formatDateTime } from "../lib/utils";
+import type { FeedbackVoteValue } from "@paperclipai/shared";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 
 /**
@@ -44,6 +51,33 @@ const BOARD_CHAT_MARKDOWN_CLASS =
 
 const boardChatBubbleShell =
   "min-w-0 max-w-[85%] break-words px-3 py-2 text-sm overflow-x-auto overflow-y-visible";
+
+/** First-letter(s) fallback for an agent with no icon. */
+function agentInitials(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  return (((parts[0]?.[0] ?? "") + (parts[1]?.[0] ?? "")).toUpperCase()) || "A";
+}
+
+/**
+ * Icon-adjacent-to-name header rendered directly above an agent bubble —
+ * the shared `[agent icon][agent name]` convention (PAP-105 / PAP-97).
+ */
+function AgentBubbleHeader({ name, icon }: { name: string; icon: string | null }) {
+  return (
+    <div className="mb-1 flex items-center gap-1.5 pl-1">
+      <Avatar size="sm" className="shrink-0">
+        <AvatarFallback>
+          {icon ? (
+            <AgentIcon icon={icon} className="h-3.5 w-3.5" />
+          ) : (
+            agentInitials(name)
+          )}
+        </AvatarFallback>
+      </Avatar>
+      <span className="text-sm font-medium text-foreground">{name}</span>
+    </div>
+  );
+}
 
 /** Agent-styled chat bubble containing the three-dot typing indicator. */
 function TypingBubble() {
@@ -291,6 +325,49 @@ export function BoardChat() {
   const sortedComments = (comments ?? [])
     .slice()
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+  // Agent lookup so each bubble can show its author's name + icon header.
+  const agentMap = useMemo(
+    () => new Map((agents ?? []).map((a) => [a.id, a] as const)),
+    [agents],
+  );
+
+  // Feedback votes for the board issue power the 👍/👎 affordance — the same
+  // store the task thread reads (PAP-105 shares the action row).
+  const { data: feedbackVotes } = useQuery({
+    queryKey: queryKeys.issues.feedbackVotes(boardIssueId ?? ""),
+    queryFn: () => issuesApi.listFeedbackVotes(boardIssueId!),
+    enabled: !!boardIssueId,
+  });
+
+  const voteByComment = useMemo(() => {
+    const map = new Map<string, FeedbackVoteValue>();
+    for (const vote of feedbackVotes ?? []) {
+      if (vote.targetType === "issue_comment") map.set(vote.targetId, vote.vote);
+    }
+    return map;
+  }, [feedbackVotes]);
+
+  const handleCommentVote = useCallback(
+    async (
+      commentId: string,
+      vote: FeedbackVoteValue,
+      options?: { allowSharing?: boolean; reason?: string },
+    ) => {
+      if (!boardIssueId) return;
+      await issuesApi.upsertFeedbackVote(boardIssueId, {
+        targetType: "issue_comment",
+        targetId: commentId,
+        vote,
+        reason: options?.reason,
+        allowSharing: options?.allowSharing,
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.issues.feedbackVotes(boardIssueId),
+      });
+    },
+    [boardIssueId, queryClient],
+  );
 
   // Reset the staged reveal whenever the active company changes so a
   // freshly-created company replays the typing intro from scratch.
@@ -672,7 +749,8 @@ export function BoardChat() {
 
                 return (
                   <>
-                    <div className="flex justify-start">
+                    <div className="flex flex-col items-start">
+                      <AgentBubbleHeader name={ceoName} icon={ceoAgent.icon} />
                       <div
                         className={cn(
                           boardChatBubbleShell,
@@ -705,27 +783,57 @@ export function BoardChat() {
 
               {sortedComments.map((comment) => {
                 const isUser = !comment.authorAgentId && comment.authorUserId !== "board-concierge";
+                if (isUser) {
+                  return (
+                    <div key={comment.id} className="flex justify-end">
+                      <div
+                        className={cn(
+                          boardChatBubbleShell,
+                          "bg-blue-600 text-white [border-radius:14px_14px_4px_14px]",
+                        )}
+                      >
+                        {comment.body ?? ""}
+                      </div>
+                    </div>
+                  );
+                }
+                // Agent bubble — name/icon header above + action row below so
+                // the room speaks the same bubble language as the task thread.
+                const agent = comment.authorAgentId
+                  ? agentMap.get(comment.authorAgentId) ?? null
+                  : ceoAgent ?? null;
+                const agentName = agent?.name ?? "Assistant";
+                const agentIconValue = agent?.icon ?? null;
                 return (
-                  <div
-                    key={comment.id}
-                    className={cn("flex", isUser ? "justify-end" : "justify-start")}
-                  >
+                  <div key={comment.id} className="flex flex-col items-start">
+                    <AgentBubbleHeader name={agentName} icon={agentIconValue} />
                     <div
                       className={cn(
                         boardChatBubbleShell,
-                        isUser
-                          ? "bg-blue-600 text-white [border-radius:14px_14px_4px_14px]"
-                          : "bg-card border border-border text-foreground [border-radius:14px_14px_14px_4px]",
+                        "bg-card border border-border text-foreground [border-radius:14px_14px_14px_4px]",
                       )}
                     >
-                      {isUser ? (
-                        comment.body ?? ""
-                      ) : (
-                        <MarkdownBody className={BOARD_CHAT_MARKDOWN_CLASS}>
-                          {comment.body ?? ""}
-                        </MarkdownBody>
-                      )}
+                      <MarkdownBody className={BOARD_CHAT_MARKDOWN_CLASS}>
+                        {comment.body ?? ""}
+                      </MarkdownBody>
                     </div>
+                    <AgentBubbleActionRow
+                      copyText={comment.body ?? ""}
+                      dateLabel={agentBubbleDateLabel(comment.createdAt)}
+                      dateTitle={formatDateTime(comment.createdAt)}
+                      anchorHref={`#comment-${comment.id}`}
+                      feedback={
+                        boardIssueId
+                          ? {
+                              activeVote: voteByComment.get(comment.id) ?? null,
+                              sharingPreference: "prompt",
+                              termsUrl: null,
+                              onVote: (vote, options) =>
+                                handleCommentVote(comment.id, vote, options),
+                            }
+                          : null
+                      }
+                    />
                   </div>
                 );
               })}
@@ -746,7 +854,10 @@ export function BoardChat() {
 
               {/* Streaming response */}
               {streamingText && (
-                <div className="flex justify-start">
+                <div className="flex flex-col items-start">
+                  {ceoAgent && (
+                    <AgentBubbleHeader name={ceoAgent.name} icon={ceoAgent.icon} />
+                  )}
                   <div
                     className={cn(
                       boardChatBubbleShell,
