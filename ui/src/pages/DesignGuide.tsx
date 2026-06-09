@@ -112,7 +112,7 @@ import {
   AvatarGroup,
   AvatarGroupCount,
 } from "@/components/ui/avatar";
-import { StatusBadge } from "@/components/StatusBadge";
+import { StatusBadge, IssueStatusBadge } from "@/components/StatusBadge";
 import { StatusIcon } from "@/components/StatusIcon";
 import { PriorityIcon } from "@/components/PriorityIcon";
 import { agentStatusDot, agentStatusDotDefault } from "@/lib/status-colors";
@@ -516,6 +516,16 @@ export function DesignGuide() {
             ].map((s) => (
               <StatusBadge key={s} status={s} />
             ))}
+          </div>
+        </SubSection>
+
+        <SubSection title="IssueStatusBadge (brand chip + glyph — PAP-75)">
+          <div className="flex items-center gap-2 flex-wrap">
+            {["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"].map(
+              (s) => (
+                <IssueStatusBadge key={s} status={s} />
+              )
+            )}
           </div>
         </SubSection>
 
@@ -965,7 +975,7 @@ export function DesignGuide() {
             identifier="PAP-001"
             title="Implement authentication flow"
             subtitle="Assigned to Agent Alpha"
-            trailing={<StatusBadge status="in_progress" />}
+            trailing={<IssueStatusBadge status="in_progress" />}
             onClick={() => {}}
           />
           <EntityRow
@@ -978,7 +988,7 @@ export function DesignGuide() {
             identifier="PAP-002"
             title="Set up CI/CD pipeline"
             subtitle="Completed 2 days ago"
-            trailing={<StatusBadge status="done" />}
+            trailing={<IssueStatusBadge status="done" />}
             onClick={() => {}}
           />
           <EntityRow
@@ -990,7 +1000,7 @@ export function DesignGuide() {
             }
             identifier="PAP-003"
             title="Write API documentation"
-            trailing={<StatusBadge status="todo" />}
+            trailing={<IssueStatusBadge status="todo" />}
             onClick={() => {}}
           />
           <EntityRow
@@ -1003,7 +1013,7 @@ export function DesignGuide() {
             identifier="PAP-004"
             title="Deploy to production"
             subtitle="Blocked by PAP-001"
-            trailing={<StatusBadge status="blocked" />}
+            trailing={<IssueStatusBadge status="blocked" />}
             selected
           />
         </div>
