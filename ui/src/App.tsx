@@ -83,8 +83,10 @@ function boardRoutes() {
       <Route path="company/export/*" element={<CompanyExport />} />
       <Route path="company/import" element={<CompanyImport />} />
       <Route path="company/settings/secrets" element={<Secrets />} />
-      <Route path="company/settings/tools" element={<ToolsAccess />} />
-      <Route path="company/settings/tools/:tab" element={<ToolsAccess />} />
+      <Route path="company/settings/tools" element={<LegacyToolsSettingsRedirect />} />
+      <Route path="company/settings/tools/:tab" element={<LegacyToolsSettingsRedirect />} />
+      <Route path="tools" element={<ToolsAccess />} />
+      <Route path="tools/:tab" element={<ToolsAccess />} />
       <Route path="company/settings/instance" element={<Navigate to="general" replace />} />
       <Route path="company/settings/instance/profile" element={<ProfileSettings />} />
       <Route path="company/settings/instance/general" element={<InstanceGeneralSettings />} />
@@ -208,6 +210,11 @@ function LegacySettingsRedirect() {
       replace
     />
   );
+}
+
+function LegacyToolsSettingsRedirect() {
+  const { tab } = useParams<{ tab?: string }>();
+  return <Navigate to={tab ? `/tools/${tab}` : "/tools"} replace />;
 }
 
 function OnboardingRoutePage() {

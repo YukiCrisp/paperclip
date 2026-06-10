@@ -110,7 +110,7 @@ export function OverviewTab({ companyId }: { companyId: string }) {
             label="Applications"
             value={appList.length}
             description={`${mcpApps} MCP · ${pluginApps} plugin`}
-            to="/company/settings/tools/applications"
+            to="/tools/applications"
           />
         </Card>
         <Card className="overflow-hidden py-0">
@@ -119,7 +119,7 @@ export function OverviewTab({ companyId }: { companyId: string }) {
             label="Active connections"
             value={activeConnections}
             description={`${activeConnections} of ${connList.length} enabled`}
-            to="/company/settings/tools/connections"
+            to="/tools/connections"
           />
         </Card>
         <Card className="overflow-hidden py-0">
@@ -128,7 +128,7 @@ export function OverviewTab({ companyId }: { companyId: string }) {
             label="Runtime slots"
             value={slotList.length}
             description={`${runningSlots} running`}
-            to="/company/settings/tools/runtime"
+            to="/tools/runtime"
           />
         </Card>
         <Card className="overflow-hidden py-0">
@@ -137,7 +137,7 @@ export function OverviewTab({ companyId }: { companyId: string }) {
             label="Denials (24h)"
             value={denials24h.length}
             description={`${deniedCount} denied · ${failedCount} failed`}
-            to="/company/settings/tools/audit"
+            to="/tools/audit"
           />
         </Card>
       </div>
@@ -149,7 +149,7 @@ export function OverviewTab({ companyId }: { companyId: string }) {
               <ShieldAlert className="h-4 w-4 text-destructive" />
               Recent denials &amp; failures
               <Link
-                to="/company/settings/tools/audit"
+                to="/tools/audit"
                 className="ml-auto text-xs font-medium text-primary hover:underline"
               >
                 View full audit →
@@ -209,7 +209,7 @@ export function OverviewTab({ companyId }: { companyId: string }) {
               Runtime health
               <HealthBadge status={healthStatusKey} label={health?.status ?? "unknown"} />
               <Link
-                to="/company/settings/tools/runtime"
+                to="/tools/runtime"
                 className="ml-auto text-xs font-medium text-primary hover:underline"
               >
                 View runtime →
