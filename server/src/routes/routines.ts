@@ -5,6 +5,7 @@ import {
   createRoutineTriggerSchema,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
+  runRoutineIntakeFormSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
 } from "@paperclipai/shared";
@@ -25,6 +26,18 @@ export function routineRoutes(
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const access = accessService(db);
+  const intakeFormControlFields = new Set([
+    "payload",
+    "variables",
+    "triggerId",
+    "projectId",
+    "assigneeAgentId",
+    "idempotencyKey",
+    "executionWorkspaceId",
+    "executionWorkspacePreference",
+    "executionWorkspaceSettings",
+    "source",
+  ]);
 
   async function assertBoardCanAssignTasks(req: Request, companyId: string) {
     assertCompanyAccess(req, companyId);
@@ -83,6 +96,21 @@ export function routineRoutes(
         triggerCount: input.triggerCount ?? null,
       },
     });
+  }
+
+  function splitIntakeFormRunInput(input: Record<string, unknown>) {
+    const payload: Record<string, unknown> = {};
+    const control: Record<string, unknown> = {};
+
+    for (const [key, value] of Object.entries(input)) {
+      if (intakeFormControlFields.has(key)) {
+        control[key] = value;
+      } else {
+        payload[key] = value;
+      }
+    }
+
+    return { payload, control };
   }
 
   router.get("/companies/:companyId/routines", async (req, res) => {
@@ -336,6 +364,41 @@ export function routineRoutes(
       });
     }
     res.json(updated?.trigger ?? null);
+  });
+
+  router.post("/routines/:id/intake-form", validate(runRoutineIntakeFormSchema), async (req, res) => {
+    const routine = await assertCanManageExistingRoutine(req, req.params.id as string);
+    if (!routine) {
+      res.status(404).json({ error: "Routine not found" });
+      return;
+    }
+    await assertBoardCanAssignTasks(req, routine.companyId);
+    const { payload, control } = splitIntakeFormRunInput(req.body);
+    const runPayload = "payload" in control
+      ? control.payload as Record<string, unknown> | null
+      : payload;
+    const run = await svc.runRoutine(routine.id, {
+      ...control,
+      source: "api",
+      payload: runPayload,
+      variables: payload,
+    }, {
+      agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+      userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
+    });
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: routine.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "routine.run_triggered",
+      entityType: "routine_run",
+      entityId: run.id,
+      details: { routineId: routine.id, source: run.source, status: run.status },
+    });
+    res.status(202).json(run);
   });
 
   router.delete("/routine-triggers/:id", async (req, res) => {

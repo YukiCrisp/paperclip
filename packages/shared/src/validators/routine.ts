@@ -153,6 +153,7 @@ export const runRoutineSchema = z.object({
   triggerId: z.string().uuid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()).optional().nullable(),
   variables: z.record(z.string(), routineVariableValueSchema).optional().nullable(),
+  caseFields: z.record(z.string(), routineVariableValueSchema).optional().nullable(),
   projectId: z.string().uuid().optional().nullable(),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   idempotencyKey: z.string().trim().max(255).optional().nullable(),
@@ -162,7 +163,14 @@ export const runRoutineSchema = z.object({
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
 });
 
+export const runRoutineIntakeFormSchema = runRoutineSchema
+  .omit({
+    source: true,
+  })
+  .passthrough();
+
 export type RunRoutine = z.infer<typeof runRoutineSchema>;
+export type RunRoutineIntakeForm = z.infer<typeof runRoutineIntakeFormSchema>;
 
 export const rotateRoutineTriggerSecretSchema = z.object({});
 export type RotateRoutineTriggerSecret = z.infer<typeof rotateRoutineTriggerSecretSchema>;

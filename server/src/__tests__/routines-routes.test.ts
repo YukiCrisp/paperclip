@@ -414,6 +414,76 @@ describe("routine routes", () => {
     expect(mockRoutineService.runRoutine).not.toHaveBeenCalled();
   });
 
+  it("requires tasks:assign permission to run a routine from an intake form", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/intake-form`)
+      .send({
+        userName: "Ada",
+        amount: 12,
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("tasks:assign");
+    expect(mockRoutineService.runRoutine).not.toHaveBeenCalled();
+  });
+
+  it("runs a routine from an intake form by mapping freeform fields to variables", async () => {
+    mockAccessService.canUser.mockResolvedValue(true);
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    mockRoutineService.runRoutine.mockResolvedValueOnce({
+      id: "run-1",
+      source: "api",
+      status: "issue_created",
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/intake-form`)
+      .send({
+        projectId,
+        payload: {
+          source: "landing",
+        },
+        userName: "Ada",
+        priority: "high",
+      });
+
+    expect(res.status).toBe(202);
+    expect(mockRoutineService.runRoutine).toHaveBeenCalledWith(routineId, {
+      source: "api",
+      projectId,
+      payload: {
+        source: "landing",
+      },
+      variables: {
+        userName: "Ada",
+        priority: "high",
+      },
+    }, {
+      agentId: null,
+      userId: "board-user",
+    });
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "routine.run_triggered",
+      entityId: "run-1",
+      details: { source: "api", status: "issue_created" },
+    }));
+  });
+
   it("passes the board actor through when manually running a routine", async () => {
     mockAccessService.canUser.mockResolvedValue(true);
     const app = await createApp({
