@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { CompanySecret, ToolApplication, ToolConnection } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ToastProvider } from "../../context/ToastContext";
+import { ApiError } from "../../api/client";
 import { ApplicationsTab } from "./ApplicationsTab";
 
 const mockToolsApi = vi.hoisted(() => ({
@@ -17,6 +18,7 @@ const mockToolsApi = vi.hoisted(() => ({
   refreshCatalog: vi.fn(),
   createConnection: vi.fn(),
   updateConnection: vi.fn(),
+  updateApplication: vi.fn(),
 }));
 
 const mockSecretsApi = vi.hoisted(() => ({
@@ -46,6 +48,26 @@ async function flushReact() {
     await Promise.resolve();
     await new Promise((resolve) => window.setTimeout(resolve, 0));
   });
+}
+
+async function typeInputValue(input: HTMLInputElement, value: string) {
+  await act(async () => {
+    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+    valueSetter?.call(input, value);
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await flushReact();
+}
+
+async function typeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
+  await act(async () => {
+    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    valueSetter?.call(textarea, value);
+    textarea.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await flushReact();
 }
 
 function makeConnection(overrides: Partial<ToolConnection>): ToolConnection {
@@ -221,5 +243,91 @@ describe("ApplicationsTab", () => {
     expect(body).toContain("2 Connection");
     expect(body).toContain("Credential references");
     expect(body).toContain("Free-text secrets are not accepted");
+  });
+
+  it("opens the row actions edit dialog and saves application details", async () => {
+    mockToolsApi.updateApplication.mockResolvedValue(
+      makeApp({ name: "GitHub Enterprise", description: "Internal MCP" }),
+    );
+    await render();
+
+    const actions = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.getAttribute("aria-label") === "Actions for GitHub",
+    );
+    expect(actions).toBeTruthy();
+    await act(() => {
+      actions!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      actions!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const edit = Array.from(document.body.querySelectorAll("[role='menuitem']")).find(
+      (item) => item.textContent === "Edit",
+    );
+    expect(edit).toBeTruthy();
+    await act(() => {
+      edit!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      edit!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(document.body.textContent ?? "").toContain("Edit application");
+    expect(document.body.textContent ?? "").toContain("MCP HTTP");
+
+    const nameInput = document.body.querySelector<HTMLInputElement>("#tool-application-name");
+    const descriptionInput = document.body.querySelector<HTMLTextAreaElement>("#tool-application-description");
+    expect(nameInput).toBeTruthy();
+    expect(descriptionInput).toBeTruthy();
+
+    await typeInputValue(nameInput!, "GitHub Enterprise");
+    await typeTextareaValue(descriptionInput!, "Internal MCP");
+
+    const save = Array.from(document.body.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Save changes"),
+    );
+    expect(save).toBeTruthy();
+    await act(() => {
+      save!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(mockToolsApi.updateApplication).toHaveBeenCalledWith("app-1", {
+      name: "GitHub Enterprise",
+      description: "Internal MCP",
+    });
+  });
+
+  it("keeps duplicate-name conflicts inline in the edit dialog", async () => {
+    mockToolsApi.updateApplication.mockRejectedValue(new ApiError("duplicate", 409, { error: "duplicate" }));
+    await render();
+
+    const actions = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.getAttribute("aria-label") === "Actions for GitHub",
+    );
+    await act(() => {
+      actions!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      actions!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const edit = Array.from(document.body.querySelectorAll("[role='menuitem']")).find(
+      (item) => item.textContent === "Edit",
+    );
+    await act(() => {
+      edit!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      edit!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const save = Array.from(document.body.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Save changes"),
+    );
+    await act(() => {
+      save!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(document.body.textContent ?? "").toContain("Another application already uses that name.");
   });
 });

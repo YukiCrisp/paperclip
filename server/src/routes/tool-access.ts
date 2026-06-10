@@ -127,17 +127,21 @@ export function toolAccessRoutes(
     assertBoard(req);
     const existing = await svc.getApplication(req.params.applicationId as string);
     assertCompanyAccess(req, existing.companyId);
-    const application = await svc.updateApplication(existing.id, req.body);
-    await logActivity(db, {
-      companyId: application.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
-      action: "tool_application.updated",
-      entityType: "tool_application",
-      entityId: application.id,
-      details: { status: application.status, name: application.name },
-    });
-    res.json(application);
+    try {
+      const application = await svc.updateApplication(existing.id, req.body);
+      await logActivity(db, {
+        companyId: application.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "tool_application.updated",
+        entityType: "tool_application",
+        entityId: application.id,
+        details: { status: application.status, name: application.name },
+      });
+      res.json(application);
+    } catch (error) {
+      svc.ensureNoDuplicateNameError(error);
+    }
   });
 
   router.get("/companies/:companyId/tools/connections", async (req, res) => {

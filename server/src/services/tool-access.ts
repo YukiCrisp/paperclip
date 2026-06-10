@@ -2431,7 +2431,36 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     },
 
     ensureNoDuplicateNameError: (error: unknown) => {
-      if (error instanceof Error && /duplicate key value/.test(error.message)) {
+      const maybeRecord = typeof error === "object" && error !== null ? error as Record<string, unknown> : null;
+      const cause = maybeRecord?.cause;
+      const maybeCause = typeof cause === "object" && cause !== null ? cause as Record<string, unknown> : null;
+      const message = [
+        error instanceof Error ? error.message : String(error),
+        maybeRecord && typeof maybeRecord.detail === "string" ? maybeRecord.detail : null,
+        maybeCause instanceof Error ? maybeCause.message : null,
+        maybeCause && typeof maybeCause.detail === "string" ? maybeCause.detail : null,
+      ].filter(Boolean).join("\n");
+      const code =
+        maybeRecord && typeof maybeRecord.code === "string"
+          ? maybeRecord.code
+          : maybeCause && typeof maybeCause.code === "string"
+            ? maybeCause.code
+            : null;
+      const constraint =
+        maybeRecord && typeof maybeRecord.constraint === "string"
+          ? maybeRecord.constraint
+          : maybeRecord && typeof maybeRecord.constraint_name === "string"
+            ? maybeRecord.constraint_name
+            : maybeCause && typeof maybeCause.constraint === "string"
+              ? maybeCause.constraint
+              : maybeCause && typeof maybeCause.constraint_name === "string"
+                ? maybeCause.constraint_name
+                : null;
+      if (
+        code === "23505" ||
+        constraint?.includes("tool_applications") ||
+        /duplicate key value|unique constraint|tool_applications_company_id_name_unique/i.test(message)
+      ) {
         throw conflict("A tool access record with that name already exists");
       }
       throw error;

@@ -5,6 +5,8 @@ import {
   Boxes,
   ChevronDown,
   ChevronRight,
+  MoreHorizontal,
+  Pencil,
   Globe,
   ListTree,
   Network,
@@ -24,7 +26,22 @@ import { ApiError } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -32,6 +49,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/context/ToastContext";
 import { EmptyState } from "@/components/EmptyState";
 import { cn } from "@/lib/utils";
@@ -93,6 +111,78 @@ function AppIcon({ type }: { type: ToolApplicationType }) {
   );
 }
 
+interface EditApplicationDialogProps {
+  application: ToolApplication;
+  error: string | null;
+  isSaving: boolean;
+  onClose: () => void;
+  onSubmit: (input: { name: string; description: string | null }) => void;
+}
+
+function EditApplicationDialog({ application, error, isSaving, onClose, onSubmit }: EditApplicationDialogProps) {
+  const [name, setName] = useState(application.name);
+  const [description, setDescription] = useState(application.description ?? "");
+  const trimmedName = name.trim();
+
+  return (
+    <Dialog open onOpenChange={(next) => !next && onClose()}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Edit application</DialogTitle>
+          <DialogDescription>Update the application details agents see in tool access surfaces.</DialogDescription>
+        </DialogHeader>
+        <form
+          className="space-y-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!trimmedName) return;
+            onSubmit({
+              name: trimmedName,
+              description: description.trim() ? description.trim() : null,
+            });
+          }}
+        >
+          <div className="space-y-2">
+            <Label htmlFor="tool-application-name">Name</Label>
+            <Input
+              id="tool-application-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              autoFocus
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="tool-application-description">Description</Label>
+            <Textarea
+              id="tool-application-description"
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              rows={4}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="tool-application-type">Type</Label>
+            <Input id="tool-application-type" value={typeLabel(application.type)} readOnly />
+          </div>
+          {error ? (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {error}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={onClose} disabled={isSaving}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={isSaving || !trimmedName}>
+              {isSaving ? "Saving..." : "Save changes"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function ApplicationsTab({ companyId }: { companyId: string }) {
   const qc = useQueryClient();
   const { pushToast } = useToast();
@@ -100,6 +190,8 @@ export function ApplicationsTab({ companyId }: { companyId: string }) {
   const [defaultApplicationId, setDefaultApplicationId] = useState<string | null>(null);
   const [expandedAppId, setExpandedAppId] = useState<string | null>(null);
   const [catalogFor, setCatalogFor] = useState<ToolConnection | null>(null);
+  const [editingApplication, setEditingApplication] = useState<ToolApplication | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
 
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("__all");
@@ -158,6 +250,31 @@ export function ApplicationsTab({ companyId }: { companyId: string }) {
   }, [visibleConnList, catalogs]);
 
   const invalidateConnections = () => qc.invalidateQueries({ queryKey: queryKeys.tools.connections(companyId) });
+  const invalidateApplications = () => qc.invalidateQueries({ queryKey: queryKeys.tools.applications(companyId) });
+
+  const updateApplication = useMutation({
+    mutationFn: ({ applicationId, input }: { applicationId: string; input: { name: string; description: string | null } }) =>
+      toolsApi.updateApplication(applicationId, input),
+    onSuccess: () => {
+      invalidateApplications();
+      setEditingApplication(null);
+      setEditError(null);
+      pushToast({ title: "Application updated", tone: "success" });
+    },
+    onError: (err) => {
+      const message = err instanceof ApiError ? err.message : String(err);
+      if (err instanceof ApiError && err.status === 409) {
+        setEditError("Another application already uses that name.");
+        return;
+      }
+      setEditError(message);
+      pushToast({
+        title: "Could not update application",
+        body: message,
+        tone: "error",
+      });
+    },
+  });
 
   const healthCheck = useMutation({
     mutationFn: (id: string) => toolsApi.checkConnectionHealth(id),
@@ -326,6 +443,7 @@ export function ApplicationsTab({ companyId }: { companyId: string }) {
                     <th className="px-3 py-2.5 text-right font-medium">Connections</th>
                     <th className="px-3 py-2.5 font-medium">Status</th>
                     <th className="px-4 py-2.5 text-right font-medium">Updated</th>
+                    <th className="w-10 px-2 py-2.5 font-medium" aria-label="Actions" />
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
@@ -372,11 +490,36 @@ export function ApplicationsTab({ companyId }: { companyId: string }) {
                           <td className="px-4 py-3 text-right text-xs">
                             <RelativeTime value={app.updatedAt} />
                           </td>
+                          <td className="px-2 py-3 text-right">
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button
+                                  size="icon"
+                                  variant="ghost"
+                                  className="h-7 w-7"
+                                  aria-label={`Actions for ${app.name}`}
+                                >
+                                  <MoreHorizontal className="h-4 w-4" />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end">
+                                <DropdownMenuItem
+                                  onSelect={() => {
+                                    setEditError(null);
+                                    setEditingApplication(app);
+                                  }}
+                                >
+                                  <Pencil className="h-4 w-4" />
+                                  Edit
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </td>
                         </tr>
                         {isExpanded ? (
                           <tr className="bg-muted/20">
                             <td className="px-2 py-2" />
-                            <td colSpan={6} className="px-4 py-3">
+                            <td colSpan={7} className="px-4 py-3">
                               {appConnections.length === 0 ? (
                                 <div className="flex items-center justify-between gap-3 py-1 text-sm">
                                   <div className="flex items-center gap-2 text-muted-foreground">
@@ -479,7 +622,7 @@ export function ApplicationsTab({ companyId }: { companyId: string }) {
                   })}
                   {filtered.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                      <td colSpan={8} className="px-4 py-8 text-center text-sm text-muted-foreground">
                         No applications match the current filters.
                       </td>
                     </tr>
@@ -492,6 +635,22 @@ export function ApplicationsTab({ companyId }: { companyId: string }) {
       )}
 
       {catalogFor ? <CatalogDialog connection={catalogFor} onClose={() => setCatalogFor(null)} /> : null}
+      {editingApplication ? (
+        <EditApplicationDialog
+          application={editingApplication}
+          error={editError}
+          isSaving={updateApplication.isPending}
+          onClose={() => {
+            if (updateApplication.isPending) return;
+            setEditingApplication(null);
+            setEditError(null);
+          }}
+          onSubmit={(input) => {
+            setEditError(null);
+            updateApplication.mutate({ applicationId: editingApplication.id, input });
+          }}
+        />
+      ) : null}
       {open ? (
         <AddConnectionDialog
           companyId={companyId}

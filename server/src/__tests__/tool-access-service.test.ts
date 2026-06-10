@@ -53,11 +53,11 @@ function mockToolsList(tools: unknown[]) {
   } as Response);
 }
 
-function createRouteApp(db: ReturnType<typeof createDb>) {
+function createRouteApp(db: ReturnType<typeof createDb>, actor?: Express.Request["actor"]) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    req.actor = {
+    req.actor = actor ?? {
       type: "board",
       userId: "board-user",
       userName: "Board User",
@@ -468,6 +468,90 @@ describeEmbeddedPostgres("tool access service", () => {
       runtimeKind: "local_stdio",
       status: "stopped",
     });
+  });
+
+  it("updates tool applications through the board route and records activity", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const application = await service.createApplication(company.id, {
+      name: "Editable app",
+      description: "Before",
+      type: "mcp_http",
+    });
+
+    const res = await request(app)
+      .patch(`/api/tool-applications/${application.id}`)
+      .send({ name: "Edited app", description: "After" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      id: application.id,
+      companyId: company.id,
+      name: "Edited app",
+      description: "After",
+      type: "mcp_http",
+    });
+    const activities = await db.select().from(activityLog).where(eq(activityLog.entityId, application.id));
+    expect(activities).toEqual([
+      expect.objectContaining({
+        action: "tool_application.updated",
+        companyId: company.id,
+        details: expect.objectContaining({ name: "Edited app" }),
+      }),
+    ]);
+  });
+
+  it("returns 409 instead of 500 when an application update collides with a duplicate name", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    await service.createApplication(company.id, { name: "Existing app", type: "mcp_http" });
+    const application = await service.createApplication(company.id, { name: "Editable app", type: "mcp_http" });
+
+    const res = await request(app)
+      .patch(`/api/tool-applications/${application.id}`)
+      .send({ name: "Existing app" });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      error: "A tool access record with that name already exists",
+    });
+  });
+
+  it("returns 403 for cross-company application updates and 404 for missing applications", async () => {
+    const allowedCompany = await createCompany(db);
+    const otherCompany = await createCompany(db);
+    const application = await toolAccessService(db).createApplication(otherCompany.id, {
+      name: "Other company app",
+      type: "mcp_http",
+    });
+    const app = createRouteApp(db, {
+      type: "board",
+      userId: "member-user",
+      userName: "Member User",
+      userEmail: null,
+      companyIds: [allowedCompany.id],
+      memberships: [
+        {
+          companyId: allowedCompany.id,
+          membershipRole: "owner",
+          status: "active",
+        },
+      ],
+      isInstanceAdmin: false,
+      source: "session",
+    });
+
+    const forbiddenRes = await request(app)
+      .patch(`/api/tool-applications/${application.id}`)
+      .send({ name: "Forbidden edit" });
+    const missingRes = await request(createRouteApp(db))
+      .patch(`/api/tool-applications/${randomUUID()}`)
+      .send({ name: "Missing edit" });
+
+    expect(forbiddenRes.status).toBe(403);
+    expect(missingRes.status).toBe(404);
   });
 
   it("links run tool decisions to invocations, audit events, and pending action requests", async () => {
