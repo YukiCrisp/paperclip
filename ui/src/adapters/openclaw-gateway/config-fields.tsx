@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Eye, EyeOff } from "lucide-react";
 import type { AdapterConfigFieldsProps } from "../types";
 import {
@@ -13,6 +13,50 @@ import {
 
 const inputClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40";
+
+function HeadersJsonTextarea({
+  isCreate,
+  createDraft,
+  onCreateDraftChange,
+  editStringified,
+  onEditCommit,
+  inputClass,
+}: {
+  isCreate: boolean;
+  createDraft: string;
+  onCreateDraftChange: (next: string) => void;
+  editStringified: string;
+  onEditCommit: (next: string) => void;
+  inputClass: string;
+}) {
+  const [editDraft, setEditDraft] = useState<string>(editStringified);
+  const [lastSyncedFromConfig, setLastSyncedFromConfig] = useState<string>(editStringified);
+  useEffect(() => {
+    if (isCreate) return;
+    if (editStringified !== lastSyncedFromConfig) {
+      setEditDraft(editStringified);
+      setLastSyncedFromConfig(editStringified);
+    }
+  }, [editStringified, isCreate, lastSyncedFromConfig]);
+  const value = isCreate ? createDraft : editDraft;
+  return (
+    <textarea
+      value={value}
+      onChange={(e) => {
+        const next = e.target.value;
+        if (isCreate) {
+          onCreateDraftChange(next);
+        } else {
+          setEditDraft(next);
+          onEditCommit(next);
+        }
+      }}
+      rows={3}
+      className={inputClass}
+      placeholder='{"x-custom-header": "value"}'
+    />
+  );
+}
 
 function SecretField({
   label,
@@ -304,35 +348,27 @@ export function OpenClawGatewayConfigFields({
       </Field>
 
       <Field label="Headers JSON">
-        <textarea
-          value={
-            isCreate
-              ? values!.headersJson ?? ""
-              : eff("adapterConfig", "headersJson", JSON.stringify(config.headers ?? {}, null, 2))
-          }
-          onChange={(e) => {
-            const next = e.target.value;
-            if (isCreate) {
-              set!({ headersJson: next });
-            } else {
-              const trimmed = next.trim();
-              if (!trimmed) {
-                mark("adapterConfig", "headers", undefined);
-                return;
+        <HeadersJsonTextarea
+          isCreate={isCreate}
+          createDraft={isCreate ? values!.headersJson ?? "" : ""}
+          onCreateDraftChange={(next) => set!({ headersJson: next })}
+          editStringified={JSON.stringify(eff("adapterConfig", "headers", config.headers ?? {}), null, 2)}
+          onEditCommit={(next) => {
+            const trimmed = next.trim();
+            if (!trimmed) {
+              mark("adapterConfig", "headers", undefined);
+              return;
+            }
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+                mark("adapterConfig", "headers", parsed);
               }
-              try {
-                const parsed = JSON.parse(trimmed);
-                if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-                  mark("adapterConfig", "headers", parsed);
-                }
-              } catch {
-                // Keep draft until JSON is valid
-              }
+            } catch {
+              // Keep local draft until JSON is valid
             }
           }}
-          rows={3}
-          className={inputClass}
-          placeholder='{"x-custom-header": "value"}'
+          inputClass={inputClass}
         />
       </Field>
 
