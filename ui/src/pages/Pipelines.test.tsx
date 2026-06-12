@@ -289,7 +289,7 @@ async function renderItemPage(
   detail = itemDetail(),
   links: unknown[] = [],
   options: {
-    children?: unknown[];
+    children?: unknown;
     events?: unknown[];
   } = {},
 ) {
@@ -411,6 +411,45 @@ describe("PipelineItemDetailView", () => {
 
     expect(container.textContent).toContain("Cross-pipeline feature");
     const link = container.querySelector('a[href="/pipelines/pipeline-features/items/cross-child"]');
+    expect(link).not.toBeNull();
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("renders built-from children from the rollup tree response shape", async () => {
+    const { container, root } = await renderItemPage(itemDetail(), [], {
+      children: {
+        case: {
+          id: "item-1",
+          title: "Release v0.42",
+          pipeline: { id: "pipeline-1", key: "release", name: "Release" },
+          stage: { id: "stage-intake", key: "intake", name: "Intake", kind: "open" },
+          childGroups: [
+            {
+              pipeline: { id: "pipeline-features", key: "feature", name: "Feature Content" },
+              cases: [
+                {
+                  id: "feature-1",
+                  caseKey: "v0.42-pipelines-ui",
+                  title: "Feature: Pipelines UI",
+                  terminalKind: "done",
+                  pipeline: { id: "pipeline-features", key: "feature", name: "Feature Content" },
+                  stage: { id: "feature-covered", key: "covered", name: "Covered", kind: "done" },
+                  rollup: { total: 6, done: 3, dropped: 3, inMotion: 0 },
+                  childGroups: [],
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(container.textContent).toContain("Feature: Pipelines UI");
+    expect(container.textContent).toContain("6 nested items hidden");
+    const link = container.querySelector('a[href="/pipelines/pipeline-features/items/feature-1"]');
     expect(link).not.toBeNull();
 
     act(() => {

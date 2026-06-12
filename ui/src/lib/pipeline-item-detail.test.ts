@@ -8,6 +8,7 @@ import {
   humanizePipelineItemStatus,
   INTERNAL_FIELD_KEYS,
   itemHasChangedNotice,
+  normalizePipelineChildRows,
 } from "./pipeline-item-detail";
 
 const stages: PipelineStage[] = [
@@ -148,5 +149,50 @@ describe("pipeline item detail helpers", () => {
     for (const key of INTERNAL_FIELD_KEYS) {
       expect(displayed.some((field) => field.key === key)).toBe(false);
     }
+  });
+
+  it("normalizes rollup-tree children responses into direct child rows", () => {
+    const rows = normalizePipelineChildRows({
+      case: {
+        id: "release-1",
+        title: "Release v0.42",
+        pipeline: { id: "release-pipeline", key: "release", name: "Release" },
+        stage: { id: "release-producing", key: "producing", name: "Producing", kind: "working" },
+        childGroups: [
+          {
+            pipeline: { id: "feature-pipeline", key: "feature", name: "Feature" },
+            cases: [
+              {
+                id: "feature-1",
+                caseKey: "v0.42-pipelines-ui",
+                title: "Feature: Pipelines UI",
+                terminalKind: "done",
+                pipeline: { id: "feature-pipeline", key: "feature", name: "Feature" },
+                stage: { id: "feature-covered", key: "covered", name: "Covered", kind: "done" },
+                rollup: { total: 6, done: 3, dropped: 3, inMotion: 0 },
+                childGroups: [],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].case).toMatchObject({
+      id: "feature-1",
+      pipelineId: "feature-pipeline",
+      stageId: "feature-covered",
+      title: "Feature: Pipelines UI",
+      terminalKind: "done",
+      childCount: 6,
+    });
+    expect(rows[0].stage).toMatchObject({
+      id: "feature-covered",
+      pipelineId: "feature-pipeline",
+      key: "covered",
+      name: "Covered",
+      kind: "done",
+    });
   });
 });

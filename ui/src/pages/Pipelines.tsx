@@ -68,6 +68,7 @@ import {
   humanizePipelineItemStatus,
   changedNoticeFromEvents,
   itemHasChangedNotice,
+  normalizePipelineChildRows,
 } from "../lib/pipeline-item-detail";
 import { extractWorkReferences, referenceFieldKeys } from "../lib/pipeline-references";
 import { hasBlockingShortcutDialog, isKeyboardShortcutTextInputTarget } from "../lib/keyboardShortcuts";
@@ -1605,7 +1606,7 @@ export function PipelineItemDetailView({ pipelineId, caseId }: { pipelineId: str
   const itemFields = displayPipelineItemFields(detail.case.fields).filter((field) => !referenceKeys.has(field.key));
   const banner = getPendingTransitionBannerState(detail.case, stageLookup);
   const statusLabel = humanizePipelineItemStatus(detail.case.terminalKind ?? detail.stage.kind);
-  const childRows = children.data ?? [];
+  const childRows = normalizePipelineChildRows(children.data);
   const eventRows = events.data?.items ?? [];
   const changedNotice = itemHasChangedNotice(detail.case) ?? changedNoticeFromEvents(eventRows);
   const primaryAction = conversationLink

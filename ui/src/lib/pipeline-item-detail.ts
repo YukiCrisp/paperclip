@@ -1,4 +1,4 @@
-import type { PipelineCase, PipelineCaseEvent, PipelineStage } from "../api/pipelines";
+import type { PipelineCase, PipelineCaseActiveWork, PipelineCaseEvent, PipelineStage } from "../api/pipelines";
 
 export const INTERNAL_FIELD_KEYS = new Set([
   "nextSuggestedStageId",
@@ -10,6 +10,30 @@ export const INTERNAL_FIELD_KEYS = new Set([
 ]);
 
 type StageLookup = Map<string, string> | Record<string, string> | PipelineStage[] | undefined;
+
+export interface PipelineChildRow {
+  case: PipelineCase;
+  stage: PipelineStage;
+  activeWork?: PipelineCaseActiveWork | null;
+}
+
+interface PipelineCaseTreeNode {
+  id: string;
+  caseKey?: string | null;
+  title: string;
+  terminalKind?: string | null;
+  createdAt?: Date | string;
+  updatedAt?: Date | string;
+  pipeline?: { id: string; key?: string; name?: string } | null;
+  stage?: { id: string; key: string; name: string; kind: string } | null;
+  rollup?: { total?: number | null } | null;
+  childGroups?: Array<{ cases?: PipelineCaseTreeNode[] | null }> | null;
+}
+
+interface PipelineCaseChildrenTree {
+  case?: PipelineCaseTreeNode | null;
+  childGroups?: Array<{ cases?: PipelineCaseTreeNode[] | null }> | null;
+}
 
 function readString(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -79,6 +103,55 @@ export function displayPipelineItemFields(fields: Record<string, unknown> | null
       label: humanizeKey(key),
       value: formatFieldValue(value),
     }));
+}
+
+function treeNodeToChildRow(node: PipelineCaseTreeNode): PipelineChildRow | null {
+  const pipelineId = node.pipeline?.id;
+  const stage = node.stage;
+  if (!pipelineId || !stage) return null;
+
+  return {
+    case: {
+      id: node.id,
+      pipelineId,
+      stageId: stage.id,
+      caseKey: node.caseKey ?? null,
+      title: node.title,
+      fields: {},
+      terminalKind: node.terminalKind ?? null,
+      childCount:
+        node.rollup?.total ??
+        node.childGroups?.reduce((count, group) => count + (group.cases?.length ?? 0), 0) ??
+        0,
+      createdAt: node.createdAt,
+      updatedAt: node.updatedAt,
+    },
+    stage: {
+      id: stage.id,
+      pipelineId,
+      key: stage.key,
+      name: stage.name,
+      kind: stage.kind,
+      position: 0,
+    },
+  };
+}
+
+export function normalizePipelineChildRows(value: unknown): PipelineChildRow[] {
+  if (Array.isArray(value)) {
+    return value.filter((row): row is PipelineChildRow => {
+      const candidate = row as Partial<PipelineChildRow>;
+      return Boolean(candidate.case?.id && candidate.case.pipelineId && candidate.stage?.id);
+    });
+  }
+
+  const tree = readRecord(value) as PipelineCaseChildrenTree | null;
+  if (!tree) return [];
+
+  return (tree.childGroups ?? tree.case?.childGroups ?? [])
+    .flatMap((group) => group.cases ?? [])
+    .map(treeNodeToChildRow)
+    .filter((row): row is PipelineChildRow => Boolean(row));
 }
 
 export function getPendingTransitionBannerState(item: Pick<PipelineCase, "pendingSuggestion" | "fields">, stages?: StageLookup) {

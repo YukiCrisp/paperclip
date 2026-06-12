@@ -336,6 +336,30 @@ export interface PipelineCompanyCaseEventsPage {
   };
 }
 
+export interface PipelineCaseChildrenTreeNode {
+  id: string;
+  caseKey: string | null;
+  title: string;
+  terminalKind?: string | null;
+  createdAt?: Date | string;
+  updatedAt?: Date | string;
+  pipeline: { id: string; key: string; name: string };
+  stage: { id: string; key: string; name: string; kind: string };
+  rollup?: { total: number; done: number; dropped: number; inMotion: number } | null;
+  childGroups?: Array<{
+    pipeline: { id: string; key: string; name: string };
+    cases: PipelineCaseChildrenTreeNode[];
+  }>;
+}
+
+export interface PipelineCaseChildrenTree {
+  case: PipelineCaseChildrenTreeNode;
+}
+
+export type PipelineCaseChildrenResponse =
+  | Array<{ case: PipelineCase; stage: PipelineStage; activeWork?: PipelineCaseActiveWork | null }>
+  | PipelineCaseChildrenTree;
+
 export type PipelineBatchIngestResult =
   | { ok: true; case: PipelineCase; created: boolean }
   | {
@@ -403,7 +427,7 @@ export const pipelinesApi = {
   },
   getCase: (caseId: string) => api.get<PipelineCaseDetail>(`/cases/${caseId}`),
   getCaseChildren: (caseId: string) =>
-    api.get<Array<{ case: PipelineCase; stage: PipelineStage; activeWork?: PipelineCaseActiveWork | null }>>(`/cases/${caseId}/children`),
+    api.get<PipelineCaseChildrenResponse>(`/cases/${caseId}/children`),
   getCaseEvents: (caseId: string, filters?: { limit?: number; offset?: number; order?: "asc" | "desc" }) => {
     const params = new URLSearchParams();
     if (filters?.limit !== undefined) params.set("limit", String(filters.limit));
