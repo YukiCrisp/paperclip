@@ -1010,6 +1010,7 @@ function PipelineCaseCard({
 function PipelineBoardColumn({
   stage,
   cases,
+  settingsHref,
   warningCount,
   onColumnEmpty,
   isDragTargeted,
@@ -1017,6 +1018,7 @@ function PipelineBoardColumn({
 }: {
   stage: PipelineStage;
   cases: BoardCase[];
+  settingsHref?: string | null;
   warningCount?: number;
   onColumnEmpty?: (stage: PipelineStage) => string;
   isDragTargeted?: boolean;
@@ -1032,8 +1034,20 @@ function PipelineBoardColumn({
       aria-label={`${stage.name} column`}
       className={`flex min-w-[260px] max-w-[320px] shrink-0 flex-col rounded-md border border-border ${isBlockedDropTarget ? "ring-1 ring-red-500/45" : ""}`}
     >
-      <div className="flex items-center justify-between border-b border-border px-3 py-2 text-sm font-semibold text-muted-foreground">
-        <span className="min-w-0 truncate">{stage.name}</span>
+      <div className="group/stage-header flex items-center justify-between border-b border-border px-3 py-2 text-sm font-semibold text-muted-foreground">
+        <div className="flex min-w-0 items-center gap-1">
+          <span className="min-w-0 truncate">{stage.name}</span>
+          {settingsHref ? (
+            <Link
+              to={settingsHref}
+              aria-label={`Edit ${stage.name} stage`}
+              title={`Edit ${stage.name} stage`}
+              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/stage-header:opacity-100"
+            >
+              <Settings className="h-3.5 w-3.5" />
+            </Link>
+          ) : null}
+        </div>
         <span className="ml-2 flex shrink-0 items-center gap-2 text-xs">
           <span>{cases.length} item{cases.length === 1 ? "" : "s"}</span>
           {warningCount ? (
@@ -1348,6 +1362,9 @@ function PipelineBoard({ pipelineId }: { pipelineId: string }) {
                   key={stage.id}
                   stage={stage}
                   cases={items}
+                  settingsHref={
+                    stage.id === UNASSIGNED_STAGE_ID ? null : `/pipelines/${pipelineId}/settings?stage=${stage.id}`
+                  }
                   warningCount={healthWarningsByStage[stage.id]?.length ?? 0}
                   isDragTargeted={isDragTargeted}
                   isDragBlocked={isDragBlocked}

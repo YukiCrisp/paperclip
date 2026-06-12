@@ -799,6 +799,19 @@ describe("PipelineBoard", () => {
     });
     queryClient.clear();
   });
+
+  it("links stage headers to settings with that stage selected", async () => {
+    const { container, root, queryClient } = await renderPipelineBoard();
+
+    const editStageLink = container.querySelector<HTMLAnchorElement>('a[aria-label="Edit Intake stage"]');
+    expect(editStageLink?.getAttribute("href")).toBe("/pipelines/pipeline-1/settings?stage=stage-intake");
+    expect(editStageLink?.className).toContain("group-hover/stage-header:opacity-100");
+
+    act(() => {
+      root.unmount();
+    });
+    queryClient.clear();
+  });
 });
 
 function attentionCase(
