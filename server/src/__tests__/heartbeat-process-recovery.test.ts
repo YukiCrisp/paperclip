@@ -455,6 +455,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runErrorCode?: string | null;
     runError?: string | null;
     contextSnapshot?: Record<string, unknown>;
+    maxConcurrentRuns?: number;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -479,7 +480,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: input?.agentStatus ?? "paused",
       adapterType: input?.adapterType ?? "codex_local",
       adapterConfig: {},
-      runtimeConfig: {},
+      runtimeConfig:
+        input?.maxConcurrentRuns != null
+          ? { heartbeat: { maxConcurrentRuns: input.maxConcurrentRuns } }
+          : {},
       permissions: {},
     });
 
@@ -976,6 +980,134 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  // Inserts an extra queued run for an existing agent, mimicking a fresh wake
+  // that the scheduler would try to start after a restart.
+  async function seedQueuedRunForAgent(input: {
+    companyId: string;
+    agentId: string;
+    includeIssueId?: boolean;
+  }) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-03-19T00:05:00.000Z");
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: input.includeIssueId ? { issueId } : {},
+      status: "queued",
+      runId,
+      requestedAt: now,
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: input.includeIssueId
+        ? { issueId, taskId: issueId, wakeReason: "issue_assigned" }
+        : {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { runId, wakeupRequestId, issueId };
+  }
+
+  it.skipIf(process.platform === "win32")(
+    "does not start a queued run while the agent still has a live detached survivor (double-launch guard)",
+    async () => {
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      expect(child.pid).toBeTypeOf("number");
+
+      // A detached survivor from a previous lifetime: running, marked
+      // process_detached, with a genuinely alive child pid. maxConcurrentRuns=2
+      // leaves a free slot, so only the guard can hold the new start back.
+      const { agentId, companyId, runId: survivorRunId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: child.pid ?? null,
+        runErrorCode: "process_detached",
+        runError: `Lost in-memory process handle, but child pid ${child.pid} is still alive`,
+        maxConcurrentRuns: 2,
+      });
+      const { runId: queuedRunId } = await seedQueuedRunForAgent({ companyId, agentId });
+
+      const heartbeat = heartbeatService(db);
+      const started = await heartbeat.startNextQueuedRunForAgent(agentId);
+
+      // No new run is launched while the survivor is alive.
+      expect(started).toEqual([]);
+      const queuedRun = await heartbeat.getRun(queuedRunId);
+      expect(queuedRun?.status).toBe("queued");
+      // The live survivor is left untouched — no destructive intervention.
+      const survivor = await heartbeat.getRun(survivorRunId);
+      expect(survivor?.status).toBe("running");
+      expect(survivor?.errorCode).toBe("process_detached");
+    },
+  );
+
+  it("starts a queued run when the agent's running detached row is a dead process (guard verifies liveness)", async () => {
+    // Looks like a detached survivor (running + process_detached) but its pid is
+    // dead, so identity verification must NOT treat it as a live survivor and
+    // must NOT block normal scheduling.
+    const { agentId, companyId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      runErrorCode: "process_detached",
+      maxConcurrentRuns: 2,
+    });
+    const { runId: queuedRunId } = await seedQueuedRunForAgent({ companyId, agentId });
+
+    const heartbeat = heartbeatService(db);
+    const started = await heartbeat.startNextQueuedRunForAgent(agentId);
+
+    expect(started).toHaveLength(1);
+    expect(started[0]?.id).toBe(queuedRunId);
+    // Let the background execution settle so teardown stays clean.
+    await waitForRunToSettle(heartbeat, queuedRunId);
+  });
+
+  it("starts a queued run normally when the agent has no detached survivor (regression)", async () => {
+    // Fresh agent with only a queued run and no running rows at all: the guard
+    // must be inert and normal scheduling must proceed.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const { runId: queuedRunId } = await seedQueuedRunForAgent({ companyId, agentId });
+
+    const heartbeat = heartbeatService(db);
+    const started = await heartbeat.startNextQueuedRunForAgent(agentId);
+
+    expect(started).toHaveLength(1);
+    expect(started[0]?.id).toBe(queuedRunId);
+    await waitForRunToSettle(heartbeat, queuedRunId);
   });
 
   it.skipIf(process.platform === "win32")(

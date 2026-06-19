@@ -7866,6 +7866,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // Returns a live "detached survivor" run for the agent, or null. A detached
+  // survivor is a run still in `running` whose in-memory ChildProcess handle was
+  // lost across a server restart (the child got reparented to PID 1 and keeps
+  // running, holding its issue lock — ENGA-502/ENGA-505). We can no longer
+  // manage, stop, or observe the completion of such a process, so while it is
+  // genuinely alive the scheduler must not start additional runs for the same
+  // agent; doing so double-runs the agent and collides on the issue lock (the
+  // 409 an observer misreads as a "zombie"). Identity is verified with
+  // isTrackedProcessAlive (pid + process-start-time fingerprint reused from the
+  // PID-reuse fix) so a recycled PID or an already-dead child does NOT block
+  // scheduling. A run we started in *this* process lifetime is tracked in
+  // runningProcesses/activeRunExecutions and is therefore never treated as a
+  // survivor — this is what keeps normal, non-detached scheduling unaffected.
+  async function findLiveDetachedSurvivorForAgent(agentId: string) {
+    const runningRows = await db
+      .select({
+        run: heartbeatRuns,
+        adapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+
+    for (const { run, adapterType } of runningRows) {
+      // Only local child-process adapters spawn a pid we can fingerprint; other
+      // adapter kinds never leave a detached child behind.
+      if (!isTrackedLocalChildProcessAdapter(adapterType)) continue;
+      // A handle we still hold this lifetime is managed, not a survivor.
+      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      if (!run.processPid) continue;
+      if (await isTrackedProcessAlive(run.processPid, run.processStartedAt)) {
+        return run;
+      }
+    }
+    return null;
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -7888,6 +7925,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
         .orderBy(asc(heartbeatRuns.createdAt));
       if (queuedRuns.length === 0) return [];
+
+      // Double-launch guard (ENGA-505): if this agent still has a live detached
+      // survivor from a previous server lifetime, defer all new starts until it
+      // exits. `availableSlots` only accounts for it as one occupied `running`
+      // row, which is insufficient when maxConcurrentRuns > 1 — the survivor is
+      // unmanageable, so we hold the whole agent rather than just one slot. The
+      // next periodic reaper / resumeQueuedRuns pass re-drives this agent once
+      // the survivor's process is gone.
+      const liveDetachedSurvivor = await findLiveDetachedSurvivorForAgent(agentId);
+      if (liveDetachedSurvivor) {
+        logger.warn(
+          {
+            agentId,
+            survivorRunId: liveDetachedSurvivor.id,
+            survivorPid: liveDetachedSurvivor.processPid,
+            queuedRunCount: queuedRuns.length,
+          },
+          "deferring queued run start: agent still has a live detached survivor run",
+        );
+        return [];
+      }
 
       const dependencyReadiness = await listQueuedRunDependencyReadiness(agent.companyId, queuedRuns);
       const queuedIssueIds = [...new Set(
@@ -11726,6 +11784,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    startNextQueuedRunForAgent,
 
     scheduleBoundedRetry: async (
       runId: string,
