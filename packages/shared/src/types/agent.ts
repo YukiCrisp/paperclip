@@ -97,6 +97,7 @@ export interface Agent {
   spentMonthlyCents: number;
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
+  errorReason?: string | null;
   permissions: AgentPermissions;
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;
