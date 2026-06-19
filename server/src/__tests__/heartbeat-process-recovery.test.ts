@@ -449,6 +449,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
+    processStartedAt?: Date | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -508,6 +509,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
+      processStartedAt: input?.processStartedAt ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
@@ -975,6 +977,77 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
   });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps a live detached run active when its recorded process start time matches the live pid (no false reap)",
+    async () => {
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      expect(child.pid).toBeTypeOf("number");
+
+      // Recorded start time matches the process we just spawned, so the identity
+      // check confirms the pid still belongs to the original child.
+      const { runId } = await seedRunFixture({
+        processPid: child.pid ?? null,
+        processStartedAt: new Date(),
+        includeIssue: false,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reapOrphanedRuns();
+      expect(result.reaped).toBe(0);
+
+      const run = await heartbeat.getRun(runId);
+      expect(run?.status).toBe("running");
+      expect(run?.errorCode).toBe("process_detached");
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "reaps a run whose recorded pid is alive but was reused by an unrelated process (stale start time)",
+    async () => {
+      // The pid is genuinely alive, but the run recorded a start time long before
+      // this process actually started -- i.e. the OS recycled the pid after the
+      // original detached child died. The bare process.kill(pid, 0) liveness check
+      // would wrongly report "alive" and pin the run in "running" forever.
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      expect(child.pid).toBeTypeOf("number");
+      expect(isPidAlive(child.pid)).toBe(true);
+
+      const { agentId, runId, issueId } = await seedRunFixture({
+        agentStatus: "idle",
+        processPid: child.pid ?? null,
+        processStartedAt: new Date("2026-03-19T00:00:00.000Z"),
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reapOrphanedRuns();
+      expect(result.reaped).toBe(1);
+      expect(result.runIds).toEqual([runId]);
+
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      const failedRun = runs.find((row) => row.id === runId);
+      expect(failedRun?.status).toBe("failed");
+      expect(failedRun?.errorCode).toBe("process_lost");
+
+      // Lock released: the stuck checkout no longer pins the issue.
+      const issue = await waitForValue(async () =>
+        db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => {
+            const row = rows[0] ?? null;
+            return row && row.checkoutRunId === null ? row : null;
+          }),
+      );
+      expect(issue?.checkoutRunId).toBeNull();
+    },
+  );
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({

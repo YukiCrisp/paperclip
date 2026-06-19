@@ -2934,6 +2934,56 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
+// Allowance for the skew between the wall-clock we stamp right after spawn()
+// (processStartedAt) and the OS-reported process start time, which `ps -o
+// lstart=` only resolves to whole seconds. A reused PID belongs to a process
+// that started long after the original child died (the staleness threshold
+// guarantees a multi-minute gap), so a few seconds of tolerance separates "same
+// process" from "PID was recycled" without any risk of confusing the two.
+const PROCESS_IDENTITY_START_TOLERANCE_MS = 5_000;
+
+// Reads the OS-reported start time of `pid` (epoch ms) using `ps -o lstart=`,
+// which works on both macOS and Linux. Returns null when the platform is
+// unsupported, the process is gone, or the timestamp cannot be parsed.
+async function readProcessStartedAtMs(pid: number): Promise<number | null> {
+  if (process.platform === "win32") return null;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const { stdout } = await execFile("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const text = stdout.trim();
+    if (!text) return null;
+    const parsed = Date.parse(text);
+    return Number.isNaN(parsed) ? null : parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Liveness check hardened against PID reuse. `process.kill(pid, 0)` only proves
+// *some* process holds that PID -- after a detached child dies the OS can hand
+// the same PID to an unrelated process, which the bare check reports as "alive"
+// forever, pinning the run in "running" and leaking its issue lock permanently
+// (ENGA-502). When we have a recorded start time we additionally require the OS
+// process-start time to match it within tolerance; a mismatch means the PID was
+// recycled and the original child is dead. When identity cannot be established
+// (no recorded start time, or `ps` unavailable) we fall back to the liveness-only
+// result so we never false-positive a genuinely live detached run into a reap.
+async function isTrackedProcessAlive(
+  pid: number | null | undefined,
+  expectedStartedAt: Date | string | null | undefined,
+): Promise<boolean> {
+  if (!isProcessAlive(pid)) return false;
+  if (expectedStartedAt == null) return true;
+  const expectedMs =
+    expectedStartedAt instanceof Date
+      ? expectedStartedAt.getTime()
+      : Date.parse(String(expectedStartedAt));
+  if (Number.isNaN(expectedMs)) return true;
+  const actualMs = await readProcessStartedAtMs(pid as number);
+  if (actualMs == null) return true;
+  return Math.abs(actualMs - expectedMs) <= PROCESS_IDENTITY_START_TOLERANCE_MS;
+}
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -7589,7 +7639,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
+      const processPidAlive =
+        tracksLocalChild && !!run.processPid
+          ? await isTrackedProcessAlive(run.processPid, run.processStartedAt)
+          : false;
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
