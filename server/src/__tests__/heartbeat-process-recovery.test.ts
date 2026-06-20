@@ -4144,4 +4144,80 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
   });
+
+  describe("reapRunById (sanctioned single-run reap)", () => {
+    it("returns not_found for an unknown run id", async () => {
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapRunById(randomUUID());
+      expect(result.outcome).toBe("not_found");
+    });
+
+    it("refuses a run that is not in running status", async () => {
+      const { runId } = await seedRunFixture({ runStatus: "failed", includeIssue: false });
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapRunById(runId);
+      expect(result.outcome).toBe("refused");
+      if (result.outcome === "refused") expect(result.reason).toBe("not_running");
+    });
+
+    it.skipIf(process.platform === "win32")(
+      "refuses with process_alive evidence when the recorded pid is still alive",
+      async () => {
+        const child = spawnAliveProcess();
+        childProcesses.add(child);
+        expect(child.pid).toBeTypeOf("number");
+        // No recorded start time -> isTrackedProcessAlive falls back to the
+        // liveness-only result, which is true for this freshly spawned child.
+        const { runId } = await seedRunFixture({
+          processPid: child.pid ?? null,
+          processStartedAt: null,
+          includeIssue: false,
+        });
+        const heartbeat = heartbeatService(db);
+
+        const result = await heartbeat.reapRunById(runId, {
+          now: new Date("2026-03-20T00:00:00.000Z"),
+        });
+        expect(result.outcome).toBe("refused");
+        if (result.outcome === "refused") {
+          expect(result.reason).toBe("process_alive");
+          expect(result.evidence.processPidAlive).toBe(true);
+        }
+        // A live process is never reaped, even a full day of silence.
+        const run = await heartbeat.getRun(runId);
+        expect(run?.status).toBe("running");
+      },
+    );
+
+    it("refuses a dead run whose silence is still below the critical threshold", async () => {
+      const { runId } = await seedRunFixture({ processPid: null, includeIssue: false });
+      const heartbeat = heartbeatService(db);
+      // startedAt is 2026-03-19T00:00:00Z; one hour later is below the 4h critical threshold.
+      const result = await heartbeat.reapRunById(runId, {
+        now: new Date("2026-03-19T01:00:00.000Z"),
+      });
+      expect(result.outcome).toBe("refused");
+      if (result.outcome === "refused") {
+        expect(result.reason).toBe("below_critical_threshold");
+        expect(result.evidence.processPidAlive).toBe(false);
+      }
+      const run = await heartbeat.getRun(runId);
+      expect(run?.status).toBe("running");
+    });
+
+    it("reaps a genuinely dead run past the critical silence threshold via the safe path", async () => {
+      const { runId } = await seedRunFixture({ processPid: null });
+      const heartbeat = heartbeatService(db);
+      // Five hours after startedAt is past the 4h critical threshold; no live pid.
+      const result = await heartbeat.reapRunById(runId, {
+        now: new Date("2026-03-19T05:00:00.000Z"),
+      });
+      expect(result.outcome).toBe("reaped");
+      if (result.outcome === "reaped") expect(result.runId).toBe(runId);
+
+      const run = await heartbeat.getRun(runId);
+      expect(run?.status).toBe("failed");
+      expect(run?.errorCode).toBe("process_lost");
+    });
+  });
 });

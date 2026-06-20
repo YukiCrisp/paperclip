@@ -400,6 +400,20 @@ const ErrorSchema = registry.register(
   z.object({ error: z.string() }),
 );
 
+// Point-in-time liveness evidence captured at reap-run evaluation, echoed back in
+// every refusal so a stale monitor snapshot can be checked against the live run.
+const ReapRunEvidenceSchema = z.object({
+  status: z.string(),
+  processPid: z.number().nullable(),
+  processGroupId: z.number().nullable(),
+  processPidAlive: z.boolean(),
+  processGroupAlive: z.boolean(),
+  lastOutputAt: z.string().nullable(),
+  lastOutputSeq: z.number(),
+  silenceAgeMs: z.number().nullable(),
+  criticalThresholdMs: z.number(),
+});
+
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.unknown())) => ({
     description: "Success",
@@ -2879,6 +2893,45 @@ registry.registerPath({
   summary: "Cancel a heartbeat run",
   request: { params: z.object({ runId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/heartbeat-runs/{runId}/reap",
+  tags: ["runs"],
+  summary: "Reap a heartbeat run after a live liveness recheck",
+  description:
+    "Sanctioned single-run termination. Re-checks liveness at evaluation time and " +
+    "refuses (HTTP 200 with the captured evidence body) unless the run is genuinely " +
+    "dead and past the critical silence threshold, so a stale monitor snapshot can " +
+    "never terminate a live run.",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: {
+    200: r.ok(
+      z.discriminatedUnion("outcome", [
+        z.object({
+          outcome: z.literal("reaped"),
+          runId: z.string(),
+          evidence: ReapRunEvidenceSchema,
+        }),
+        z.object({
+          outcome: z.literal("refused"),
+          runId: z.string(),
+          reason: z.enum([
+            "not_running",
+            "in_memory_handle_alive",
+            "process_alive",
+            "below_critical_threshold",
+            "finalize_noop",
+          ]),
+          evidence: ReapRunEvidenceSchema,
+        }),
+        z.object({ outcome: z.literal("not_found"), runId: z.string() }),
+      ]),
+    ),
+    401: r.unauthorized,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({
