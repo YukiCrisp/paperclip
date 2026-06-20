@@ -128,6 +128,24 @@ export function registerRunCommands(command: Command): void {
 
   addCommonClientOptions(
     command
+      .command("reap")
+      .description(
+        "Safely finalize a dead orphaned heartbeat run. Re-checks liveness (pid + process group + output-silence age) and REFUSES with live evidence unless the run is genuinely dead and past the critical silence threshold. The sanctioned alternative to hand-written SQL.",
+      )
+      .argument("<runId>", "Heartbeat run ID")
+      .action(async (runId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const result = await ctx.api.post(apiPath`/api/heartbeat-runs/${runId}/reap`, {});
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    command
       .command("events")
       .description("List heartbeat run events")
       .argument("<runId>", "Heartbeat run ID")

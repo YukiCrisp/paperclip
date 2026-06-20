@@ -3564,6 +3564,44 @@ export function agentRoutes(
     res.json(run);
   });
 
+  // Sanctioned, liveness-rechecked single-run reap. The service refuses (and
+  // returns live evidence in the body) unless the run is genuinely dead and past
+  // the critical silence threshold, so this is the only run-termination path an
+  // operator needs -- no hand-written `UPDATE heartbeat_runs` against a run a
+  // stale monitor snapshot mislabeled as a zombie (ENGA-510 / ENGA-520).
+  router.post("/heartbeat-runs/:runId/reap", async (req, res) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const existing = await heartbeat.getRun(runId);
+    if (!existing) {
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+
+    const result = await heartbeat.reapRunById(runId);
+
+    if (result.outcome === "reaped") {
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "heartbeat.reaped",
+        entityType: "heartbeat_run",
+        entityId: runId,
+        details: {
+          agentId: existing.agentId,
+          reason: "manual_reap_run",
+          silenceAgeMs: result.evidence.silenceAgeMs,
+        },
+      });
+    }
+
+    // Refusals return 200 with the evidence body on purpose: showing the operator
+    // why the run is still alive is the whole point of the verb.
+    res.json(result);
+  });
+
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {
     const runId = req.params.runId as string;
     const existing = await heartbeat.getRun(runId);

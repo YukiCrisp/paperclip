@@ -1462,6 +1462,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return [
       `Paperclip detected ${input.level} output silence on an active heartbeat run.`,
       "",
+      `> The figures below are a point-in-time snapshot taken at ${input.now.toISOString()}, not a live pulse. The run may have produced output or finished since. **Re-read the live run (link above) before acting** — a snapshot showing an old sequence number is not evidence the run is dead.`,
+      "",
       "## Run",
       "",
       `- Run: ${runUiLink(input.run, input.prefix)}`,
@@ -1497,7 +1499,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       "- Continue or snooze if the run is intentionally quiet.",
       "- Ask the run owner for context if work may be delegated outside the transcript.",
       "- Preserve artifacts, branch state, and useful output before cancellation.",
-      "- Cancel or recover through the explicit run recovery controls when authorized.",
+      `- To cancel a still-live run gracefully, use \`paperclipai run cancel ${input.run.id}\`.`,
+      `- To finalize a run only if it is genuinely dead, use the sanctioned, liveness-rechecked reap verb: \`paperclipai run reap ${input.run.id}\` (or \`POST /api/heartbeat-runs/${input.run.id}/reap\`). It re-checks the pid and silence age at call time and **refuses with live evidence** unless the process is gone and silence is past the critical threshold.`,
+      "- Never hand-write SQL (e.g. `UPDATE heartbeat_runs SET status=...`) to terminate a run: it bypasses every liveness and safety check and can kill a healthy run. The reap verb is the only sanctioned termination path.",
       "- Close this issue as a false positive only after recording the reason.",
     ].join("\n");
   }

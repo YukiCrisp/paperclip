@@ -156,7 +156,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { recoveryService } from "./recovery/service.js";
+import { ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS, recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
@@ -226,6 +226,35 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+
+// Why a refusal was returned by reapRunById. Surfaced to the operator so they
+// can see exactly which liveness gate kept the run alive instead of guessing.
+export type ReapRunRefusalReason =
+  | "not_running"
+  | "in_memory_handle_alive"
+  | "process_alive"
+  | "below_critical_threshold"
+  | "finalize_noop";
+
+// Point-in-time liveness evidence captured at reap-run evaluation, echoed back
+// in every refusal so a stale monitor snapshot can be checked against the live
+// run before any termination is attempted.
+export type ReapRunEvidence = {
+  status: string;
+  processPid: number | null;
+  processGroupId: number | null;
+  processPidAlive: boolean;
+  processGroupAlive: boolean;
+  lastOutputAt: string | null;
+  lastOutputSeq: number;
+  silenceAgeMs: number | null;
+  criticalThresholdMs: number;
+};
+
+export type ReapRunResult =
+  | { outcome: "not_found"; runId: string }
+  | { outcome: "refused"; runId: string; reason: ReapRunRefusalReason; evidence: ReapRunEvidence }
+  | { outcome: "reaped"; runId: string; evidence: ReapRunEvidence };
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -7675,73 +7704,180 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
-
-      let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
-        finishedAt: now,
-        resultJson: mergeRunStopMetadataForAgent(
-          { adapterType, adapterConfig },
-          "failed",
-          {
-            resultJson: parseObject(run.resultJson),
-            errorCode: "process_lost",
-            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-          },
-        ),
-      });
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-      });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
-      finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
-      await releaseEnvironmentLeasesForRun({
-        runId: finalizedRun.id,
-        companyId: finalizedRun.companyId,
-        agentId: finalizedRun.agentId,
-        status: finalizedRun.status,
-        failureReason: finalizedRun.error ?? undefined,
-      });
-
-      let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
-      if (shouldRetry) {
-        const agent = await getAgent(run.agentId);
-        if (agent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
-        }
-      } else {
-        await releaseIssueExecutionAndPromote(finalizedRun);
-      }
-
-      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "error",
-        message: shouldRetry
-          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
-          : baseMessage,
-        payload: {
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
-          ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
-        },
-      });
-
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage);
-      await startNextQueuedRunForAgent(run.agentId);
-      runningProcesses.delete(run.id);
-      reaped.push(run.id);
+      const reapedId = await finalizeOrphanedRun({ run, adapterType, adapterConfig, now, descendantOnlyCleanup });
+      if (reapedId) reaped.push(reapedId);
     }
 
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
     return { reaped: reaped.length, runIds: reaped };
+  }
+
+  // Safe service-layer termination of a single dead orphaned run, shared by the
+  // periodic sweep (reapOrphanedRuns) and the on-demand `reap-run` verb
+  // (reapRunById). Callers MUST have already confirmed the run is genuinely dead
+  // (no live pid / process group, no in-memory handle). This is the only
+  // sanctioned terminal path: it routes through setRunStatus + lease/issue
+  // release + agent finalization, never a raw `UPDATE heartbeat_runs`.
+  async function finalizeOrphanedRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    adapterType: string;
+    adapterConfig: (typeof agents.$inferSelect)["adapterConfig"];
+    now: Date;
+    descendantOnlyCleanup: boolean;
+  }): Promise<string | null> {
+    const { run, adapterType, adapterConfig, now, descendantOnlyCleanup } = input;
+    const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+    const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+    const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+
+    let finalizedRun = await setRunStatus(run.id, "failed", {
+      error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+      errorCode: "process_lost",
+      finishedAt: now,
+      resultJson: mergeRunStopMetadataForAgent(
+        { adapterType, adapterConfig },
+        "failed",
+        {
+          resultJson: parseObject(run.resultJson),
+          errorCode: "process_lost",
+          errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        },
+      ),
+    });
+    await setWakeupStatus(run.wakeupRequestId, "failed", {
+      finishedAt: now,
+      error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+    });
+    if (!finalizedRun) finalizedRun = await getRun(run.id);
+    if (!finalizedRun) return null;
+    finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+    await releaseEnvironmentLeasesForRun({
+      runId: finalizedRun.id,
+      companyId: finalizedRun.companyId,
+      agentId: finalizedRun.agentId,
+      status: finalizedRun.status,
+      failureReason: finalizedRun.error ?? undefined,
+    });
+
+    let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+    if (shouldRetry) {
+      const agent = await getAgent(run.agentId);
+      if (agent) {
+        retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+      }
+    } else {
+      await releaseIssueExecutionAndPromote(finalizedRun);
+    }
+
+    await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "error",
+      message: shouldRetry
+        ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
+        : baseMessage,
+      payload: {
+        ...(run.processPid ? { processPid: run.processPid } : {}),
+        ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+        ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
+        ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(run.agentId, "failed", baseMessage);
+    await startNextQueuedRunForAgent(run.agentId);
+    runningProcesses.delete(run.id);
+    return finalizedRun.id;
+  }
+
+  // On-demand, single-run counterpart to the periodic reapOrphanedRuns sweep and
+  // the sanctioned manual run-termination path. It re-derives liveness at call
+  // time -- PID-reuse-hardened `kill -0` + process-group probe + output-silence
+  // age -- and REFUSES with live evidence unless the run is genuinely dead AND
+  // past the critical silence threshold. Termination, when allowed, flows through
+  // the shared finalizeOrphanedRun service path, never a raw `UPDATE
+  // heartbeat_runs`. This makes the safe path the only path so a stale monitor
+  // snapshot can never be translated into a hand-written destructive SQL recipe
+  // that kills a live run (ENGA-510 / ENGA-520).
+  async function reapRunById(
+    runId: string,
+    opts?: { now?: Date },
+  ): Promise<ReapRunResult> {
+    const now = opts?.now ?? new Date();
+    const [row] = await db
+      .select({
+        run: heartbeatRuns,
+        adapterType: agents.adapterType,
+        adapterConfig: agents.adapterConfig,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    if (!row) return { outcome: "not_found", runId };
+
+    const { run, adapterType, adapterConfig } = row;
+    const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+    const processPidAlive =
+      tracksLocalChild && !!run.processPid
+        ? await isTrackedProcessAlive(run.processPid, run.processStartedAt)
+        : false;
+    const processGroupAlive = Boolean(
+      tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId),
+    );
+    const silenceStartedAt =
+      run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? null;
+    const silenceAgeMs = silenceStartedAt
+      ? Math.max(0, now.getTime() - new Date(silenceStartedAt).getTime())
+      : null;
+    const evidence: ReapRunEvidence = {
+      status: run.status,
+      processPid: run.processPid ?? null,
+      processGroupId: run.processGroupId ?? null,
+      processPidAlive,
+      processGroupAlive,
+      lastOutputAt: run.lastOutputAt ? new Date(run.lastOutputAt).toISOString() : null,
+      lastOutputSeq: run.lastOutputSeq ?? 0,
+      silenceAgeMs,
+      criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+    };
+
+    // Only "running" rows are eligible; anything terminal is already finalized.
+    if (run.status !== "running") {
+      return { outcome: "refused", runId, reason: "not_running", evidence };
+    }
+    // A live in-memory handle means this process is actively supervising the run.
+    if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) {
+      return { outcome: "refused", runId, reason: "in_memory_handle_alive", evidence };
+    }
+    // The non-overridable safety: a live OS process (or surviving group) is never
+    // reaped. A 1h silence is "suspicious", not "dead".
+    if (processPidAlive || processGroupAlive) {
+      return { outcome: "refused", runId, reason: "process_alive", evidence };
+    }
+    // Even with a dead pid, refuse until the critical silence threshold (4h) so a
+    // momentary gap right after process loss cannot be terminated prematurely.
+    if (silenceAgeMs === null || silenceAgeMs < ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS) {
+      return { outcome: "refused", runId, reason: "below_critical_threshold", evidence };
+    }
+
+    const reapedId = await finalizeOrphanedRun({
+      run,
+      adapterType,
+      adapterConfig,
+      now,
+      descendantOnlyCleanup: false,
+    });
+    if (!reapedId) {
+      return { outcome: "refused", runId, reason: "finalize_noop", evidence };
+    }
+    logger.warn(
+      { runId: reapedId, reason: "manual_reap_run", silenceAgeMs },
+      "reaped dead heartbeat run via reap-run verb",
+    );
+    return { outcome: "reaped", runId: reapedId, evidence };
   }
 
   async function resumeQueuedRuns() {
@@ -11779,6 +11915,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
+    reapRunById,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
