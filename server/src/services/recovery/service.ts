@@ -1586,6 +1586,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
     const sourceIssue = await resolveStaleRunSourceIssue(input.run);
     const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
+
+    // ENGA-578: re-verify live run state at the moment we would recommend destructive action.
+    // The candidate row was snapshotted at scan time and the evaluation ticket is frequently worked
+    // minutes-to-hours later, by which point the run has usually already exited. If the run is no
+    // longer running, self-resolve any open evaluation instead of recommending a kill/mark-terminal
+    // against stale state (the "snapshot-freeze" false-positive class).
+    const [freshRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId)))
+      .limit(1);
+    if (freshRun && TERMINAL_HEARTBEAT_RUN_STATUSES.has(freshRun.status)) {
+      if (existing) {
+        await selfResolveTerminalStaleRunEvaluation({ run: freshRun, evaluation: existing, now: input.now });
+      }
+      return { kind: "resolved" as const, evaluationIssueId: existing?.id ?? null };
+    }
+
     if (sourceIssue && isRecoveryOriginIssue(sourceIssue)) {
       await logActivity(db, {
         companyId: input.run.companyId,
@@ -1723,6 +1741,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return { kind: "existing" as const, evaluationIssueId: existing.id };
     }
 
+    // ENGA-578: a suspicious-but-not-critical silent run is review-only. Slow-but-healthy runs
+    // (e.g. an upstream inference that stalls then recovers) routinely cross the 1h suspicion
+    // threshold and self-heal well before the 4h critical threshold. Filing a board cleanup ticket
+    // and waking an owner at suspicion is the dominant false-positive source — record the signal in
+    // the activity log for observability, but do not create a ticket or wake an owner until the
+    // critical threshold is crossed.
+    if (level !== "critical") {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_suspicious_noted",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          level,
+          sourceIssueId: sourceIssue?.id ?? null,
+          silenceAgeMs: evidence.silenceAgeMs,
+          lastOutputAt: input.run.lastOutputAt?.toISOString() ?? null,
+        },
+      });
+      return { kind: "noted" as const };
+    }
+
     const ownerAgentId = await resolveStaleRunOwnerAgentId({ run: input.run, runningAgent, sourceIssue });
     const description = buildStaleRunEvaluationDescription({
       run: input.run,
@@ -1807,8 +1852,127 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, evaluationIssueId: evaluation.id };
   }
 
+  // ENGA-578: stand down an open stale-run evaluation once its run has reached a terminal state.
+  // These tickets are frequently worked minutes-to-hours after detection, by which time the run has
+  // usually already exited cleanly (the silence was a slow-but-healthy inference, not a hang).
+  // Closing the ticket here prevents an operator from killing/mark-terminal-ing a run that is already
+  // gone, and removes the dominant false-positive class.
+  async function selfResolveTerminalStaleRunEvaluation(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    evaluation: { id: string; identifier: string | null; status: string };
+    now: Date;
+  }) {
+    const { run, evaluation } = input;
+    if (!isTerminalIssueStatus(evaluation.status)) {
+      await issuesSvc.update(evaluation.id, { status: "done" });
+      await issuesSvc.addComment(evaluation.id, [
+        "Run self-resolved — output-silence watchdog stand-down.",
+        "",
+        `- Run: \`${run.id}\``,
+        `- Run status now: \`${run.status}\`${run.errorCode ? ` (errorCode: \`${run.errorCode}\`)` : ""}`,
+        `- Finished at: ${run.finishedAt?.toISOString() ?? "unknown"}`,
+        "- Outcome: false positive. The run already reached a terminal state, so no kill/mark-terminal action is required.",
+      ].join("\n"), { runId: run.id });
+    }
+
+    if (!(await hasDismissedFalsePositiveDecision(run.companyId, run.id))) {
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId: run.companyId,
+        runId: run.id,
+        evaluationIssueId: evaluation.id,
+        decision: "dismissed_false_positive",
+        reason: `Run reached terminal status \`${run.status}\` before the output-silence alert was actioned.`,
+        createdByRunId: null,
+      });
+    }
+
+    const sourceIssue = await resolveStaleRunSourceIssue(run);
+    if (sourceIssue) {
+      const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(run.companyId, sourceIssue.id);
+      if (activeRecoveryAction?.kind === "active_run_watchdog") {
+        await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: run.companyId,
+          sourceIssueId: sourceIssue.id,
+          actionId: activeRecoveryAction.id,
+          status: "resolved",
+          outcome: "false_positive",
+          resolutionNote: "Run reached a terminal status before the output-silence alert was actioned; watchdog stood down.",
+        });
+      }
+    }
+
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: run.agentId,
+      runId: run.id,
+      action: "heartbeat.output_stale_self_resolved",
+      entityType: "issue",
+      entityId: evaluation.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        runId: run.id,
+        runStatus: run.status,
+        finishedAt: run.finishedAt?.toISOString() ?? null,
+        evaluationIssueId: evaluation.id,
+        evaluationIssueIdentifier: evaluation.identifier,
+      },
+    });
+  }
+
+  // ENGA-578: sweep open stale-run evaluation tickets whose run has since reached a terminal state
+  // and self-resolve them. This runs the snapshot-freeze guard continuously — not only at
+  // ticket-creation time — so tickets filed in a prior scan cycle also stand down once their run
+  // exits, instead of waiting for an operator to act on stale state.
+  async function resolveTerminalStaleRunEvaluations(opts: { now: Date; companyId?: string }) {
+    const rows = await db
+      .select({
+        run: heartbeatRuns,
+        evaluationId: issues.id,
+        evaluationIdentifier: issues.identifier,
+        evaluationStatus: issues.status,
+      })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(issues.companyId, heartbeatRuns.companyId),
+          // issues.originId is text; heartbeatRuns.id is uuid. Cast the uuid side to text so the
+          // comparison never errors on non-uuid origin values from other origin kinds.
+          sql`${heartbeatRuns.id}::text = ${issues.originId}`,
+        ),
+      )
+      .where(
+        and(
+          opts.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+          inArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+        ),
+      )
+      .limit(100);
+
+    let resolved = 0;
+    for (const row of rows) {
+      await selfResolveTerminalStaleRunEvaluation({
+        run: row.run,
+        evaluation: {
+          id: row.evaluationId,
+          identifier: row.evaluationIdentifier,
+          status: row.evaluationStatus,
+        },
+        now: opts.now,
+      });
+      resolved += 1;
+    }
+    return resolved;
+  }
+
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
+    const resolved = await resolveTerminalStaleRunEvaluations({ now, companyId: opts?.companyId });
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
     const candidates = await db
       .select()
@@ -1829,6 +1993,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       existing: 0,
       escalated: 0,
       folded: 0,
+      noted: 0,
+      resolved,
       snoozed: 0,
       skipped: 0,
       evaluationIssueIds: [] as string[],
@@ -1844,6 +2010,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
+      else if (outcome.kind === "noted") result.noted += 1;
+      else if (outcome.kind === "resolved") result.resolved += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);
