@@ -10,12 +10,14 @@ import {
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
   DEPLOYMENT_MODES,
+  MODEL_PROFILE_KEYS,
   SECRET_PROVIDERS,
   STORAGE_PROVIDERS,
   type BindMode,
   type AuthBaseUrlMode,
   type DeploymentExposure,
   type DeploymentMode,
+  type ModelProfileKey,
   type SecretProvider,
   type StorageProvider,
   inferBindModeFromHost,
@@ -85,8 +87,43 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  /**
+   * Optional wake-reason -> model-profile lever (ENGA-616). Maps a heartbeat
+   * wake reason (e.g. "heartbeat_timer", "issue_monitor_due") to a model
+   * profile key so routine pulse/watchdog/monitor runs can be tiered to a
+   * cheaper lane while real assignment work keeps the agent's primary model.
+   * Empty by default — the switch exists but is off until the board enables it.
+   */
+  routineModelProfileMap: Partial<Record<string, ModelProfileKey>>;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
+}
+
+/**
+ * Parse PAPERCLIP_ROUTINE_MODEL_PROFILE_MAP (a JSON object mapping wake reason
+ * to model-profile key) into a validated map. Unknown profile keys and
+ * malformed JSON are ignored so a bad env value degrades to "lever off" rather
+ * than crashing startup or mis-tiering runs.
+ */
+export function parseRoutineModelProfileMap(
+  raw: string | undefined | null,
+): Partial<Record<string, ModelProfileKey>> {
+  if (!raw || raw.trim().length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const out: Partial<Record<string, ModelProfileKey>> = {};
+  for (const [reason, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof reason !== "string" || reason.trim().length === 0) continue;
+    if (typeof value === "string" && (MODEL_PROFILE_KEYS as readonly string[]).includes(value)) {
+      out[reason] = value as ModelProfileKey;
+    }
+  }
+  return out;
 }
 
 function detectTailnetBindHost(): string | undefined {
@@ -331,6 +368,7 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    routineModelProfileMap: parseRoutineModelProfileMap(process.env.PAPERCLIP_ROUTINE_MODEL_PROFILE_MAP),
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
