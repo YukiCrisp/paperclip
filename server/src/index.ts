@@ -778,7 +778,10 @@ export async function startServer(): Promise<StartedServer> {
   // (ENGA-706 B). Null when the heartbeat scheduler is disabled.
   let shutdownHeartbeat: ReturnType<typeof heartbeatService> | null = null;
   if (config.heartbeatSchedulerEnabled) {
-    const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    const heartbeat = heartbeatService(db as any, {
+      pluginWorkerManager,
+      routineModelProfileMap: config.routineModelProfileMap,
+    });
     shutdownHeartbeat = heartbeat;
     const routines = routineService(db as any, { pluginWorkerManager });
 
