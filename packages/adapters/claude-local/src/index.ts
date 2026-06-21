@@ -43,6 +43,7 @@ Core fields:
 - promptTemplate (string, optional): run prompt template
 - maxTurnsPerRun (number, optional): max turns for one run
 - dangerouslySkipPermissions (boolean, optional, default true): pass --dangerously-skip-permissions to claude; defaults to true because Paperclip runs Claude in headless --print mode where interactive permission prompts cannot be answered
+- excludeDynamicSystemPromptSections (boolean, optional, default false): pass --exclude-dynamic-system-prompt-sections to claude, moving per-machine sections (cwd, env info incl. date, memory paths, git status) out of the default system prompt into the first user message. Widens run-crossing/cross-agent server-side prompt-cache reuse of the static Claude Code base by keeping the cached system-prompt prefix byte-identical across heartbeats, agents, and day boundaries. Ignored under --system-prompt; we use --append-system-prompt-file so the default prompt is still in effect. Default off so enabling is an explicit, reversible fleet decision (ENGA-621 / ENGA-616 lever #1).
 - command (string, optional): defaults to "claude"
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables

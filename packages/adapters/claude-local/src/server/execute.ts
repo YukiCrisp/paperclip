@@ -411,6 +411,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  // Run-crossing prompt-cache reuse (ENGA-621 / ENGA-616 lever #1): when set,
+  // pass Claude Code's --exclude-dynamic-system-prompt-sections so the per-machine
+  // sections (cwd, env info incl. date, memory paths, git status) move out of the
+  // default system prompt and into the first user message. This keeps the cached
+  // system-prompt prefix byte-identical across heartbeats AND across agents/days,
+  // widening server-side prompt-cache hits for the ~16.8K-token Claude Code base.
+  // Cross-run caching of our static bundle already works without this (the bundle
+  // hash has no timestamp); this only extends reuse across cwd/date drift. Gated
+  // and default-off so enabling is an explicit, reversible fleet decision.
+  const excludeDynamicSystemPromptSections = asBoolean(
+    config.excludeDynamicSystemPromptSections,
+    false,
+  );
   const configEnv = parseObject(config.env);
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -798,6 +811,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
     args.push("--add-dir", effectivePromptBundleAddDir);
+    // Applies only to the default system prompt (the flag is ignored under
+    // --system-prompt); we use --append-system-prompt-file, so the default
+    // prompt is still in effect on every run, including resumes.
+    if (excludeDynamicSystemPromptSections) {
+      args.push("--exclude-dynamic-system-prompt-sections");
+    }
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };

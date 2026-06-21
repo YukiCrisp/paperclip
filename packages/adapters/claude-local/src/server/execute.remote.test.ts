@@ -328,4 +328,56 @@ describe("claude remote execution", () => {
     expect(call?.[2]).toContain("12345678-1234-4abc-9def-123456789012");
   });
 
+  it("omits --exclude-dynamic-system-prompt-sections by default (ENGA-621 lever #1, gated off)", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exclude-default-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-exclude-default",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "claude" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    expect(call?.[2]).not.toContain("--exclude-dynamic-system-prompt-sections");
+  });
+
+  it("passes --exclude-dynamic-system-prompt-sections when excludeDynamicSystemPromptSections is enabled", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exclude-on-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-exclude-on",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "claude", excludeDynamicSystemPromptSections: true },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    expect(call?.[2]).toContain("--exclude-dynamic-system-prompt-sections");
+  });
+
 });
