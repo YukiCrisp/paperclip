@@ -255,11 +255,46 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     return { companyId, managerId, coderId, issueId, runId, issuePrefix };
   }
 
-  it("creates one medium-priority evaluation issue for a suspicious silent run", async () => {
+  it("does not file a cleanup ticket for a suspicious sub-critical silent run; records a review-only note", async () => {
+    // ENGA-578: slow-but-healthy runs routinely cross the 1h suspicion threshold and self-heal
+    // before the 4h critical threshold. The suspicion signal is review-only — no board ticket,
+    // no owner wake — so it no longer generates a kill/mark-terminal cleanup ticket.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const second = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(first).toMatchObject({ created: 0, noted: 1 });
+    expect(second).toMatchObject({ created: 0, noted: 1 });
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(0);
+
+    const notes = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "heartbeat.output_stale_suspicious_noted"),
+        ),
+      );
+    expect(notes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("creates one high-priority evaluation issue for a critical silent run", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, runId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
 
@@ -277,7 +312,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluations).toHaveLength(1);
     expect(["todo", "in_progress"]).toContain(evaluations[0]?.status);
     expect(evaluations[0]).toMatchObject({
-      priority: "medium",
+      priority: "high",
       assigneeAgentId: managerId,
       assigneeAdapterOverrides: { modelProfile: "cheap" },
       originId: runId,
@@ -287,13 +322,71 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");
   });
 
+  it("self-resolves an open evaluation once its run reaches a terminal status", async () => {
+    // ENGA-578: a critical run files a ticket, then exits cleanly on its own. The next scan must
+    // re-check live run state, stand the ticket down as a false positive, and record a
+    // dismissed_false_positive decision so it never re-fires — no operator kill required.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(first.created).toBe(1);
+    const evaluationIssueId = first.evaluationIssueIds[0]!;
+
+    // The run finishes on its own (slow-but-healthy inference recovered and exited cleanly).
+    const finishedAt = new Date(now.getTime() + 5 * 60_000);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt, updatedAt: finishedAt })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const second = await heartbeat.scanSilentActiveRuns({ now: finishedAt, companyId });
+    expect(second).toMatchObject({ resolved: 1, created: 0, scanned: 0 });
+
+    const [evaluation] = await db.select().from(issues).where(eq(issues.id, evaluationIssueId));
+    expect(evaluation?.status).toBe("done");
+
+    const decisions = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
+        ),
+      );
+    expect(decisions).toHaveLength(1);
+
+    const selfResolved = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "heartbeat.output_stale_self_resolved"),
+        ),
+      );
+    expect(selfResolved).toHaveLength(1);
+
+    // Idempotent: a later scan does not re-resolve or re-file.
+    const third = await heartbeat.scanSilentActiveRuns({
+      now: new Date(finishedAt.getTime() + 60_000),
+      companyId,
+    });
+    expect(third).toMatchObject({ resolved: 0, created: 0 });
+  });
+
   it("redacts sensitive values from actual run-log evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const leakedJwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
     const leakedGithubToken = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
     const { companyId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
       logChunk: [
         "Authorization: Bearer live-bearer-token-value",
         `POST payload {"apiKey":"json-secret-value","token":"${leakedJwt}"}`,
@@ -422,7 +515,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, runId, managerId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -690,7 +783,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, runId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -746,7 +839,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, runId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -798,7 +891,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, coderId, runId, issuePrefix } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -892,7 +985,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, runId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
 
@@ -930,7 +1023,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, runId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -963,7 +1056,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, runId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const heartbeat = heartbeatService(db);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
