@@ -4,10 +4,13 @@ import {
   type AdapterModelProfileDefinition,
 } from "../adapters/index.js";
 import {
+  applyRoutineModelProfileWakeContext,
   mergeModelProfileAdapterConfig,
   normalizeModelProfileWakeContext,
   resolveModelProfileApplication,
+  resolveWakeReasonModelProfile,
 } from "../services/heartbeat.ts";
+import { parseRoutineModelProfileMap } from "../config.ts";
 
 const cheapProfile: AdapterModelProfileDefinition = {
   key: "cheap",
@@ -143,5 +146,84 @@ describe("heartbeat model profile application", () => {
     });
 
     expect(contextSnapshot).toMatchObject({ modelProfile: "cheap" });
+  });
+});
+
+describe("ENGA-616 routine model-profile lever", () => {
+  describe("parseRoutineModelProfileMap", () => {
+    it("returns an empty map when unset, blank, or malformed (lever off)", () => {
+      expect(parseRoutineModelProfileMap(undefined)).toEqual({});
+      expect(parseRoutineModelProfileMap("")).toEqual({});
+      expect(parseRoutineModelProfileMap("   ")).toEqual({});
+      expect(parseRoutineModelProfileMap("{not json")).toEqual({});
+      expect(parseRoutineModelProfileMap("[\"cheap\"]")).toEqual({});
+      expect(parseRoutineModelProfileMap("\"cheap\"")).toEqual({});
+    });
+
+    it("keeps only entries whose value is a known model-profile key", () => {
+      expect(
+        parseRoutineModelProfileMap(
+          JSON.stringify({
+            heartbeat_timer: "cheap",
+            issue_monitor_due: "cheap",
+            issue_assigned: "opus", // unknown profile key -> dropped
+            "": "cheap", // empty reason -> dropped
+            bad: 123, // non-string value -> dropped
+          }),
+        ),
+      ).toEqual({ heartbeat_timer: "cheap", issue_monitor_due: "cheap" });
+    });
+  });
+
+  describe("resolveWakeReasonModelProfile", () => {
+    const map = { heartbeat_timer: "cheap", issue_monitor_due: "cheap" } as const;
+
+    it("returns the mapped profile for a matching wake reason", () => {
+      expect(resolveWakeReasonModelProfile({ wakeReason: "heartbeat_timer", map })).toBe("cheap");
+    });
+
+    it("returns null for unmapped reasons, blank input, or an empty map", () => {
+      expect(resolveWakeReasonModelProfile({ wakeReason: "issue_assigned", map })).toBeNull();
+      expect(resolveWakeReasonModelProfile({ wakeReason: null, map })).toBeNull();
+      expect(resolveWakeReasonModelProfile({ wakeReason: "  ", map })).toBeNull();
+      expect(resolveWakeReasonModelProfile({ wakeReason: "heartbeat_timer", map: {} })).toBeNull();
+      expect(resolveWakeReasonModelProfile({ wakeReason: "heartbeat_timer", map: null })).toBeNull();
+    });
+  });
+
+  describe("applyRoutineModelProfileWakeContext", () => {
+    const map = { heartbeat_timer: "cheap" } as const;
+
+    it("tiers a routine wake reason to its mapped profile", () => {
+      const contextSnapshot = applyRoutineModelProfileWakeContext({
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+        routineModelProfileMap: map,
+      });
+      expect(contextSnapshot).toMatchObject({ modelProfile: "cheap" });
+    });
+
+    it("leaves assignment-style wakes on the agent's primary model", () => {
+      const contextSnapshot = applyRoutineModelProfileWakeContext({
+        contextSnapshot: { wakeReason: "issue_assigned" },
+        routineModelProfileMap: map,
+      });
+      expect(contextSnapshot.modelProfile).toBeUndefined();
+    });
+
+    it("never overrides an explicitly requested profile", () => {
+      const contextSnapshot = applyRoutineModelProfileWakeContext({
+        contextSnapshot: { wakeReason: "heartbeat_timer", modelProfile: "cheap" },
+        routineModelProfileMap: {},
+      });
+      expect(contextSnapshot).toMatchObject({ modelProfile: "cheap" });
+    });
+
+    it("is a no-op when the lever is off (empty map)", () => {
+      const contextSnapshot = applyRoutineModelProfileWakeContext({
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+        routineModelProfileMap: {},
+      });
+      expect(contextSnapshot.modelProfile).toBeUndefined();
+    });
   });
 });

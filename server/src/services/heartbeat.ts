@@ -1761,6 +1761,40 @@ export function normalizeModelProfileWakeContext(input: {
   return input.contextSnapshot;
 }
 
+/**
+ * ENGA-616 model-tiering lever: resolve the model profile a routine-style wake
+ * should run under, based on its wake reason. Returns null when no mapping
+ * applies (lever off, unknown reason, or unknown profile key) so the caller
+ * leaves the agent's primary model untouched.
+ */
+export function resolveWakeReasonModelProfile(input: {
+  wakeReason: string | null | undefined;
+  map: Partial<Record<string, ModelProfileKey>> | null | undefined;
+}): ModelProfileKey | null {
+  const wakeReason = readNonEmptyString(input.wakeReason ?? null);
+  if (!wakeReason || !input.map) return null;
+  return readModelProfileKey(input.map[wakeReason]);
+}
+
+/**
+ * Apply the wake-reason model-profile lever to a wake context. Only fills in a
+ * model profile when none was already requested explicitly (payload / wake
+ * context), so explicit per-issue or per-routine overrides always win over the
+ * blanket routine-tiering default.
+ */
+export function applyRoutineModelProfileWakeContext(input: {
+  contextSnapshot: Record<string, unknown>;
+  routineModelProfileMap: Partial<Record<string, ModelProfileKey>> | null | undefined;
+}): Record<string, unknown> {
+  if (readContextModelProfile(input.contextSnapshot)) return input.contextSnapshot;
+  const profile = resolveWakeReasonModelProfile({
+    wakeReason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    map: input.routineModelProfileMap,
+  });
+  if (profile) input.contextSnapshot.modelProfile = profile;
+  return input.contextSnapshot;
+}
+
 function readAgentRuntimeModelProfile(
   runtimeConfig: unknown,
   key: ModelProfileKey,
@@ -2608,6 +2642,7 @@ function enrichWakeContextSnapshot(input: {
   source: WakeupOptions["source"];
   triggerDetail: WakeupOptions["triggerDetail"] | null;
   payload: Record<string, unknown> | null;
+  routineModelProfileMap?: Partial<Record<string, ModelProfileKey>> | null;
 }) {
   const { contextSnapshot, reason, source, triggerDetail, payload } = input;
   const issueIdFromPayload = readNonEmptyString(payload?.["issueId"]) ?? readNonEmptyString(payload?.["taskId"]);
@@ -2649,6 +2684,10 @@ function enrichWakeContextSnapshot(input: {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
   }
   normalizeModelProfileWakeContext({ contextSnapshot, payload });
+  applyRoutineModelProfileWakeContext({
+    contextSnapshot,
+    routineModelProfileMap: input.routineModelProfileMap ?? null,
+  });
   normalizeInteractionContinuationWakeContext(contextSnapshot, payload);
 
   return {
@@ -3444,9 +3483,12 @@ export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeSe
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  /** ENGA-616 wake-reason -> model-profile lever; empty/omitted = lever off. */
+  routineModelProfileMap?: Partial<Record<string, ModelProfileKey>>;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const routineModelProfileMap = options.routineModelProfileMap ?? {};
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -10723,6 +10765,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           source: promotedSource,
           triggerDetail: promotedTriggerDetail,
           payload: promotedPayload,
+          routineModelProfileMap,
         });
 
         const sessionBefore =
@@ -10988,6 +11031,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       source,
       triggerDetail,
       payload,
+      routineModelProfileMap,
     });
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
