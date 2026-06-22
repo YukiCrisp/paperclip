@@ -2934,6 +2934,56 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
+// Allowance for the skew between the wall-clock we stamp right after spawn()
+// (processStartedAt) and the OS-reported process start time, which `ps -o
+// lstart=` only resolves to whole seconds. A reused PID belongs to a process
+// that started long after the original child died (the staleness threshold
+// guarantees a multi-minute gap), so a few seconds of tolerance separates "same
+// process" from "PID was recycled" without any risk of confusing the two.
+const PROCESS_IDENTITY_START_TOLERANCE_MS = 5_000;
+
+// Reads the OS-reported start time of `pid` (epoch ms) using `ps -o lstart=`,
+// which works on both macOS and Linux. Returns null when the platform is
+// unsupported, the process is gone, or the timestamp cannot be parsed.
+async function readProcessStartedAtMs(pid: number): Promise<number | null> {
+  if (process.platform === "win32") return null;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const { stdout } = await execFile("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const text = stdout.trim();
+    if (!text) return null;
+    const parsed = Date.parse(text);
+    return Number.isNaN(parsed) ? null : parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Liveness check hardened against PID reuse. `process.kill(pid, 0)` only proves
+// *some* process holds that PID -- after a detached child dies the OS can hand
+// the same PID to an unrelated process, which the bare check reports as "alive"
+// forever, pinning the run in "running" and leaking its issue lock permanently
+// (ENGA-502). When we have a recorded start time we additionally require the OS
+// process-start time to match it within tolerance; a mismatch means the PID was
+// recycled and the original child is dead. When identity cannot be established
+// (no recorded start time, or `ps` unavailable) we fall back to the liveness-only
+// result so we never false-positive a genuinely live detached run into a reap.
+async function isTrackedProcessAlive(
+  pid: number | null | undefined,
+  expectedStartedAt: Date | string | null | undefined,
+): Promise<boolean> {
+  if (!isProcessAlive(pid)) return false;
+  if (expectedStartedAt == null) return true;
+  const expectedMs =
+    expectedStartedAt instanceof Date
+      ? expectedStartedAt.getTime()
+      : Date.parse(String(expectedStartedAt));
+  if (Number.isNaN(expectedMs)) return true;
+  const actualMs = await readProcessStartedAtMs(pid as number);
+  if (actualMs == null) return true;
+  return Math.abs(actualMs - expectedMs) <= PROCESS_IDENTITY_START_TOLERANCE_MS;
+}
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -7589,7 +7639,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
+      const processPidAlive =
+        tracksLocalChild && !!run.processPid
+          ? await isTrackedProcessAlive(run.processPid, run.processStartedAt)
+          : false;
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
@@ -7813,6 +7866,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // Returns a live "detached survivor" run for the agent, or null. A detached
+  // survivor is a run still in `running` whose in-memory ChildProcess handle was
+  // lost across a server restart (the child got reparented to PID 1 and keeps
+  // running, holding its issue lock — ENGA-502/ENGA-505). We can no longer
+  // manage, stop, or observe the completion of such a process, so while it is
+  // genuinely alive the scheduler must not start additional runs for the same
+  // agent; doing so double-runs the agent and collides on the issue lock (the
+  // 409 an observer misreads as a "zombie"). Identity is verified with
+  // isTrackedProcessAlive (pid + process-start-time fingerprint reused from the
+  // PID-reuse fix) so a recycled PID or an already-dead child does NOT block
+  // scheduling. A run we started in *this* process lifetime is tracked in
+  // runningProcesses/activeRunExecutions and is therefore never treated as a
+  // survivor — this is what keeps normal, non-detached scheduling unaffected.
+  async function findLiveDetachedSurvivorForAgent(agentId: string) {
+    const runningRows = await db
+      .select({
+        run: heartbeatRuns,
+        adapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+
+    for (const { run, adapterType } of runningRows) {
+      // Only local child-process adapters spawn a pid we can fingerprint; other
+      // adapter kinds never leave a detached child behind.
+      if (!isTrackedLocalChildProcessAdapter(adapterType)) continue;
+      // A handle we still hold this lifetime is managed, not a survivor.
+      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      if (!run.processPid) continue;
+      if (await isTrackedProcessAlive(run.processPid, run.processStartedAt)) {
+        return run;
+      }
+    }
+    return null;
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -7835,6 +7925,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
         .orderBy(asc(heartbeatRuns.createdAt));
       if (queuedRuns.length === 0) return [];
+
+      // Double-launch guard (ENGA-505): if this agent still has a live detached
+      // survivor from a previous server lifetime, defer all new starts until it
+      // exits. `availableSlots` only accounts for it as one occupied `running`
+      // row, which is insufficient when maxConcurrentRuns > 1 — the survivor is
+      // unmanageable, so we hold the whole agent rather than just one slot. The
+      // next periodic reaper / resumeQueuedRuns pass re-drives this agent once
+      // the survivor's process is gone.
+      const liveDetachedSurvivor = await findLiveDetachedSurvivorForAgent(agentId);
+      if (liveDetachedSurvivor) {
+        logger.warn(
+          {
+            agentId,
+            survivorRunId: liveDetachedSurvivor.id,
+            survivorPid: liveDetachedSurvivor.processPid,
+            queuedRunCount: queuedRuns.length,
+          },
+          "deferring queued run start: agent still has a live detached survivor run",
+        );
+        return [];
+      }
 
       const dependencyReadiness = await listQueuedRunDependencyReadiness(agent.companyId, queuedRuns);
       const queuedIssueIds = [...new Set(
@@ -11673,6 +11784,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    startNextQueuedRunForAgent,
 
     scheduleBoundedRetry: async (
       runId: string,
