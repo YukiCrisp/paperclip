@@ -3188,6 +3188,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  // (ENGA-706 B) Set once the process begins graceful shutdown. While true, no
+  // new heartbeat run may be started: terminateOwnedRunsForShutdown is racing
+  // the process exit, and any child spawned during that window becomes the exact
+  // lock-holding orphan that (B) exists to eliminate. `startNextQueuedRunForAgent`
+  // is the single spawn entrypoint, so guarding it there covers every caller
+  // (deferred-wake promotion, scheduler tick, retry) for the shutdown window.
+  let shuttingDown = false;
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -7842,6 +7849,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    // (ENGA-706 B) Refuse to spawn while the process is shutting down. Without
+    // this guard the comment's "no new starts during shutdown" promise is not
+    // upheld: terminateOwnedRunsForShutdown's release path, the scheduler tick,
+    // or a retry could each land here mid-shutdown and spawn an orphan that the
+    // ownedRunIds snapshot no longer covers.
+    if (shuttingDown) {
+      logger.info({ agentId }, "skip starting queued run: server is shutting down");
+      return [];
+    }
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
@@ -9809,7 +9825,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
-  async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+  async function releaseIssueExecutionAndPromote(
+    run: typeof heartbeatRuns.$inferSelect,
+    options: { releaseLocksOnly?: boolean } = {},
+  ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -9912,6 +9931,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
         );
+
+      // (ENGA-706 B) Release-only path for graceful shutdown: the lock-clearing
+      // UPDATEs above already unwedge the issue, which is the entire point of the
+      // shutdown terminalize. Stop here — do NOT promote a deferred wake into a
+      // queued successor (and thus re-stamp an execution lock that nothing will
+      // start before the process exits). The pending wake survives in
+      // agentWakeupRequests and is re-evaluated cleanly on the next boot's drain.
+      if (options.releaseLocksOnly) return null;
 
       // Deferred-wake promotion is bound to a single primary issue: the run's context
       // issue when present, otherwise the first candidate we found (preserves the
@@ -11380,6 +11407,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // cannot run this hook, so (A)'s timer-independent self-reclaim remains the
   // primary defense.
   async function terminateOwnedRunsForShutdown(reason = "Cancelled because the server is shutting down") {
+    // Latch the shutdown flag before doing anything else so every concurrent
+    // start path (scheduler tick, in-flight promotion) short-circuits in
+    // startNextQueuedRunForAgent for the remainder of the process lifetime.
+    shuttingDown = true;
     const ownedRunIds = [...runningProcesses.keys()];
     let terminated = 0;
     for (const runId of ownedRunIds) {
@@ -11436,7 +11467,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             level: "warn",
             message: "run cancelled due to server shutdown",
           });
-          await releaseIssueExecutionAndPromote(cancelled);
+          await releaseIssueExecutionAndPromote(cancelled, { releaseLocksOnly: true });
           await finalizeAgentStatus(run.agentId, "cancelled");
         }
         terminated += 1;
