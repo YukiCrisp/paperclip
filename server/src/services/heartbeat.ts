@@ -123,6 +123,7 @@ import {
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import { isTrackedProcessAlive } from "./process-liveness.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -3178,69 +3179,6 @@ export function buildPaperclipTaskMarkdown(input: {
 // A positive liveness check means some process currently owns the PID.
 // On Linux, PIDs can be recycled, so this is a best-effort signal rather
 // than proof that the original child is still alive.
-function isProcessAlive(pid: number | null | undefined) {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "EPERM") return true;
-    if (code === "ESRCH") return false;
-    return false;
-  }
-}
-
-// Allowance for the skew between the wall-clock we stamp right after spawn()
-// (processStartedAt) and the OS-reported process start time, which `ps -o
-// lstart=` only resolves to whole seconds. A reused PID belongs to a process
-// that started long after the original child died (the staleness threshold
-// guarantees a multi-minute gap), so a few seconds of tolerance separates "same
-// process" from "PID was recycled" without any risk of confusing the two.
-const PROCESS_IDENTITY_START_TOLERANCE_MS = 5_000;
-
-// Reads the OS-reported start time of `pid` (epoch ms) using `ps -o lstart=`,
-// which works on both macOS and Linux. Returns null when the platform is
-// unsupported, the process is gone, or the timestamp cannot be parsed.
-async function readProcessStartedAtMs(pid: number): Promise<number | null> {
-  if (process.platform === "win32") return null;
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const { stdout } = await execFile("ps", ["-o", "lstart=", "-p", String(pid)]);
-    const text = stdout.trim();
-    if (!text) return null;
-    const parsed = Date.parse(text);
-    return Number.isNaN(parsed) ? null : parsed;
-  } catch {
-    return null;
-  }
-}
-
-// Liveness check hardened against PID reuse. `process.kill(pid, 0)` only proves
-// *some* process holds that PID -- after a detached child dies the OS can hand
-// the same PID to an unrelated process, which the bare check reports as "alive"
-// forever, pinning the run in "running" and leaking its issue lock permanently
-// (ENGA-502). When we have a recorded start time we additionally require the OS
-// process-start time to match it within tolerance; a mismatch means the PID was
-// recycled and the original child is dead. When identity cannot be established
-// (no recorded start time, or `ps` unavailable) we fall back to the liveness-only
-// result so we never false-positive a genuinely live detached run into a reap.
-async function isTrackedProcessAlive(
-  pid: number | null | undefined,
-  expectedStartedAt: Date | string | null | undefined,
-): Promise<boolean> {
-  if (!isProcessAlive(pid)) return false;
-  if (expectedStartedAt == null) return true;
-  const expectedMs =
-    expectedStartedAt instanceof Date
-      ? expectedStartedAt.getTime()
-      : Date.parse(String(expectedStartedAt));
-  if (Number.isNaN(expectedMs)) return true;
-  const actualMs = await readProcessStartedAtMs(pid as number);
-  if (actualMs == null) return true;
-  return Math.abs(actualMs - expectedMs) <= PROCESS_IDENTITY_START_TOLERANCE_MS;
-}
-
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -3510,6 +3448,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  // (ENGA-706 B) Set once the process begins graceful shutdown. While true, no
+  // new heartbeat run may be started: terminateOwnedRunsForShutdown is racing
+  // the process exit, and any child spawned during that window becomes the exact
+  // lock-holding orphan that (B) exists to eliminate. `startNextQueuedRunForAgent`
+  // is the single spawn entrypoint, so guarding it there covers every caller
+  // (deferred-wake promotion, scheduler tick, retry) for the shutdown window.
+  let shuttingDown = false;
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -8446,6 +8391,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    // (ENGA-706 B) Refuse to spawn while the process is shutting down. Without
+    // this guard the comment's "no new starts during shutdown" promise is not
+    // upheld: terminateOwnedRunsForShutdown's release path, the scheduler tick,
+    // or a retry could each land here mid-shutdown and spawn an orphan that the
+    // ownedRunIds snapshot no longer covers.
+    if (shuttingDown) {
+      logger.info({ agentId }, "skip starting queued run: server is shutting down");
+      return [];
+    }
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
@@ -10442,7 +10396,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; releaseLocksOnly?: boolean } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -10546,6 +10500,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
         );
+
+      // (ENGA-706 B) Release-only path for graceful shutdown: the lock-clearing
+      // UPDATEs above already unwedge the issue, which is the entire point of the
+      // shutdown terminalize. Stop here — do NOT promote a deferred wake into a
+      // queued successor (and thus re-stamp an execution lock that nothing will
+      // start before the process exits). The pending wake survives in
+      // agentWakeupRequests and is re-evaluated cleanly on the next boot's drain.
+      if (options.releaseLocksOnly) return null;
 
       // Deferred-wake promotion is bound to a single primary issue: the run's context
       // issue when present, otherwise the first candidate we found (preserves the
@@ -12108,6 +12070,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  // (ENGA-706 B) Best-effort terminalize hook for graceful shutdown. On
+  // SIGTERM/SIGINT the runs whose child process this lifetime still owns
+  // (`runningProcesses`) would otherwise be orphaned: the child detaches
+  // (reparented to PID 1) and keeps holding its issue lock until the periodic
+  // reaper notices, which is the zombie-lock window (A) shrinks but cannot fully
+  // close for the SIGKILL/OOM/power-loss cases. For the graceful case we can do
+  // better than wait — terminate the owned children and terminalize their runs
+  // (cancelled) so their issue locks release immediately and no detached
+  // survivor is left behind. We deliberately do NOT start queued work here
+  // (unlike cancelRunInternal): the process is exiting, and spawning a fresh
+  // child during shutdown would just create a new orphan. SIGKILL/OOM/power loss
+  // cannot run this hook, so (A)'s timer-independent self-reclaim remains the
+  // primary defense.
+  async function terminateOwnedRunsForShutdown(reason = "Cancelled because the server is shutting down") {
+    // Latch the shutdown flag before doing anything else so every concurrent
+    // start path (scheduler tick, in-flight promotion) short-circuits in
+    // startNextQueuedRunForAgent for the remainder of the process lifetime.
+    shuttingDown = true;
+    const ownedRunIds = [...runningProcesses.keys()];
+    let terminated = 0;
+    for (const runId of ownedRunIds) {
+      try {
+        const run = await getRun(runId);
+        if (!run) {
+          runningProcesses.delete(runId);
+          continue;
+        }
+        if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) {
+          runningProcesses.delete(runId);
+          continue;
+        }
+        const agent = await getAgent(run.agentId);
+        const errorCode = "server_shutdown";
+        const resultJson = agent
+          ? mergeRunStopMetadataForAgent(agent, "cancelled", {
+              resultJson: parseObject(run.resultJson),
+              errorCode,
+              errorMessage: reason,
+            })
+          : undefined;
+
+        const running = runningProcesses.get(run.id);
+        try {
+          if (running) {
+            await terminateHeartbeatRunProcess({
+              pid: running.child.pid ?? run.processPid,
+              processGroupId: running.processGroupId ?? run.processGroupId,
+              graceMs: Math.max(1, running.graceSec) * 1000,
+            });
+          } else if (run.processPid || run.processGroupId) {
+            await terminateHeartbeatRunProcess({
+              pid: run.processPid,
+              processGroupId: run.processGroupId,
+            });
+          }
+        } finally {
+          runningProcesses.delete(run.id);
+        }
+
+        const finishedAt = new Date();
+        const cancelled = await setRunStatus(run.id, "cancelled", {
+          finishedAt,
+          error: reason,
+          errorCode,
+          ...(resultJson ? { resultJson } : {}),
+        });
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt, error: reason });
+        if (cancelled) {
+          await appendRunEvent(cancelled, 1, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "run cancelled due to server shutdown",
+          });
+          await releaseIssueExecutionAndPromote(cancelled, { releaseLocksOnly: true });
+          await finalizeAgentStatus(run.agentId, "cancelled");
+        }
+        terminated += 1;
+      } catch (err) {
+        // Best-effort: a failure on one run must not block terminalizing the
+        // rest or stall shutdown. The periodic reaper + (A) self-reclaim are the
+        // backstop for anything missed here.
+        logger.warn({ err, runId }, "failed to terminalize owned run during shutdown");
+      }
+    }
+    if (terminated > 0) {
+      logger.info({ terminated }, "terminalized owned runs during graceful shutdown");
+    }
+    return { terminated };
+  }
+
   async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause", errorCode = "cancelled") {
     const agent = await getAgent(agentId);
     const runs = await db
@@ -12460,6 +12513,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reapOrphanedRuns,
     reapRunById,
+    terminateOwnedRunsForShutdown,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
 import { asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
@@ -5198,6 +5199,15 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const ownershipChildProcesses = new Set<ChildProcess>();
+
+  function spawnAliveProcess() {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    ownershipChildProcesses.add(child);
+    return child;
+  }
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-checkout-owner-");
@@ -5206,6 +5216,14 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
   }, 20_000);
 
   afterEach(async () => {
+    for (const child of ownershipChildProcesses) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    ownershipChildProcesses.clear();
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issueInboxArchives);
@@ -5229,6 +5247,8 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     checkoutStatus: "running" | "failed" | "timed_out";
     actorRunStatus?: "running" | "failed" | "timed_out" | "succeeded";
     assigneeMatchesActor?: boolean;
+    ownerProcessPid?: number | null;
+    ownerProcessStartedAt?: Date | null;
   }) {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -5279,6 +5299,8 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
         status: params.checkoutStatus,
         invocationSource: "manual",
         finishedAt: params.checkoutStatus === "running" ? null : new Date(),
+        processPid: params.ownerProcessPid ?? null,
+        processStartedAt: params.ownerProcessStartedAt ?? null,
       },
       {
         id: actorRunId,
@@ -5335,6 +5357,69 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   it("keeps live checkout owners protected with a 409 conflict", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "running" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  // ENGA-706 (A): the worst-case zombie-lock wedge is an agent's *own* fresh run
+  // colliding (409) on a checkout still pinned by its previous run, whose OS
+  // process is already dead but whose run row is still `running` (the reaper has
+  // not noticed yet). Identity-verified self-reclaim lets the new run adopt the
+  // dead owner's checkout immediately, timer-independent, instead of wedging.
+  it.skipIf(process.platform === "win32")(
+    "lets the same agent self-reclaim a running checkout owner whose process is verifiably dead (ENGA-706 A)",
+    async () => {
+      // processPid is not alive and a start time is recorded, so isTrackedProcessAlive
+      // can prove the original process is gone -> the owner run is treated as stale.
+      const seeded = await seedOwnershipIssue({
+        checkoutStatus: "running",
+        ownerProcessPid: 999_999_999,
+        ownerProcessStartedAt: new Date("2026-03-19T00:00:00.000Z"),
+      });
+
+      const ownership = await svc.assertCheckoutOwner(
+        seeded.issueId,
+        seeded.actorAgentId,
+        seeded.actorRunId,
+      );
+
+      expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
+      expect(ownership.executionRunId).toBe(seeded.actorRunId);
+      expect(ownership.adoptedFromRunId).toBe(seeded.staleRunId);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "does not let the same agent reclaim a running checkout owner whose process is genuinely alive (no false adopt)",
+    async () => {
+      // A real, live process whose recorded start time matches the pid: identity
+      // confirms it is still alive, so the checkout stays protected (409). This is
+      // the regression guard against false self-reclaim killing a live detached run.
+      const child = spawnAliveProcess();
+      expect(child.pid).toBeTypeOf("number");
+      const seeded = await seedOwnershipIssue({
+        checkoutStatus: "running",
+        ownerProcessPid: child.pid ?? null,
+        ownerProcessStartedAt: new Date(),
+      });
+
+      await expect(
+        svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+      ).rejects.toMatchObject({ status: 409 });
+    },
+  );
+
+  it("does not self-reclaim a running checkout owner when identity is unprovable (no recorded start time)", async () => {
+    // A `running` owner with a pid but no recorded process-start time: identity
+    // cannot be established, so isTrackedProcessAlive falls back to "assume alive"
+    // and the checkout stays protected (409). Conservative side per ENGA-706.
+    const seeded = await seedOwnershipIssue({
+      checkoutStatus: "running",
+      ownerProcessPid: 999_999_999,
+      ownerProcessStartedAt: null,
+    });
 
     await expect(
       svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
