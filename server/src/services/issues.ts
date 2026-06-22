@@ -76,6 +76,7 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { isTrackedProcessAlive } from "./process-liveness.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -3726,7 +3727,12 @@ export function issueService(db: Db) {
       ]);
       const [existingRun, actorRun] = await Promise.all([
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({
+            status: heartbeatRuns.status,
+            agentId: heartbeatRuns.agentId,
+            processPid: heartbeatRuns.processPid,
+            processStartedAt: heartbeatRuns.processStartedAt,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
@@ -3736,7 +3742,33 @@ export function issueService(db: Db) {
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
       ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+      let stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+      // (ENGA-706 A) Self-reclaim relaxation: a still-`running` owner run that
+      // belongs to THIS agent but whose tracked OS process is *verifiably* dead
+      // is treated as stale, so the agent can immediately re-checkout its own
+      // zombie — eliminating the "owner's fresh run 409s on its own zombie"
+      // wedge without waiting for the periodic 5-min reaper. We only relax when
+      // identity is provable: same agent, a recorded pid + process-start time,
+      // and a confirmed death via isTrackedProcessAlive (the pid + start-time
+      // fingerprint from ENGA-502). When identity cannot be established (no
+      // recorded start time, or `ps` unavailable) isTrackedProcessAlive returns
+      // `true` and we keep the old reject, never false-killing a live detached
+      // run started by another lifetime.
+      if (
+        !stale &&
+        existingRun &&
+        existingRun.agentId === input.actorAgentId &&
+        existingRun.processPid != null &&
+        existingRun.processStartedAt != null
+      ) {
+        const ownerProcessAlive = await isTrackedProcessAlive(
+          existingRun.processPid,
+          existingRun.processStartedAt,
+        );
+        if (!ownerProcessAlive) {
+          stale = true;
+        }
+      }
       const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };

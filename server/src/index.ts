@@ -750,8 +750,13 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  // Hoisted so the SIGINT/SIGTERM shutdown handler (a sibling block below) can
+  // best-effort terminalize this lifetime's owned runs on graceful exit
+  // (ENGA-706 B). Null when the heartbeat scheduler is disabled.
+  let shutdownHeartbeat: ReturnType<typeof heartbeatService> | null = null;
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    shutdownHeartbeat = heartbeat;
     const routines = routineService(db as any, { pluginWorkerManager });
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
@@ -994,6 +999,22 @@ export async function startServer(): Promise<StartedServer> {
   
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      // (ENGA-706 B) Best-effort, bounded terminalize of the runs whose child
+      // this process still owns, so their issue locks release immediately on a
+      // graceful restart instead of leaking until the periodic reaper notices.
+      // Runs before stopping embedded Postgres (it needs the DB) and is bounded
+      // so a stuck child cannot stall shutdown.
+      if (shutdownHeartbeat) {
+        try {
+          await Promise.race([
+            shutdownHeartbeat.terminateOwnedRunsForShutdown(`Cancelled because the server received ${signal}`),
+            new Promise((resolve) => setTimeout(resolve, 10_000)),
+          ]);
+        } catch (err) {
+          logger.warn({ err, signal }, "terminalizing owned runs during shutdown failed");
+        }
+      }
+
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
         telemetryClient.stop();
