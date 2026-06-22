@@ -1110,6 +1110,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await waitForRunToSettle(heartbeat, queuedRunId);
   });
 
+  it("does not start a queued run during graceful shutdown, and releases the owned run's issue lock (ENGA-706 B)", async () => {
+    // An invokable agent with one owned, running heartbeat run that holds its
+    // issue's execution + checkout lock, plus a separate queued run (a deferred
+    // wake) sitting with a free slot. On a normal tick this queued run WOULD
+    // start; the shutdown guard is the only thing that may hold it back here.
+    const { agentId, companyId, runId, issueId } = await seedRunFixture({
+      agentStatus: "running",
+      maxConcurrentRuns: 1,
+    });
+    const { runId: queuedRunId } = await seedQueuedRunForAgent({
+      companyId,
+      agentId,
+      includeIssueId: false,
+    });
+    const heartbeat = heartbeatService(db);
+    runningProcesses.set(runId, {
+      child: { pid: 23456 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    mockTerminateLocalService.mockResolvedValueOnce(undefined);
+
+    const { terminated } = await heartbeat.terminateOwnedRunsForShutdown();
+
+    // The owned run is terminalized and its issue lock released immediately
+    // (release-only path) so the issue is not wedged after the restart.
+    expect(terminated).toBe(1);
+    const owned = await heartbeat.getRun(runId);
+    expect(owned?.status).toBe("cancelled");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+
+    // The deferred-wake run was NOT promoted/started while shutting down — it
+    // stays queued for the next boot's drain rather than spawning a lock-holding
+    // orphan that the ownedRunIds snapshot can no longer reach.
+    const queued = await heartbeat.getRun(queuedRunId);
+    expect(queued?.status).toBe("queued");
+
+    // The shuttingDown latch makes the "no new starts during shutdown" contract
+    // hold for every spawn path, not just the release call above: a direct
+    // start request for this invokable agent with a free slot is refused.
+    const started = await heartbeat.startNextQueuedRunForAgent(agentId);
+    expect(started).toEqual([]);
+    const stillQueued = await heartbeat.getRun(queuedRunId);
+    expect(stillQueued?.status).toBe("queued");
+  });
+
   it.skipIf(process.platform === "win32")(
     "keeps a live detached run active when its recorded process start time matches the live pid (no false reap)",
     async () => {
