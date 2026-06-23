@@ -7577,13 +7577,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
-      // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      // (ENGA-707 Fix A) A run that tracks a local child with a recorded pid/process-group
+      // is judged deterministically by the liveness checks below, so it skips the staleness
+      // cushion — collapsing the local-crash wedge from ~5min to one reaper tick when a
+      // crash leaves a confirmed-dead pid behind. The cushion only exists to avoid false
+      // positives when we lack a definitive signal, so pid-less runs and remote adapters
+      // still fall back to the time-based guard. (isTrackedProcessAlive additionally guards
+      // against PID reuse, so skipping the cushion cannot mis-reap a recycled-pid survivor.)
+      const hasRecordedLocalProcess = tracksLocalChild && (!!run.processPid || !!run.processGroupId);
+      if (staleThresholdMs > 0 && !hasRecordedLocalProcess) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       const processPidAlive =
         tracksLocalChild && !!run.processPid
           ? await isTrackedProcessAlive(run.processPid, run.processStartedAt)
