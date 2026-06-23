@@ -26,6 +26,7 @@ import {
   upsertIssueDocumentSchema,
   restoreIssueDocumentRevisionSchema,
   upsertIssueFeedbackVoteSchema,
+  upsertIssueWatchdogSchema,
   // Project
   createProjectSchema,
   updateProjectSchema,
@@ -109,6 +110,7 @@ import {
   // Instance settings
   patchInstanceGeneralSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
+  patchInstanceSettingsSchema,
   issueGraphLivenessAutoRecoveryRequestSchema,
   // Resource memberships
   updateResourceMembershipSchema,
@@ -444,6 +446,14 @@ const jsonBody = (schema: z.ZodTypeAny) => ({
 });
 
 const r = responses;
+
+const externalObjectSummariesBodySchema = z.object({
+  issueIds: z.array(z.string().uuid()).max(1000),
+}).strict();
+
+const refreshExternalObjectsBodySchema = z.object({
+  objectIds: z.array(z.string().uuid()).max(50).optional(),
+}).strict();
 
 function paramsSchemaFromPath(routePath: string): z.ZodObject<z.ZodRawShape> | undefined {
   const names = [...routePath.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map((match) => match[1]);
@@ -1378,6 +1388,36 @@ registry.registerPath({
   summary: "Get issue heartbeat context",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/watchdog",
+  tags: ["issues"],
+  summary: "Get active issue watchdog",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/issues/{id}/watchdog",
+  tags: ["issues"],
+  summary: "Create or update an issue watchdog",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(upsertIssueWatchdogSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/issues/{id}/watchdog",
+  tags: ["issues"],
+  summary: "Disable an issue watchdog",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -2426,6 +2466,23 @@ registry.registerPath({
 });
 
 // ─── Instance settings ────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/settings",
+  tags: ["instance"],
+  summary: "Get instance settings",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/instance/settings",
+  tags: ["instance"],
+  summary: "Update instance settings",
+  request: { body: jsonBody(patchInstanceSettingsSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
 
 registry.registerPath({
   method: "get",
@@ -3798,6 +3855,57 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/external-objects",
+  tags: ["issues"],
+  summary: "List external objects mentioned by an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/external-object-summary",
+  tags: ["issues"],
+  summary: "Get external object status summary for an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issues/external-object-summaries",
+  tags: ["issues"],
+  summary: "Get external object status summaries for issues",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(externalObjectSummariesBodySchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/external-objects/refresh",
+  tags: ["issues"],
+  summary: "Refresh external objects mentioned by an issue",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(refreshExternalObjectsBodySchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/projects/{id}/external-object-summary",
+  tags: ["projects"],
+  summary: "Get external object status summary for a project",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
 // ─── Org chart images ─────────────────────────────────────────────────────────
 
 registry.registerPath({
@@ -4436,6 +4544,8 @@ registerCurrentRoute({
 for (const route of [
   ["get", "/api/routines/{id}/revisions", "List routine revisions"],
   ["post", "/api/routines/{id}/revisions/{revisionId}/restore", "Restore a routine revision"],
+  ["get", "/api/routines/{id}/description/annotations", "List routine description annotation threads"],
+  ["get", "/api/routines/{id}/description/annotations/{threadId}", "Get a routine description annotation thread"],
 ] as const) {
   registerCurrentRoute({
     method: route[0],
@@ -4444,6 +4554,32 @@ for (const route of [
     summary: route[2],
   });
 }
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/routines/{id}/description/annotations",
+  tags: ["routines"],
+  summary: "Create a routine description annotation thread",
+  body: createDocumentAnnotationThreadSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/routines/{id}/description/annotations/{threadId}/comments",
+  tags: ["routines"],
+  summary: "Add a routine description annotation comment",
+  body: createDocumentAnnotationCommentSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/routines/{id}/description/annotations/{threadId}",
+  tags: ["routines"],
+  summary: "Update a routine description annotation thread",
+  body: updateDocumentAnnotationThreadSchema,
+});
 
 const pluginLocalFolderRequestSchema = z.object({
   path: z.string().min(1),
