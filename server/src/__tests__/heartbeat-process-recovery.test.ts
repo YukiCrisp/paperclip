@@ -2477,6 +2477,190 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 
+  it("parks a child-waiting parent whose run hung instead of waking the owner in a loop (ENGA-801)", async () => {
+    // The flap: a parent with open children whose run died from inactivity (NOT
+    // the waiting-on-review error code) used to escalate every heartbeat, waking
+    // the owner via source_scoped_recovery_action. It must now park structurally.
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "claude_output_inactivity_monitor",
+      runError: "No output from the model for too long; inactivity monitor terminated the run",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openChildId = randomUUID();
+    const doneChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: openChildId,
+        companyId,
+        parentId: issueId,
+        title: "Implementation sub-task still running",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 30,
+        identifier: `${issuePrefix}-30`,
+      },
+      {
+        id: doneChildId,
+        companyId,
+        parentId: issueId,
+        title: "Sub-task already finished",
+        status: "done",
+        priority: "medium",
+        issueNumber: 31,
+        identifier: `${issuePrefix}-31`,
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Parked as a dependency wait — not escalated, not re-queued, not reassigned.
+    expect(result.waitingOnReviewResolved).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("blocked");
+    expect(parent?.assigneeAgentId).toBe(agentId);
+
+    // Only the open child becomes a first-class blocker; the done child is excluded.
+    const blockers = await sourceBlockerIssueIds(companyId, issueId);
+    expect(blockers).toEqual([openChildId]);
+
+    // No wake storm: no source-scoped recovery action, no recovery wakeup, no retry run.
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(0);
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+      ));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.map((row) => row.id)).toEqual([runId]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("This task is waiting on");
+    expect(comments[0]?.body).toContain("continue automatically");
+    expect(comments[0]?.body).toContain(`${issuePrefix}-30`);
+    expect(comments[0]?.body).not.toContain(`${issuePrefix}-31`);
+    // The raw machine error code never leaks into the human thread.
+    expect(comments[0]?.body).not.toContain("claude_output_inactivity_monitor");
+  });
+
+  it("does not re-flap a parked child-waiting parent on subsequent heartbeats (ENGA-801)", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "claude_output_inactivity_monitor",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openChildId = randomUUID();
+    await db.insert(issues).values({
+      id: openChildId,
+      companyId,
+      parentId: issueId,
+      title: "Sub-task still running",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 40,
+      identifier: `${issuePrefix}-40`,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.waitingOnReviewResolved).toBe(1);
+
+    // Second heartbeat: the parent is now `blocked`, so it is no longer a
+    // recovery candidate — nothing new happens. This is the anti-flap property.
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.waitingOnReviewResolved).toBe(0);
+    expect(second.escalated).toBe(0);
+    expect(second.continuationRequeued).toBe(0);
+    expect(second.issueIds).toEqual([]);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("blocked");
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+      ));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    // Exactly one park comment total — not one per heartbeat.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+
+    const blockers = await sourceBlockerIssueIds(companyId, issueId);
+    expect(blockers).toEqual([openChildId]);
+  });
+
+  it("still re-enqueues continuation for a parent whose children are all done (ENGA-801 regression)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "process_lost",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const doneChildId = randomUUID();
+    await db.insert(issues).values({
+      id: doneChildId,
+      companyId,
+      parentId: issueId,
+      title: "Sub-task already finished",
+      status: "done",
+      priority: "medium",
+      issueNumber: 50,
+      identifier: `${issuePrefix}-50`,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // No open dependency → the structural guard no-ops and the normal
+    // continuation-retry path runs (no regression).
+    expect(result.waitingOnReviewResolved).toBe(0);
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("in_progress");
+
+    // The parent was not converted into a dependency wait.
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      source: "issue.continuation_recovery",
+    });
+
+    if (retryRun?.id) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
   it("clears the detached warning when the run reports activity again", async () => {
     const { runId } = await seedRunFixture({
       includeIssue: false,
