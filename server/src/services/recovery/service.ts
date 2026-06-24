@@ -94,6 +94,22 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+// ENGA-803: circuit-breaker for the same-error recovery flap. When a stranded
+// `in_progress` issue with no open children/blockers keeps dying with the SAME
+// terminal run error code, the per-attempt continuation/escalation logic revives
+// it every heartbeat (continuation retry → owner wake → in_progress re-assertion
+// → same death). The owner's re-assertion run carries a different `retryReason`,
+// so the existing `summarizeRecentContinuationRetries` consecutive counter resets
+// each cycle and never trips. After this many consecutive same-error terminal
+// deaths — counted across the owner's re-assertions — Paperclip parks the issue
+// in `blocked` and escalates to the board ONCE without enqueuing another owner
+// wake, so a human decides instead of the loop running forever. Floor at 2 so a
+// single transient failure can never trip the breaker.
+export const RECOVERY_SAME_ERROR_CIRCUIT_BREAKER_MAX_DEATHS = Math.max(
+  2,
+  Number(process.env.RECOVERY_SAME_ERROR_CIRCUIT_BREAKER_MAX_DEATHS) || 5,
+);
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -545,6 +561,54 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (errorCodeToMatch !== rowErrorCode) {
         break;
       }
+
+      consecutive += 1;
+      if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
+    }
+    return { consecutive, latestFinishedAt };
+  }
+
+  // ENGA-803: count how many of the issue's most recent runs died, consecutively,
+  // with the SAME terminal error code. Unlike `summarizeRecentContinuationRetries`
+  // this deliberately does NOT key on `retryReason`, so it spans the owner's
+  // `in_progress` re-assertion runs (which carry a different reason but die from
+  // the same cause). A successful run or a different error code breaks the chain,
+  // so genuine progress always resets the counter. This is the signal the
+  // circuit-breaker trips on. Returns `{ consecutive: 0 }` when no error code is
+  // supplied (a null error cannot be fingerprinted into a loop).
+  async function summarizeConsecutiveSameErrorTerminalDeaths(
+    companyId: string,
+    issueId: string,
+    errorCodeToMatch: string | null,
+  ) {
+    if (!errorCodeToMatch) return { consecutive: 0, latestFinishedAt: null as Date | null };
+    const rows = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(20);
+
+    let consecutive = 0;
+    let latestFinishedAt: Date | null = null;
+    for (const row of rows) {
+      if (
+        !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+          row.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+        )
+      ) {
+        break;
+      }
+      if (readNonEmptyString(row.errorCode) !== errorCodeToMatch) break;
 
       consecutive += 1;
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
@@ -2453,9 +2517,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: "todo" | "in_progress";
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    // ENGA-803: when set, this issue has tripped the same-error circuit-breaker.
+    // The action is recorded as a board escalation with no owner so no automatic
+    // owner wake is ever enqueued for it; a human must intervene.
+    circuitBroken?: { consecutiveDeaths: number; errorCode: string | null } | null;
   }) {
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    const circuitBroken = input.circuitBroken ?? null;
+    const ownerAgentId = circuitBroken ? null : await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     const now = new Date();
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
@@ -2470,21 +2539,41 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issue: input.issue,
         recoveryCause,
       }),
-      evidence: buildStrandedRecoveryActionEvidence({
-        issue: input.issue,
-        latestRun: input.latestRun,
-        previousStatus: input.previousStatus,
-        recoveryCause,
-        successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-      }),
-      nextAction: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+      evidence: {
+        ...buildStrandedRecoveryActionEvidence({
+          issue: input.issue,
+          latestRun: input.latestRun,
+          previousStatus: input.previousStatus,
+          recoveryCause,
+          successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+        }),
+        ...(circuitBroken
+          ? {
+            circuitBreaker: {
+              consecutiveDeaths: circuitBroken.consecutiveDeaths,
+              errorCode: circuitBroken.errorCode,
+              threshold: RECOVERY_SAME_ERROR_CIRCUIT_BREAKER_MAX_DEATHS,
+            },
+          }
+          : {}),
+      },
+      nextAction: circuitBroken
+        ? "Automatic recovery is parked: this issue died repeatedly with the same run error and has no dependency to wait on. A board operator must inspect the run evidence and fix the runtime/adapter, reassign, or record a manual resolution before it can resume."
+        : recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
         ? "Choose and record a valid issue disposition without copying transcript content."
         : recoveryCause === "workspace_validation_failed"
           ? "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
         : recoveryCause === "configuration_incomplete"
           ? "Bind the missing secret(s) named in the run failure to the agent/project/routine env before resuming adapter execution."
         : "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
-      wakePolicy: recoveryCause === "workspace_validation_failed" || recoveryCause === "configuration_incomplete"
+      wakePolicy: circuitBroken
+        ? {
+          type: "board_escalation",
+          reason: "recovery_circuit_breaker",
+          consecutiveDeaths: circuitBroken.consecutiveDeaths,
+          errorCode: circuitBroken.errorCode,
+        }
+        : recoveryCause === "workspace_validation_failed" || recoveryCause === "configuration_incomplete"
         ? {
           type: "manual_repair_required",
           reason: recoveryCause,
@@ -2887,6 +2976,100 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  // ENGA-803: park an issue that tripped the same-error circuit-breaker. Records
+  // the recovery action as a board escalation (no owner), moves the issue to
+  // `blocked` keeping its assignee, posts a single board-facing escalation
+  // comment, and — crucially — does NOT enqueue any owner wake. With no wake the
+  // owner can never re-assert `in_progress`, so the issue leaves the recovery
+  // candidate set and the flap stops until a human intervenes. Idempotent: the
+  // comment is only posted once per recovery action.
+  async function parkStrandedRecoveryCircuitBreaker(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    consecutiveDeaths: number;
+    errorCode: string;
+  }): Promise<typeof issues.$inferSelect | null> {
+    const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
+      issue: input.issue,
+      previousStatus: "in_progress",
+      latestRun: input.latestRun,
+      recoveryCause: "stranded_assigned_issue",
+      circuitBroken: { consecutiveDeaths: input.consecutiveDeaths, errorCode: input.errorCode },
+    });
+
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+      blockedByIssueIds: blockerIds,
+    });
+    if (!updated) return null;
+
+    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
+    const runLink = input.latestRun
+      ? runUiLink({ id: input.latestRun.id, agentId: input.latestRun.agentId }, prefix)
+      : "none";
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
+
+    const hasParkComment = await db
+      .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, input.issue.id), eq(issueComments.authorType, "system")))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(50)
+      .then((rows) => rows.some((row) =>
+        (row.body ?? "").includes(escalationCommentMarker) ||
+        noticeMetadataReferencesRecoveryAction(row.metadata, recoveryAction.id),
+      ));
+
+    if (!hasParkComment) {
+      await issuesSvc.addComment(
+        input.issue.id,
+        [
+          "Paperclip stopped automatic recovery for this issue (circuit-breaker).",
+          "",
+          `This issue's run has died the same way ${input.consecutiveDeaths} times in a row with no dependency to wait on, ` +
+            "so reviving it every heartbeat was just looping. Paperclip parked it in `blocked` and is no longer auto-restarting it.",
+          "",
+          `- Latest run: ${runLink}`,
+          `- Latest run status: \`${input.latestRun?.status ?? "unknown"}\``,
+          `- Consecutive same-error deaths: ${input.consecutiveDeaths}`,
+          `- Recovery action: \`${recoveryAction.id}\``,
+          failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
+          "",
+          "Next action: a board operator should inspect the failed run evidence and fix the runtime/adapter, reassign the issue, or record an intentional manual resolution. It will not resume automatically.",
+        ].join("\n"),
+        {},
+        { authorType: "system" },
+      );
+    }
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "blocked",
+        previousStatus: "in_progress",
+        source: "recovery.reconcile_stranded_circuit_breaker_parked",
+        consecutiveDeaths: input.consecutiveDeaths,
+        latestRunErrorCode: input.errorCode,
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunStatus: input.latestRun?.status ?? null,
+        recoveryActionId: recoveryAction.id,
+        blockerIssueIds: blockerIds,
+      },
+    });
+
+    return updated;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     const candidates = await db
       .select()
@@ -2909,6 +3092,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEscalated: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,
+      circuitBrokenParked: 0,
       recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
@@ -3072,6 +3256,45 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.issueIds.push(issue.id);
         continue;
       }
+
+      // ENGA-803: same-error circuit-breaker (Fix 2, complements the ENGA-801
+      // child-waiting guard above). We only reach here when there is no live run
+      // AND no open children/blockers to wait on. If this issue keeps dying with
+      // the same terminal error code across the owner's `in_progress`
+      // re-assertions, the per-attempt continuation/escalation logic below would
+      // revive it every heartbeat forever — it cannot self-heal because there is
+      // no dependency to clear. After N consecutive same-error deaths, park it
+      // for the board ONCE without enqueuing another owner wake. Recovery-origin
+      // issues are handled separately above and never reach here with a terminal
+      // run.
+      const sameErrorCode = readNonEmptyString(latestRun?.errorCode);
+      if (
+        !isStrandedIssueRecoveryIssue(issue) &&
+        isUnsuccessfulTerminalIssueRun(latestRun) &&
+        sameErrorCode
+      ) {
+        const sameErrorDeaths = await summarizeConsecutiveSameErrorTerminalDeaths(
+          issue.companyId,
+          issue.id,
+          sameErrorCode,
+        );
+        if (sameErrorDeaths.consecutive >= RECOVERY_SAME_ERROR_CIRCUIT_BREAKER_MAX_DEATHS) {
+          const parked = await parkStrandedRecoveryCircuitBreaker({
+            issue,
+            latestRun,
+            consecutiveDeaths: sameErrorDeaths.consecutive,
+            errorCode: sameErrorCode,
+          });
+          if (parked) {
+            result.circuitBrokenParked += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+      }
+
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
 
