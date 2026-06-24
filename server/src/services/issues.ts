@@ -699,6 +699,9 @@ async function listPendingFinalizeBlockerIssueIds(
   const blockerIssueIds = [...new Set(blockerWorkspacePairs.map((pair) => pair.blockerIssueId))];
   const executionWorkspaceIds = [...new Set(blockerWorkspacePairs.map((pair) => pair.executionWorkspaceId))];
   if (blockerIssueIds.length === 0 || executionWorkspaceIds.length === 0) return pending;
+  const blockerWorkspaceKeys = new Set(
+    blockerWorkspacePairs.map((pair) => `${pair.blockerIssueId}:${pair.executionWorkspaceId}`),
+  );
 
   const rows = await dbOrTx
     .select({
@@ -712,18 +715,32 @@ async function listPendingFinalizeBlockerIssueIds(
     .where(
       and(
         eq(workspaceOperations.companyId, companyId),
-        inArray(workspaceOperations.issueId, blockerIssueIds),
         inArray(workspaceOperations.executionWorkspaceId, executionWorkspaceIds),
+        or(inArray(workspaceOperations.issueId, blockerIssueIds), isNull(workspaceOperations.issueId)),
       ),
     );
 
-  const latestByBlockerWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
+  const latestAttributedByBlockerWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
+  const latestUnattributedByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
   for (const row of rows) {
-    if (!row.issueId || !row.executionWorkspaceId) continue;
-    const key = `${row.issueId}:${row.executionWorkspaceId}`;
-    const current = latestByBlockerWorkspace.get(key);
+    if (!row.executionWorkspaceId) continue;
+    if (row.issueId) {
+      const key = `${row.issueId}:${row.executionWorkspaceId}`;
+      if (!blockerWorkspaceKeys.has(key)) continue;
+      const current = latestAttributedByBlockerWorkspace.get(key);
+      if (!current || row.startedAt > current.startedAt) {
+        latestAttributedByBlockerWorkspace.set(key, {
+          phase: row.phase,
+          status: row.status,
+          startedAt: row.startedAt,
+        });
+      }
+      continue;
+    }
+
+    const current = latestUnattributedByWorkspace.get(row.executionWorkspaceId);
     if (!current || row.startedAt > current.startedAt) {
-      latestByBlockerWorkspace.set(key, {
+      latestUnattributedByWorkspace.set(row.executionWorkspaceId, {
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
@@ -732,8 +749,9 @@ async function listPendingFinalizeBlockerIssueIds(
   }
 
   for (const pair of blockerWorkspacePairs) {
-    const latest = latestByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`);
-    if (!latest) continue; // no attributed ops recorded -> nothing to finalize for this blocker
+    const latest = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
+      ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
+    if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
     pending.add(pair.blockerIssueId);
   }

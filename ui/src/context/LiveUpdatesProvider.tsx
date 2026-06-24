@@ -667,6 +667,9 @@ function invalidateActivityQueries(
   const actorType = readString(payload.actorType);
   const actorId = readString(payload.actorId);
   const details = readRecord(payload.details);
+  const ownActorActivity =
+    (actorType === "user" && !!currentActor.userId && actorId === currentActor.userId) ||
+    (actorType === "agent" && !!currentActor.agentId && actorId === currentActor.agentId);
 
   if (action?.startsWith("resource_membership.")) {
     const targetUserId = readString(details?.userId);
@@ -789,8 +792,10 @@ function invalidateActivityQueries(
     queryClient.invalidateQueries({ queryKey: ["routines"] });
     if (entityType === "routine" && action && ROUTINE_DOCUMENT_ANNOTATION_ACTIVITY_ACTIONS.has(action) && entityId) {
       const documentKey = readString(details?.key) ?? readString(details?.documentKey) ?? "description";
+      const routineInvalidationOptions = ownActorActivity ? { refetchType: "inactive" as const } : undefined;
       queryClient.invalidateQueries({
         queryKey: ["routines", "document-annotations", entityId, documentKey],
+        ...routineInvalidationOptions,
       });
     }
     return;

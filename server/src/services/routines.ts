@@ -654,6 +654,12 @@ export function routineService(
     actor: Actor,
     options: { changeSummary?: string | null } = {},
   ): Promise<RoutineDescriptionDocument> {
+    if (executor === db) {
+      return db.transaction(async (tx) => (
+        upsertRoutineDescriptionDocument(tx as unknown as Db, routine, actor, options)
+      ));
+    }
+
     const now = new Date();
     const body = routine.description ?? "";
     const existing = await getRoutineDescriptionDocument(routine.id, executor);

@@ -3209,7 +3209,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
-  it("ignores unattributed pre-backfill workspace operations when checking blocker readiness", async () => {
+  it("keeps dependents blocked on unattributed workspace operations for the blocker workspace", async () => {
     const {
       companyId,
       executionWorkspaceId,
@@ -3224,6 +3224,22 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       phase: "worktree_prepare",
       status: "succeeded",
       startedAt: new Date("2026-05-23T22:00:00.000Z"),
+    });
+
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+    });
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: null,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
     });
 
     await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
@@ -3286,6 +3302,14 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       phase: "workspace_finalize",
       status: "succeeded",
       startedAt: new Date("2026-05-23T22:10:00.000Z"),
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: null,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:15:00.000Z"),
     });
 
     await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([

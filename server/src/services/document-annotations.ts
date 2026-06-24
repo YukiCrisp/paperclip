@@ -146,7 +146,11 @@ export function documentAnnotationService(db: Db) {
       })
       .from(routineDocuments)
       .innerJoin(documents, eq(routineDocuments.documentId, documents.id))
-      .where(and(eq(routineDocuments.routineId, routineId), eq(routineDocuments.key, key)))
+      .where(and(
+        eq(routineDocuments.routineId, routineId),
+        eq(routineDocuments.key, key),
+        eq(routineDocuments.companyId, documents.companyId),
+      ))
       .then((rows: RoutineDocumentRow[]) => rows[0] ?? null);
   }
 
@@ -171,6 +175,8 @@ export function documentAnnotationService(db: Db) {
     routineId: string,
     documentKey: string,
     threadId: string,
+    companyId: string,
+    documentId: string,
     dbOrTx: any = db,
   ): Promise<DocumentAnnotationThread | null> {
     return dbOrTx
@@ -178,7 +184,9 @@ export function documentAnnotationService(db: Db) {
       .from(documentAnnotationThreads)
       .where(and(
         eq(documentAnnotationThreads.id, threadId),
+        eq(documentAnnotationThreads.companyId, companyId),
         eq(documentAnnotationThreads.routineId, routineId),
+        eq(documentAnnotationThreads.documentId, documentId),
         eq(documentAnnotationThreads.documentKey, documentKey),
       ))
       .then((rows: DocumentAnnotationThread[]) => rows[0] ?? null);
@@ -256,6 +264,7 @@ export function documentAnnotationService(db: Db) {
       const doc = await getRoutineDocument(routineId, key);
       if (!doc) throw notFound("Document not found");
       const conditions = [
+        eq(documentAnnotationThreads.companyId, doc.companyId),
         eq(documentAnnotationThreads.routineId, routineId),
         eq(documentAnnotationThreads.documentId, doc.documentId),
       ];
@@ -289,7 +298,9 @@ export function documentAnnotationService(db: Db) {
     },
 
     getThreadForRoutineDocument: async (routineId: string, key: string, threadId: string) => {
-      const thread = await getThreadForRoutine(routineId, key, threadId);
+      const doc = await getRoutineDocument(routineId, key);
+      if (!doc) return null;
+      const thread = await getThreadForRoutine(routineId, key, threadId, doc.companyId, doc.documentId);
       if (!thread) return null;
       const comments = await commentsForThreads([thread.id]);
       return { ...thread, comments };
@@ -512,7 +523,9 @@ export function documentAnnotationService(db: Db) {
       input: CreateDocumentAnnotationComment,
       actor: ActorInput,
     ) => db.transaction(async (tx) => {
-      const thread = await getThreadForRoutine(routineId, key, threadId, tx);
+      const doc = await getRoutineDocument(routineId, key, tx);
+      if (!doc) throw notFound("Document not found");
+      const thread = await getThreadForRoutine(routineId, key, threadId, doc.companyId, doc.documentId, tx);
       if (!thread) throw notFound("Annotation thread not found");
       const now = new Date();
       const [comment] = await tx
@@ -646,7 +659,9 @@ export function documentAnnotationService(db: Db) {
       input: UpdateDocumentAnnotationThread,
       actor: ActorInput,
     ) => db.transaction(async (tx) => {
-      const thread = await getThreadForRoutine(routineId, key, threadId, tx);
+      const doc = await getRoutineDocument(routineId, key, tx);
+      if (!doc) throw notFound("Document not found");
+      const thread = await getThreadForRoutine(routineId, key, threadId, doc.companyId, doc.documentId, tx);
       if (!thread) throw notFound("Annotation thread not found");
       if (!input.status || input.status === thread.status) return thread;
 

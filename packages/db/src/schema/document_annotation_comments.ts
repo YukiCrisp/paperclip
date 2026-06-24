@@ -51,9 +51,9 @@ export const documentAnnotationComments = pgTable(
     ),
     issueCommentIdx: index("document_annotation_comments_issue_comment_idx").on(table.issueCommentId),
     bodySearchIdx: index("document_annotation_comments_body_search_idx").using("gin", table.body.op("gin_trgm_ops")),
-    ownerCheck: check(
-      "document_annotation_comments_owner_check",
-      sql`${table.issueId} IS NOT NULL OR ${table.routineId} IS NOT NULL`,
+    exactlyOneOwnerChk: check(
+      "document_annotation_comments_exactly_one_owner_chk",
+      sql`num_nonnulls(${table.issueId}, ${table.routineId}) = 1`,
     ),
   }),
 );

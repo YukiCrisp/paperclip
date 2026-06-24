@@ -74,9 +74,9 @@ export const documentAnnotationThreads = pgTable(
       table.companyId,
       table.anchorState,
     ),
-    ownerCheck: check(
-      "document_annotation_threads_owner_check",
-      sql`${table.issueId} IS NOT NULL OR ${table.routineId} IS NOT NULL`,
+    exactlyOneOwnerChk: check(
+      "document_annotation_threads_exactly_one_owner_chk",
+      sql`num_nonnulls(${table.issueId}, ${table.routineId}) = 1`,
     ),
   }),
 );
