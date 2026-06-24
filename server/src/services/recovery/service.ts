@@ -193,12 +193,6 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "issue_dependencies_blocked",
 ]);
 
-// A continuation cancelled with this code is a *deliberate wait* (the latest run
-// reported it was parked for review/approval), not a lost execution path. When the
-// issue has a real waiting target we convert it into a normal dependency wait rather
-// than escalating it as stranded.
-const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE = "issue_continuation_waiting_on_review";
-
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
@@ -2662,6 +2656,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return existingUnresolvedBlockerIssues(companyId, issueId).then((rows) => rows.map((row) => row.id));
   }
 
+  // Park an assigned parent that has open children or unresolved blockers as a
+  // normal dependency wait (status `blocked` + first-class blockedByIssueIds),
+  // preserving its assignee. Returns the updated issue, or null when the issue
+  // has no open children/blockers (nothing to wait on → caller falls through to
+  // the normal stranded-recovery logic). This is the single canonical "the live
+  // run is gone but the work is genuinely waiting on dependencies" handler — it
+  // is driven structurally off the issue graph, NOT off any run error code, so a
+  // child-waiting parent whose run merely hung (e.g. inactivity monitor) parks
+  // the same way as one whose run explicitly reported waiting-for-review. The
+  // issue auto-resumes via `issue_children_completed`, so parking is safe and
+  // self-healing (ENGA-801).
   async function resolveContinuationWaitingOnReview(issue: typeof issues.$inferSelect) {
     const existingBlockers = await existingUnresolvedBlockerIssues(issue.companyId, issue.id);
     const openChildren = await db
@@ -2686,8 +2691,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
         "It will continue automatically when that work is done — there's nothing you need to do. " +
-        "(It was paused because the latest run reported it was waiting for review/approval; " +
-        "Paperclip turned that into a normal dependency wait instead of flagging it as stuck.)",
+        "(Paperclip paused it because it has open dependencies and no live run, and turned that " +
+        "into a normal dependency wait instead of flagging it as stuck.)",
       {},
       { authorType: "system" },
     );
@@ -3048,6 +3053,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         continue;
       }
+      // ENGA-801: structural child-waiting guard. `hasActiveExecutionPath` is
+      // already false here (checked above), so there is no live run for this
+      // parent. If it has open children or unresolved blockers, parking it as a
+      // dependency wait is the only correct posture — reviving it every
+      // heartbeat (continuation retry / escalation) just wakes the owner in a
+      // loop (`source_scoped_recovery_action` storm) for an issue that cannot
+      // progress until that work finishes. It auto-resumes via
+      // `issue_children_completed`, so this is safe and self-healing. This runs
+      // before the success/terminal branches and is driven off the issue graph,
+      // not the run's error code, so a parent whose run merely hung parks the
+      // same as one that explicitly reported waiting-for-review.
+      // `resolveContinuationWaitingOnReview` returns null when there are no open
+      // children/blockers, so genuinely-stranded parents fall through.
+      const parkedWaitingOnDependencies = await resolveContinuationWaitingOnReview(issue);
+      if (parkedWaitingOnDependencies) {
+        result.waitingOnReviewResolved += 1;
+        result.issueIds.push(issue.id);
+        continue;
+      }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
 
@@ -3112,14 +3136,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         const classification = classifyContinuationFailure(latestRun);
 
-        if (classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE) {
-          const resolved = await resolveContinuationWaitingOnReview(issue);
-          if (resolved) {
-            result.waitingOnReviewResolved += 1;
-            result.issueIds.push(issue.id);
-            continue;
-          }
-        }
+        // Note: the deliberate waiting-on-review conversion that used to live here
+        // is now handled structurally by the child-waiting guard above, which
+        // parks any parent with open children/blockers regardless of error code
+        // (ENGA-801). A parent that reaches this point has no open dependencies.
 
         if (classification.kind === "non_retryable") {
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
