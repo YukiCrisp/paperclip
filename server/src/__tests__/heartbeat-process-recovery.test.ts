@@ -2613,6 +2613,169 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(blockers).toEqual([openChildId]);
   });
 
+  // ENGA-803: same-error circuit-breaker. Seeds the flap loop — an issue with no
+  // dependency that keeps dying with the SAME terminal error code across the
+  // owner's `in_progress` re-assertions — and asserts Paperclip parks it once
+  // instead of reviving it every heartbeat.
+  async function seedSameErrorDeathLoop(input: { deaths: number; latestRetryReason?: string | null }) {
+    const seeded = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "claude_output_inactivity_monitor",
+      runError: "No output from the model for too long; inactivity monitor terminated the run",
+    });
+    // The fixture already created one same-error death. Add the rest so the
+    // newest run is the latest by createdAt. Every other added run is the owner's
+    // re-assertion (`source_scoped_recovery_action`, a DIFFERENT retryReason) —
+    // exactly what resets the per-attempt continuation counter today.
+    const base = Date.now();
+    for (let i = 1; i < input.deaths; i += 1) {
+      const isOwnerReassertion = i % 2 === 1;
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: isOwnerReassertion ? "timed_out" : "failed",
+        contextSnapshot: {
+          issueId: seeded.issueId,
+          taskId: seeded.issueId,
+          wakeReason: isOwnerReassertion ? "source_scoped_recovery_action" : "issue_continuation_needed",
+          ...(isOwnerReassertion ? {} : { retryReason: "issue_continuation_needed" }),
+        },
+        startedAt: new Date(base + i * 60_000),
+        finishedAt: new Date(base + i * 60_000 + 30_000),
+        createdAt: new Date(base + i * 60_000),
+        updatedAt: new Date(base + i * 60_000 + 30_000),
+        errorCode: "claude_output_inactivity_monitor",
+        error: "inactivity monitor terminated the run",
+      });
+    }
+    return seeded;
+  }
+
+  it("parks an issue after N same-error deaths spanning owner re-assertions, escalating once (ENGA-803)", async () => {
+    // 6 consecutive same-error deaths, well over the default threshold of 5.
+    const { companyId, agentId, issueId } = await seedSameErrorDeathLoop({ deaths: 6 });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Circuit-breaker tripped: parked, not escalated/requeued through the normal path.
+    expect(result.circuitBrokenParked).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.waitingOnReviewResolved).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("blocked");
+    // Assignee preserved so the board park keeps the owner visible.
+    expect(parent?.assigneeAgentId).toBe(agentId);
+
+    // No owner wake enqueued → the loop cannot revive itself.
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+      ));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    // No new retry run was spawned.
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.every((row) => row.invocationSource !== "automation" || row.errorCode === "claude_output_inactivity_monitor")).toBe(true);
+
+    // The recovery action is recorded as a board-escalation circuit-breaker park.
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]?.ownerType).toBe("board");
+    expect(recoveryActions[0]?.ownerAgentId).toBeNull();
+    const wakePolicy = recoveryActions[0]?.wakePolicy as Record<string, unknown> | null;
+    expect(wakePolicy?.type).toBe("board_escalation");
+    expect(wakePolicy?.reason).toBe("recovery_circuit_breaker");
+
+    // Exactly one board-facing escalation comment; the raw error code never leaks.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("circuit-breaker");
+    expect(comments[0]?.body).not.toContain("claude_output_inactivity_monitor");
+
+    // Activity log records the park source.
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(
+      activity.some((event) =>
+        (event.details as Record<string, unknown> | null)?.source === "recovery.reconcile_stranded_circuit_breaker_parked",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not re-flap or re-comment a circuit-breaker-parked issue on later heartbeats (ENGA-803)", async () => {
+    const { companyId, issueId } = await seedSameErrorDeathLoop({ deaths: 6 });
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.circuitBrokenParked).toBe(1);
+
+    // Second heartbeat: the issue is now `blocked`, so it is no longer a recovery
+    // candidate — nothing new happens. This is the anti-flap property.
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.circuitBrokenParked).toBe(0);
+    expect(second.escalated).toBe(0);
+    expect(second.continuationRequeued).toBe(0);
+    expect(second.issueIds).toEqual([]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+      ));
+    expect(recoveryWakeups).toHaveLength(0);
+  });
+
+  it("does not circuit-break a single same-error death — normal recovery still runs (ENGA-803)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_output_inactivity_monitor",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // One death is far below the threshold → no circuit-break; the normal
+    // continuation-retry path runs unchanged.
+    expect(result.circuitBrokenParked).toBe(0);
+    expect(result.continuationRequeued).toBe(1);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("in_progress");
+
+    // No circuit-breaker recovery action was created.
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(
+      recoveryActions.every((row) => (row.wakePolicy as Record<string, unknown> | null)?.reason !== "recovery_circuit_breaker"),
+    ).toBe(true);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.some((row) => row.id !== runId)).toBe(true);
+  });
+
   it("still re-enqueues continuation for a parent whose children are all done (ENGA-801 regression)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
