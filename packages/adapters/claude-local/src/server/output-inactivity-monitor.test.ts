@@ -5,9 +5,17 @@ import {
   DEFAULT_CLAUDE_RUN_WALL_CLOCK_TIMEOUT_SEC,
   createClaudeOutputInactivityMonitor,
   formatOutputInactivityMonitorErrorMessage,
+  readClaudeStreamToolActivity,
   resolveClaudeInactivityTimeout,
   resolveClaudeRunWallClockTimeoutSec,
 } from "./output-inactivity-monitor.js";
+
+const assistantToolUse = (id: string, name = "Bash") =>
+  `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"${id}","name":"${name}","input":{}}]}}\n`;
+const toolResult = (id: string) =>
+  `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"${id}","content":"ok"}]}}\n`;
+const assistantText = (text: string) =>
+  `{"type":"assistant","message":{"content":[{"type":"text","text":"${text}"}]}}\n`;
 
 class FakeClock {
   private nowMs = 0;
@@ -295,6 +303,128 @@ describe("createClaudeOutputInactivityMonitor (disabled)", () => {
         onFire: () => {},
       }),
     ).toThrow(/timeoutMs > 0/);
+  });
+});
+
+describe("readClaudeStreamToolActivity", () => {
+  it("returns null for non-tool lines", () => {
+    expect(readClaudeStreamToolActivity("")).toBeNull();
+    expect(readClaudeStreamToolActivity("loading...")).toBeNull();
+    expect(readClaudeStreamToolActivity('{"type":"system","subtype":"init"}')).toBeNull();
+    expect(readClaudeStreamToolActivity(assistantText("just thinking").trim())).toBeNull();
+  });
+
+  it("extracts started tool_use ids from an assistant event", () => {
+    expect(readClaudeStreamToolActivity(assistantToolUse("toolu_1").trim())).toEqual({
+      started: ["toolu_1"],
+      completed: [],
+    });
+  });
+
+  it("extracts completed tool_use_ids from a user tool_result event", () => {
+    expect(readClaudeStreamToolActivity(toolResult("toolu_1").trim())).toEqual({
+      started: [],
+      completed: ["toolu_1"],
+    });
+  });
+
+  it("handles parallel tool_use blocks in a single assistant event", () => {
+    const line = '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Bash","input":{}},{"type":"text","text":"x"},{"type":"tool_use","id":"b","name":"Read","input":{}}]}}';
+    expect(readClaudeStreamToolActivity(line)).toEqual({ started: ["a", "b"], completed: [] });
+  });
+});
+
+describe("createClaudeOutputInactivityMonitor (tool-wait suspension)", () => {
+  const makeMonitor = (clock: FakeClock, timeoutMs: number, onFire: () => void) =>
+    createClaudeOutputInactivityMonitor({
+      timeoutMs,
+      now: () => clock.now(),
+      setTimer: (cb, ms) => clock.setTimer(cb, ms),
+      clearTimer: (handle) => clock.clearTimer(handle),
+      onFire,
+    });
+
+  it("does not fire while a dispatched tool has not yet returned, even far past the timeout", () => {
+    const clock = new FakeClock();
+    let fireCount = 0;
+    const timeoutMs = 15 * 60 * 1000;
+    const monitor = makeMonitor(clock, timeoutMs, () => {
+      fireCount += 1;
+    });
+
+    clock.advance(50);
+    monitor.noteStdoutChunk(assistantToolUse("toolu_1"));
+    expect(monitor.state().pendingToolCount).toBe(1);
+
+    // A long Bash / sub-agent Task / Workflow runs silently for 40 minutes.
+    clock.advance(40 * 60 * 1000);
+    expect(fireCount).toBe(0);
+
+    monitor.stop();
+  });
+
+  it("re-arms and fires once the pending tool resolves and the run then goes silent", () => {
+    const clock = new FakeClock();
+    let fireCount = 0;
+    const timeoutMs = 15 * 60 * 1000;
+    const monitor = makeMonitor(clock, timeoutMs, () => {
+      fireCount += 1;
+    });
+
+    monitor.noteStdoutChunk(assistantToolUse("toolu_1"));
+    clock.advance(40 * 60 * 1000);
+    expect(fireCount).toBe(0);
+
+    // Tool returns; model is expected to resume generating. Silence is now a hang again.
+    monitor.noteStdoutChunk(toolResult("toolu_1"));
+    expect(monitor.state().pendingToolCount).toBe(0);
+    clock.advance(timeoutMs - 1);
+    expect(fireCount).toBe(0);
+    clock.advance(1);
+    expect(fireCount).toBe(1);
+
+    monitor.stop();
+  });
+
+  it("stays suspended until ALL parallel tools resolve", () => {
+    const clock = new FakeClock();
+    let fireCount = 0;
+    const timeoutMs = 10 * 60 * 1000;
+    const monitor = makeMonitor(clock, timeoutMs, () => {
+      fireCount += 1;
+    });
+
+    monitor.noteStdoutChunk(assistantToolUse("a"));
+    monitor.noteStdoutChunk(assistantToolUse("b"));
+    expect(monitor.state().pendingToolCount).toBe(2);
+
+    monitor.noteStdoutChunk(toolResult("a"));
+    expect(monitor.state().pendingToolCount).toBe(1);
+    clock.advance(timeoutMs * 3);
+    expect(fireCount).toBe(0); // still one tool pending
+
+    monitor.noteStdoutChunk(toolResult("b"));
+    expect(monitor.state().pendingToolCount).toBe(0);
+    clock.advance(timeoutMs);
+    expect(fireCount).toBe(1);
+
+    monitor.stop();
+  });
+
+  it("still fires on a true mid-generation stall (no tool in flight)", () => {
+    const clock = new FakeClock();
+    let fireCount = 0;
+    const timeoutMs = 5 * 60 * 1000;
+    const monitor = makeMonitor(clock, timeoutMs, () => {
+      fireCount += 1;
+    });
+
+    monitor.noteStdoutChunk(assistantText("hello"));
+    expect(monitor.state().pendingToolCount).toBe(0);
+    clock.advance(timeoutMs);
+    expect(fireCount).toBe(1);
+
+    monitor.stop();
   });
 });
 

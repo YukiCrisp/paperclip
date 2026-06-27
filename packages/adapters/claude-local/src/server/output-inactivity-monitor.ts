@@ -79,6 +79,48 @@ export interface ClaudeOutputInactivityMonitorState {
   lastEventAt: number;
   firedAt: number | null;
   parsedEventCount: number;
+  /**
+   * Number of tools claude has dispatched (`tool_use`) but not yet seen resolve
+   * (`tool_result`). While this is > 0 the inactivity timer is *suspended*: a
+   * long Bash, sub-agent Task, Workflow, or slow API call legitimately produces
+   * no parent stdout, so silence during a tool wait is productive, not a hang.
+   * The run-level wall-clock backstop still bounds a genuinely stuck tool.
+   */
+  pendingToolCount: number;
+}
+
+/**
+ * Parse a single claude `--output-format stream-json` line for tool lifecycle
+ * activity. Returns the `tool_use` ids started by an assistant event and the
+ * `tool_use_id`s completed by a user `tool_result` event, or `null` when the
+ * line carries no tool activity (plain text, thinking, system, init, or
+ * non-JSON). Used to distinguish tool-wait silence from model-generation
+ * silence in the inactivity monitor.
+ */
+export function readClaudeStreamToolActivity(
+  line: string,
+): { started: string[]; completed: string[] } | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  const parsed = parseJson(trimmed);
+  if (parsed === null || typeof parsed !== "object") return null;
+  const event = parsed as { type?: unknown; message?: unknown };
+  const message = event.message as { content?: unknown } | undefined;
+  if (!message || !Array.isArray(message.content)) return null;
+
+  const started: string[] = [];
+  const completed: string[] = [];
+  for (const block of message.content as unknown[]) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as { type?: unknown; id?: unknown; tool_use_id?: unknown };
+    if (b.type === "tool_use" && typeof b.id === "string") {
+      started.push(b.id);
+    } else if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+      completed.push(b.tool_use_id);
+    }
+  }
+  if (started.length === 0 && completed.length === 0) return null;
+  return { started, completed };
 }
 
 export interface ClaudeOutputInactivityMonitorOptions {
@@ -133,9 +175,18 @@ export function createClaudeOutputInactivityMonitor(
     lastEventAt: spawnedAt,
     firedAt: null,
     parsedEventCount: 0,
+    pendingToolCount: 0,
   };
+  const pendingTools = new Set<string>();
   let timerHandle: unknown = null;
   let stopped = false;
+
+  const suspend = () => {
+    if (timerHandle != null) {
+      clearTimer(timerHandle);
+      timerHandle = null;
+    }
+  };
 
   const fire = () => {
     if (state.fired || stopped) return;
@@ -162,9 +213,22 @@ export function createClaudeOutputInactivityMonitor(
           sawHeartbeat = true;
           state.parsedEventCount += 1;
         }
+        const activity = readClaudeStreamToolActivity(rawLine);
+        if (activity) {
+          for (const id of activity.started) pendingTools.add(id);
+          for (const id of activity.completed) pendingTools.delete(id);
+        }
       }
+      state.pendingToolCount = pendingTools.size;
       if (sawHeartbeat) {
         state.lastEventAt = now();
+      }
+      // While any dispatched tool is still in flight, silence is expected: keep
+      // the timer suspended. Re-arm only once every tool has resolved (the model
+      // is expected to resume generating, so renewed silence means a real hang).
+      if (pendingTools.size > 0) {
+        suspend();
+      } else if (sawHeartbeat) {
         arm();
       }
     },
