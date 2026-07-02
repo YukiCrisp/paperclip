@@ -32,6 +32,7 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { resolveEmbeddedPostgresReuse } from "./lib/embedded-postgres-reuse.js";
 import { logger } from "./middleware/logger.js";
 import {
   getManagedInstanceConfig,
@@ -413,9 +414,23 @@ export async function startServer(): Promise<StartedServer> {
       }
     };
   
-    const runningPid = getRunningPid();
-    if (runningPid) {
-      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
+    // Reuse requires "alive AND accepting connections" — a postmaster mid-shutdown
+    // still holds postmaster.pid, so PID liveness alone would boot against a dying
+    // server and fail within seconds (ENGA-1310).
+    const reuseDecision = await resolveEmbeddedPostgresReuse({
+      getRunningPid,
+      isConnectable: async () => {
+        const reachableDataDir = await getPostgresDataDirectory(
+          `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`,
+        );
+        return typeof reachableDataDir === "string" && resolve(reachableDataDir) === resolve(dataDir);
+      },
+      signal: (pid, signalName) => process.kill(pid, signalName),
+      sleep: (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
+      warn: (message) => logger.warn(message),
+    });
+    if (reuseDecision.action === "reuse") {
+      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${reuseDecision.pid}, port=${port})`);
     } else {
       const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
       try {
