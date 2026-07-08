@@ -1498,6 +1498,64 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
   });
 
+  it("cancels a routine-execution issue instead of blocking it when recovery is exhausted (ENGA-1612)", async () => {
+    mockAdapterExecute.mockRejectedValueOnce(new Error("continuation recovery failed"));
+
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    // Shape the source issue as a routine-execution issue: recreated by the routine's
+    // next scheduled fire, so a dead one has nothing to recover.
+    await db
+      .update(issues)
+      .set({ originKind: "routine_execution", originId: randomUUID() })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    // The dead run still fails and a continuation retry is attempted (which we forced to
+    // fail above), so recovery is genuinely exhausted before the terminal disposition.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id === runId)?.status).toBe("failed");
+
+    const cancelledIssue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const issue = rows[0] ?? null;
+        return issue?.status === "cancelled" ? issue : null;
+      })
+    );
+    // Terminal cancel, NOT a blocked zombie — the release cleared the execution lock.
+    expect(cancelledIssue?.status).toBe("cancelled");
+    expect(cancelledIssue?.executionRunId).toBeNull();
+    expect(cancelledIssue?.checkoutRunId).toBeNull();
+    // Still assigned to the routine's agent; the next fire regenerates the work.
+    expect(cancelledIssue?.assigneeAgentId).toBe(agentId);
+
+    // No zombie signature: empty first-class blockers, no nested stranded-recovery issue.
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    const nestedRecoveries = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(nestedRecoveries).toHaveLength(0);
+
+    const comments = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.length > 0 ? rows : null;
+    });
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("cancelled it instead of parking it as `blocked`");
+    expect(comments[0]?.body).toContain("Origin kind: `routine_execution`");
+  });
+
   it("blocks failed recovery work in place during immediate terminal-run cleanup", async () => {
     const sourceIssueId = randomUUID();
     const { companyId, agentId, runId, issueId } = await seedRunFixture({

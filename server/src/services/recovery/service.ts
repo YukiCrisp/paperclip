@@ -2617,6 +2617,87 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  function buildStrandedRoutineExecutionCancelComment(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: "todo" | "in_progress";
+    latestRun: LatestIssueRun;
+    prefix: string;
+  }) {
+    const runLink = input.latestRun
+      ? runUiLink({ id: input.latestRun.id, agentId: input.latestRun.agentId }, input.prefix)
+      : "none";
+    const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "none";
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+
+    return [
+      "Paperclip exhausted automatic recovery for a routine-execution issue and cancelled it instead of parking it as `blocked`.",
+      "",
+      "Routine-execution issues are disposable by design: the routine's next scheduled fire regenerates the work. Parking a dead one as `blocked` (with no live execution path, no first-class blocker, and no invokable recovery owner) produces an unresumable zombie that accumulates in stalled-work triage. Cancelling is the correct terminal disposition — the next fire recreates a fresh execution issue.",
+      "",
+      `- Previous status: \`${input.previousStatus}\``,
+      `- Latest run: ${runLink}`,
+      `- Latest run status: \`${input.latestRun?.status ?? "unknown"}\``,
+      `- Retry reason: \`${retryReason}\``,
+      failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
+      "- Origin kind: `routine_execution`",
+      "",
+      "Next action: none required. If the routine itself is unhealthy (repeated dead fires), inspect the routine definition and its recent runs.",
+    ].join("\n");
+  }
+
+  // Routine-execution issues (originKind === "routine_execution") are recreated by
+  // the routine's next scheduled fire, so a dead one has nothing to recover. Parking
+  // it as `blocked` leaves an unresumable zombie: no live run, empty blockedByIssueIds,
+  // and — when no manager/creator/executive/assignee is invokable-with-budget — no
+  // recovery-owner wake either. Those pollute the CEO-pulse P1 stalled-work heuristic
+  // (blocked + empty blockedBy) and never self-heal. Cancelling is the correct terminal
+  // disposition; the routine re-fires on schedule. (ENGA-1610 / ENGA-1612 diagnosis.)
+  async function cancelStrandedRoutineExecutionIssue(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: "todo" | "in_progress";
+    latestRun: LatestIssueRun;
+  }) {
+    const updated = await issuesSvc.update(input.issue.id, { status: "cancelled" });
+    if (!updated) return null;
+
+    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
+    await issuesSvc.addComment(
+      input.issue.id,
+      buildStrandedRoutineExecutionCancelComment({
+        issue: input.issue,
+        previousStatus: input.previousStatus,
+        latestRun: input.latestRun,
+        prefix,
+      }),
+      {},
+      { authorType: "system" },
+    );
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "cancelled",
+        previousStatus: input.previousStatus,
+        source: "recovery.reconcile_stranded_routine_execution",
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunStatus: input.latestRun?.status ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        originKind: input.issue.originKind,
+        originId: input.issue.originId,
+      },
+    });
+
+    return updated;
+  }
+
   async function existingBlockerIssueIds(companyId: string, issueId: string) {
     return db
       .select({ blockerIssueId: issueRelations.issueId })
@@ -2726,6 +2807,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
+        issue: input.issue,
+        previousStatus: input.previousStatus,
+        latestRun: input.latestRun,
+      });
+    }
+
+    // Recovery is exhausted at this point (immediate-block conditions met, or the
+    // reconcile sweep ran out of retry/continuation options). For a routine-execution
+    // issue there is nothing to recover — the next scheduled fire regenerates the work —
+    // so cancel it rather than leaving a blocked zombie. See cancelStrandedRoutineExecutionIssue.
+    if (input.issue.originKind === "routine_execution") {
+      return cancelStrandedRoutineExecutionIssue({
         issue: input.issue,
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
