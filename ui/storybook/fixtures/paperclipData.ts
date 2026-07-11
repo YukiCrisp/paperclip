@@ -1297,6 +1297,13 @@ export const storybookDashboardSummary: DashboardSummary = {
     { date: "2026-04-19", succeeded: 5, failed: 0, other: 1, total: 6 },
     { date: "2026-04-20", succeeded: 4, failed: 0, other: 2, total: 6 },
   ],
+  authFailureAlert: {
+    consecutiveFailures: 0,
+    threshold: 3,
+    triggered: false,
+    latestFailureAt: null,
+    errorCode: null,
+  },
 };
 
 export const storybookLiveRuns: LiveRunForIssue[] = [
