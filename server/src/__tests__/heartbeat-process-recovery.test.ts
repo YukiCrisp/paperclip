@@ -1238,6 +1238,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       triggerDetail: "system",
       status: "queued",
       wakeupRequestId,
+      // Upstream now requires a resolvable responsible user at dispatch
+      // (resolveResponsibleUserIdForRun); match the fixture pattern used by the
+      // other run inserts in this file so claimQueuedRun can proceed.
+      responsibleUserId: "responsible-user",
       contextSnapshot: input.includeIssueId
         ? { issueId, taskId: issueId, wakeReason: "issue_assigned" }
         : {},
@@ -1523,6 +1527,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {
     const { companyId, agentId } = await seedIdleTimerAgentFixture();
     const heartbeat = heartbeatService(db);
+
+    // Isolate this assertion to THIS wakeup: clear any adapter calls that leaked
+    // from a prior test's still-settling background run (the merge interleaves
+    // adapter-dispatching tests ahead of this one). Matches the mockClear idiom
+    // used elsewhere in this file for `not.toHaveBeenCalled()` assertions.
+    mockAdapterExecute.mockClear();
 
     const run = await heartbeat.wakeup(agentId, {
       source: "timer",
