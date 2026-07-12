@@ -2881,7 +2881,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   function buildStrandedRoutineExecutionCancelComment(input: {
     issue: typeof issues.$inferSelect;
-    previousStatus: "todo" | "in_progress";
+    previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
     prefix: string;
   }) {
@@ -2916,7 +2916,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // disposition; the routine re-fires on schedule. (ENGA-1610 / ENGA-1612 diagnosis.)
   async function cancelStrandedRoutineExecutionIssue(input: {
     issue: typeof issues.$inferSelect;
-    previousStatus: "todo" | "in_progress";
+    previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
     const updated = await issuesSvc.update(input.issue.id, { status: "cancelled" });
