@@ -1402,7 +1402,17 @@ describe("claude execute", () => {
         onLog: async () => {},
       });
 
-      expect(result.exitCode).toBe(1);
+      // Local hardening (b62783dc1), preserved over upstream in the ENGA-1831
+      // merge: a subtype=success result that exits nonzero after the
+      // terminalResultCleanup SIGTERM is authoritative-success. The adapter masks
+      // the top-level exitCode to 0 (and signal to null) so the heartbeat — which
+      // keys success on `exitCode === 0 && !errorMessage` — classifies the run as
+      // succeeded instead of failed, while the real exit is preserved under
+      // resultJson.processExitCode. Upstream returns the raw exit (1) and lets the
+      // heartbeat mark such runs failed; this merge keeps the local behavior.
+      expect(result.exitCode).toBe(0);
+      expect(result.signal).toBeNull();
+      expect((result.resultJson as Record<string, unknown>).processExitCode).toBe(1);
       expect(result.errorMessage).toBeNull();
       expect(result.errorCode).toBeNull();
       expect(result.summary).toBe("Implemented the requested change.");
