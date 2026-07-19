@@ -232,6 +232,71 @@ export function nextCronTickInTimeZone(expression: string, timeZone: string, aft
   return null;
 }
 
+// Scheduled triggers overwhelmingly land on minute :00, so a stack of routines
+// firing on the same cron slot all wake in the same 60s window and produce an
+// instantaneous concurrency spike (contributed to the 07-14 process_lost
+// incident, ENGA-2148/2157). We spread same-slot triggers by adding a
+// deterministic per-trigger sub-slot offset (a "splay") to the computed tick.
+//
+// The offset MUST be deterministic per trigger (never per-fire random): a
+// non-deterministic nextRunAt would break coalesce_if_active / dispatch
+// fingerprinting / catch-up, all of which assume a stable cron-derived instant.
+// The same trigger therefore always fires at the same sub-slot offset, while
+// triggers sharing a cron slot scatter across the window.
+const DEFAULT_ROUTINE_TRIGGER_JITTER_WINDOW_SEC = 900; // 15 minutes
+
+export const ROUTINE_TRIGGER_JITTER_WINDOW_SEC: number = (() => {
+  const raw = process.env.PAPERCLIP_ROUTINE_TRIGGER_JITTER_WINDOW_SEC;
+  if (raw == null || raw.trim() === "") return DEFAULT_ROUTINE_TRIGGER_JITTER_WINDOW_SEC;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ROUTINE_TRIGGER_JITTER_WINDOW_SEC;
+  return Math.floor(parsed);
+})();
+
+// Deterministic offset in [0, jitterWindowSec) derived from the trigger id via
+// FNV-1a. Pure integer math so it is stable across processes and node versions.
+export function triggerSplayOffsetSeconds(triggerId: string, jitterWindowSec: number): number {
+  if (!triggerId || !Number.isFinite(jitterWindowSec)) return 0;
+  const window = Math.floor(jitterWindowSec);
+  if (window <= 0) return 0;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < triggerId.length; i += 1) {
+    hash ^= triggerId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) % window;
+}
+
+// Compute the next fire instant for a scheduled trigger: the clean cron tick
+// plus this trigger's deterministic splay. The effective window is clamped
+// below the gap to the following tick so the splay can never reach (let alone
+// pass) the next slot — this keeps sparse crons correct and stays safe even for
+// pathological per-minute expressions.
+export function nextScheduledRunAt(params: {
+  cronExpression: string;
+  timeZone: string;
+  after: Date;
+  triggerId: string | null | undefined;
+  jitterWindowSec?: number;
+}): Date | null {
+  const { cronExpression, timeZone, after, triggerId } = params;
+  const jitterWindowSec = params.jitterWindowSec ?? ROUTINE_TRIGGER_JITTER_WINDOW_SEC;
+  const baseTick = nextCronTickInTimeZone(cronExpression, timeZone, after);
+  if (!baseTick) return null;
+  if (!triggerId || jitterWindowSec <= 0) return baseTick;
+
+  let effectiveWindow = Math.floor(jitterWindowSec);
+  const followingTick = nextCronTickInTimeZone(cronExpression, timeZone, baseTick);
+  if (followingTick) {
+    const gapSec = Math.floor((followingTick.getTime() - baseTick.getTime()) / 1000);
+    effectiveWindow = Math.min(effectiveWindow, Math.max(0, gapSec - 1));
+  }
+
+  const offsetSec = triggerSplayOffsetSeconds(triggerId, effectiveWindow);
+  if (offsetSec <= 0) return baseTick;
+  return new Date(baseTick.getTime() + offsetSec * 1000);
+}
+
 function nextResultText(status: string, issueId?: string | null) {
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
   if (status === "coalesced") return "Coalesced into an existing live execution issue";
@@ -1595,7 +1660,12 @@ export function routineService(
         .returning();
 
       const nextRunAt = input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
-        ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
+        ? nextScheduledRunAt({
+            cronExpression: input.trigger.cronExpression,
+            timeZone: input.trigger.timezone,
+            after: triggeredAt,
+            triggerId: input.trigger.id,
+          })
         : undefined;
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
@@ -2155,6 +2225,10 @@ export function routineService(
       let secretId: string | null = null;
       let publicId: string | null = null;
       let nextRunAt: Date | null = null;
+      // Generate the id up front so the seed nextRunAt is already splayed on the
+      // initial write (otherwise a new :00 trigger would fire unsplayed once
+      // before the claim loop re-splays it — see nextScheduledRunAt).
+      const triggerId = crypto.randomUUID();
 
       if (input.kind === "schedule") {
         assertScheduleCompatibleVariables(routine.variables ?? []);
@@ -2162,7 +2236,12 @@ export function routineService(
         assertTimeZone(timeZone);
         const error = validateCron(input.cronExpression);
         if (error) throw unprocessable(error);
-        nextRunAt = nextCronTickInTimeZone(input.cronExpression, timeZone, new Date());
+        nextRunAt = nextScheduledRunAt({
+          cronExpression: input.cronExpression,
+          timeZone,
+          after: new Date(),
+          triggerId,
+        });
       }
 
       if (input.kind === "webhook") {
@@ -2181,6 +2260,7 @@ export function routineService(
         const [createdTrigger] = await txDb
           .insert(routineTriggers)
           .values({
+            id: triggerId,
             companyId: routine.companyId,
             routineId: routine.id,
             kind: input.kind,
@@ -2241,7 +2321,12 @@ export function routineService(
           timezone = patch.timezone;
         }
         if (cronExpression && timezone) {
-          nextRunAt = nextCronTickInTimeZone(cronExpression, timezone, new Date());
+          nextRunAt = nextScheduledRunAt({
+            cronExpression,
+            timeZone: timezone,
+            after: new Date(),
+            triggerId: id,
+          });
         }
         if ((patch.enabled ?? existing.enabled) === true) {
           assertScheduleCompatibleVariables(routine.variables ?? []);
@@ -2488,7 +2573,12 @@ export function routineService(
           const webhookSecret = recreatedWebhookSecrets.get(triggerSnapshot.id);
           const restoredNextRunAt = triggerSnapshot.kind === "schedule" && triggerSnapshot.enabled
             && triggerSnapshot.cronExpression && triggerSnapshot.timezone
-            ? nextCronTickInTimeZone(triggerSnapshot.cronExpression, triggerSnapshot.timezone, now)
+            ? nextScheduledRunAt({
+                cronExpression: triggerSnapshot.cronExpression,
+                timeZone: triggerSnapshot.timezone,
+                after: now,
+                triggerId: triggerSnapshot.id,
+              })
             : null;
           const baseValues = {
             companyId: locked.companyId,
@@ -2808,14 +2898,24 @@ export function routineService(
         const worktreeSuppressed = !automaticEligibility.eligible;
 
         let runCount = 1;
-        let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+        let claimedNextRunAt = nextScheduledRunAt({
+          cronExpression: row.trigger.cronExpression,
+          timeZone: row.trigger.timezone,
+          after: now,
+          triggerId: row.trigger.id,
+        });
 
         if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           let cursor: Date | null = row.trigger.nextRunAt;
           runCount = 0;
           while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
             runCount += 1;
-            claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
+            claimedNextRunAt = nextScheduledRunAt({
+              cronExpression: row.trigger.cronExpression,
+              timeZone: row.trigger.timezone,
+              after: cursor,
+              triggerId: row.trigger.id,
+            });
             cursor = claimedNextRunAt;
           }
         }
