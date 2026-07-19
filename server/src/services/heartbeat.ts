@@ -99,6 +99,14 @@ import {
   classifyRunLiveness,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
+import {
+  computeHostBoundedRunSlots,
+  probeHostMemoryPressure as defaultProbeHostMemoryPressure,
+  resolveHostConcurrencyCap,
+  resolveHostMemoryPressureConfig,
+  type HostMemoryPressureResult,
+  type ProbeHostMemoryPressure,
+} from "./host-memory-pressure.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
@@ -495,7 +503,13 @@ function isSpawnLikeFailureMessage(value: unknown) {
 function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
-  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE || run.errorCode === "process_lost") {
+  if (
+    run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE ||
+    run.errorCode === "process_lost" ||
+    // ENGA-2152: host_resource_pressure is a reclassified process loss and stays
+    // in the same retryable-infrastructure class as process_lost.
+    run.errorCode === "host_resource_pressure"
+  ) {
     return true;
   }
 
@@ -5061,6 +5075,8 @@ export interface HeartbeatServiceOptions {
   /** ENGA-616 wake-reason -> model-profile lever; empty/omitted = lever off. */
   routineModelProfileMap?: Partial<Record<string, ModelProfileKey>>;
   runtimeEnv?: Record<string, string | undefined>;
+  /** ENGA-2152 test seam: override host memory-pressure measurement. */
+  probeHostMemoryPressure?: ProbeHostMemoryPressure;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -5090,6 +5106,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
   const runtimeEnv = options.runtimeEnv ?? process.env;
+  // ENGA-2152 host-wide run governance. Both levers are OFF unless the operator
+  // opts in via env, so merging this is inert until a (gated) deploy enables it.
+  //   - hostConcurrencyCap: bounds total tracked local child-process runs across
+  //     ALL agents (per-agent maxConcurrentRuns can otherwise oversubscribe RAM).
+  //   - hostMemoryPressureConfig.gateEnabled: defer starting queued runs while the
+  //     host is under memory pressure. Thresholds always have defaults so the
+  //     probe stays meaningful for loss reclassification even when the gate is off.
+  const hostConcurrencyCap = resolveHostConcurrencyCap(runtimeEnv);
+  const hostMemoryPressureConfig = resolveHostMemoryPressureConfig(runtimeEnv);
+  const probeHostMemoryPressure = options.probeHostMemoryPressure ?? defaultProbeHostMemoryPressure;
   const inWorktreeRuntime = isTruthyRuntimeEnvValue(runtimeEnv.PAPERCLIP_IN_WORKTREE);
   // Preview worktree instances suppress the run engine by default. Users can lift
   // that per-worktree via the `enableWorktreeRunExecution` experimental setting
@@ -9993,6 +10019,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // ENGA-2152: host-global running count for the concurrency cap. Only
+  // tracked local child-process adapters spawn a local child that consumes host
+  // RAM, so only those count toward the host budget; cloud/remote adapters are
+  // excluded. Grouped by adapterType so the tracked-adapter predicate stays the
+  // single source of truth.
+  async function countRunningLocalChildRunsForHost() {
+    const rows = await db
+      .select({ adapterType: agents.adapterType, count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.status, "running"))
+      .groupBy(agents.adapterType);
+    let total = 0;
+    for (const row of rows) {
+      if (isTrackedLocalChildProcessAdapter(row.adapterType)) total += Number(row.count ?? 0);
+    }
+    return total;
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -10790,7 +10835,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const { run, adapterType, adapterConfig, now, descendantOnlyCleanup } = input;
     const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
     const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-    const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+
+    // ENGA-2152: the null-pid / null-pgid branch is the ambiguous
+    // "server may have restarted" fallback that masked memory-pressure losses on
+    // 2026-07-14. When both ids are null, probe host memory (best-effort) so we
+    // can attach a diagnostic snapshot and, if the host is genuinely pressured,
+    // reclassify the loss as host_resource_pressure instead of the misleading
+    // restart message. Independent of the pressure gate — diagnostic even when
+    // the gate is off. shouldRetry is always false on this branch (it requires a
+    // non-null pid/pgid), so this never collides with the retry-once path.
+    const bothProcessIdsNull = !run.processPid && !run.processGroupId;
+    let resourcePressure: HostMemoryPressureResult | null = null;
+    if (bothProcessIdsNull) {
+      try {
+        resourcePressure = await probeHostMemoryPressure(hostMemoryPressureConfig.thresholds);
+      } catch {
+        resourcePressure = null;
+      }
+    }
+    const reclassifyAsResourcePressure = Boolean(resourcePressure?.underPressure);
+    const lossErrorCode = reclassifyAsResourcePressure ? "host_resource_pressure" : "process_lost";
+    const baseMessage = reclassifyAsResourcePressure
+      ? `Process lost -- host under memory pressure (${resourcePressure?.reason})`
+      : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
     // (upstream) When we only stopped orphaned descendants, record structured
     // unmanaged-background-task evidence so the run resultJson reflects the
     // process-group cleanup rather than looking like a clean process loss.
@@ -10807,7 +10874,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let finalizedRun = await setRunStatus(run.id, "failed", {
       error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-      errorCode: "process_lost",
+      errorCode: lossErrorCode,
       finishedAt: now,
       resultJson: (() => {
         const result = mergeRunStopMetadataForAgent(
@@ -10815,17 +10882,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "failed",
           {
             resultJson: parseObject(run.resultJson),
-            errorCode: "process_lost",
+            errorCode: lossErrorCode,
             errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
           },
         );
-        return unmanagedBackgroundTaskEvidence
+        const withEvidence = unmanagedBackgroundTaskEvidence
           ? {
             ...result,
             stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
             unmanagedBackgroundTask: unmanagedBackgroundTaskEvidence,
           }
           : result;
+        // ENGA-2152: attach the host-memory snapshot for post-hoc diagnosis of
+        // resource-pressure losses (only when a real measurement was taken).
+        return resourcePressure && resourcePressure.snapshot.source !== "unavailable"
+          ? {
+            ...withEvidence,
+            hostMemorySnapshot: resourcePressure.snapshot,
+            hostMemoryPressure: {
+              underPressure: resourcePressure.underPressure,
+              reason: resourcePressure.reason,
+            },
+          }
+          : withEvidence;
       })(),
     });
     await setWakeupStatus(run.wakeupRequestId, "failed", {
@@ -11161,7 +11240,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      const perAgentSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      // ENGA-2152: bound per-agent slots by the remaining host-global budget so
+      // N agents cannot collectively oversubscribe host RAM. Disabled (cap null)
+      // by default -> per-agent behavior unchanged. Only query the host count
+      // when the cap is active and this agent actually has a free slot.
+      let availableSlots = perAgentSlots;
+      if (hostConcurrencyCap != null && perAgentSlots > 0) {
+        const hostRunningCount = await countRunningLocalChildRunsForHost();
+        availableSlots = computeHostBoundedRunSlots({
+          perAgentSlots,
+          hostCap: hostConcurrencyCap,
+          hostRunningCount,
+        });
+        if (availableSlots < perAgentSlots) {
+          logger.info(
+            { agentId, perAgentSlots, availableSlots, hostRunningCount, hostConcurrencyCap },
+            "host concurrency cap reduced available run slots",
+          );
+        }
+      }
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
@@ -11174,6 +11272,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ))
         .orderBy(asc(heartbeatRuns.createdAt));
       if (queuedRuns.length === 0) return [];
+
+      // ENGA-2152: when the host is under memory pressure, defer starting queued
+      // runs (including process_lost retries, which enqueue as queued runs) until
+      // the pressure eases. Returning [] leaves the runs queued; the periodic
+      // resumeQueuedRuns pass re-drives this agent, giving natural backoff and
+      // breaking the retry-storm-into-a-thrashing-host cycle. Opt-in via env; a
+      // failed/unavailable probe fails open (never blocks).
+      if (hostMemoryPressureConfig.gateEnabled) {
+        const pressure = await probeHostMemoryPressure(hostMemoryPressureConfig.thresholds);
+        if (pressure.underPressure) {
+          logger.warn(
+            {
+              agentId,
+              reason: pressure.reason,
+              queuedRunCount: queuedRuns.length,
+              availableRatio: pressure.snapshot.availableRatio,
+              swapUsedBytes: pressure.snapshot.swapUsedBytes,
+            },
+            "deferring queued run start: host under memory pressure",
+          );
+          return [];
+        }
+      }
 
       // Double-launch guard (ENGA-505): if this agent still has a live detached
       // survivor from a previous server lifetime, defer all new starts until it
