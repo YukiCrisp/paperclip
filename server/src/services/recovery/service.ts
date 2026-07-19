@@ -237,6 +237,36 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(latestRun.status);
 }
 
+// Provider usage-limit (quota) failures are transient capacity waits — the provider
+// states that capacity resets at a later time — so the correct recovery is to keep the
+// original assignee and retry after the reset, never to cancel/escalate the work as
+// stranded. (ENGA-2149 / ENGA-2177: minimal fork backport of upstream #9634/#9635,
+// which route recovery by failure cause and wait for provider quota resets. The old
+// base cancels routine_execution issues and escalates assigned ones without inspecting
+// the failure family, losing work that would have succeeded once capacity reset.)
+const PROVIDER_QUOTA_PARK_DEFAULT_BACKOFF_MS = 15 * 60_000;
+
+function isProviderQuotaFailureRun(latestRun: LatestIssueRun): boolean {
+  if (!latestRun) return false;
+  if (latestRun.errorCode === "provider_quota") return true;
+  return readNonEmptyString(parseObject(latestRun.resultJson).errorFamily) === "provider_quota";
+}
+
+// The provider's reset time, if the run recorded one. Adapters persist it under any of
+// these result-json keys; `providerQuotaRetryNotBefore` is the quota-specific one.
+function readProviderQuotaRetryNotBefore(latestRun: LatestIssueRun): Date | null {
+  const resultJson = parseObject(latestRun?.resultJson);
+  const value =
+    resultJson.providerQuotaRetryNotBefore ??
+    resultJson.retryNotBefore ??
+    resultJson.transientRetryNotBefore;
+  if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) {
+    return null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
@@ -3081,6 +3111,85 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  // Park a stranded issue that failed on a provider usage-limit (quota) failure instead
+  // of cancelling (routine_execution) or escalating (assigned) it. Quota is a transient
+  // capacity wait, not a stranded-work signal: the original assignee should retry once
+  // capacity resets. Preserve the in_progress/in_review status and assignee, and schedule
+  // a bare issue monitor at the provider's reset time (or a bounded default backoff). The
+  // due-monitor tick (`tickDueIssueMonitors`) wakes the assignee at that time; a bare
+  // monitor with no execution policy is enough — its dispatch only requires an assignee
+  // and `monitorNextCheckAt`. `reconcileStrandedAssignedIssues` treats a pending future
+  // monitor + provider-quota latest run as a live recovery path and skips it while it
+  // waits, so it is not re-parked on every sweep. Idempotent: a re-entry while already
+  // parked refreshes the monitor without re-notifying.
+  // (ENGA-2149 / ENGA-2177: minimal fork backport of upstream #9634/#9635.)
+  async function parkProviderQuotaStrandedIssue(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: StrandedPreviousStatus;
+    latestRun: LatestIssueRun;
+    now: Date;
+  }) {
+    const resetAt = readProviderQuotaRetryNotBefore(input.latestRun);
+    const monitorNextCheckAt =
+      resetAt && resetAt.getTime() > input.now.getTime()
+        ? resetAt
+        : new Date(input.now.getTime() + PROVIDER_QUOTA_PARK_DEFAULT_BACKOFF_MS);
+
+    const alreadyParked = Boolean(
+      input.issue.monitorNextCheckAt &&
+        input.issue.monitorNextCheckAt.getTime() > input.now.getTime(),
+    );
+
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt,
+        monitorWakeRequestedAt: null,
+        updatedAt: input.now,
+      })
+      .where(eq(issues.id, input.issue.id));
+
+    if (!alreadyParked) {
+      const resetCopy = resetAt
+        ? ` The provider reported capacity resets around ${monitorNextCheckAt.toISOString()}.`
+        : ` It will retry after a short backoff (around ${monitorNextCheckAt.toISOString()}).`;
+      await issuesSvc.addComment(
+        input.issue.id,
+        "Paperclip paused this task because its run hit a provider usage limit (quota). " +
+          "Rather than cancelling or escalating it, Paperclip kept it assigned to the same agent " +
+          "and scheduled an automatic retry once capacity resets — there's nothing you need to do." +
+          resetCopy,
+        {},
+        { authorType: "system" },
+      );
+
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: input.previousStatus,
+          previousStatus: input.previousStatus,
+          source: "recovery.reconcile_provider_quota_wait",
+          monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          originKind: input.issue.originKind,
+          originId: input.issue.originId,
+        },
+      });
+    }
+
+    return { ...input.issue, monitorNextCheckAt, monitorWakeRequestedAt: null };
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3095,6 +3204,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issue: input.issue,
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
+      });
+    }
+
+    // Provider usage-limit (quota) failures are transient capacity waits, not stranded
+    // work. Park the issue for the original assignee and let the monitor retry it after
+    // the reset instead of cancelling (routine_execution) or escalating (assigned) it.
+    // Only park while in_progress/in_review, since the due-monitor tick requires those
+    // statuses; a todo falls through to the existing disposition. (ENGA-2149 — #9634/#9635.)
+    if (
+      (input.previousStatus === "in_progress" || input.previousStatus === "in_review") &&
+      isProviderQuotaFailureRun(input.latestRun)
+    ) {
+      return parkProviderQuotaStrandedIssue({
+        issue: input.issue,
+        previousStatus: input.previousStatus,
+        latestRun: input.latestRun,
+        now: new Date(),
       });
     }
 
@@ -3269,6 +3395,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    const now = new Date();
     const candidates = await db
       .select()
       .from(issues)
@@ -3347,6 +3474,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+        result.skipped += 1;
+        continue;
+      }
+      // A provider-quota park (bare monitor scheduled for the assignee at the reset time)
+      // is a live recovery path, not a stranded issue — `tickDueIssueMonitors` owns the
+      // retry. Skip it so the sweep does not re-park or escalate it while it waits.
+      // (ENGA-2149 / ENGA-2177 — #9634/#9635.)
+      if (
+        issue.monitorNextCheckAt &&
+        issue.monitorNextCheckAt.getTime() > now.getTime() &&
+        isProviderQuotaFailureRun(latestRun)
+      ) {
         result.skipped += 1;
         continue;
       }
