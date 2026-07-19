@@ -2048,6 +2048,100 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Origin kind: `routine_execution`");
   });
 
+  it("parks a routine-execution issue on provider_quota instead of cancelling it, and schedules an assignee monitor at the reset time (ENGA-2149 / ENGA-2177)", async () => {
+    // The reset time the provider reported; must be in the real future so the park uses
+    // it rather than the bounded default backoff (the sweep/park read real wall-clock).
+    const resetAt = new Date(Date.now() + 90 * 60 * 1000);
+    const providerQuotaResult = { providerQuotaRetryNotBefore: resetAt.toISOString() };
+
+    // A stranded in_progress routine-execution issue whose continuation retry failed on a
+    // provider usage-limit (quota) failure. Without the backport this cancels the issue.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "provider_quota",
+      runError: "Provider usage limit reached; try again at 12:00 AM (UTC)",
+      resultJson: providerQuotaResult,
+    });
+    await db
+      .update(issues)
+      .set({ originKind: "routine_execution", originId: randomUUID() })
+      .where(eq(issues.id, issueId));
+
+    // Exhaust the transient retry budget: provider_quota classifies as transient_infra
+    // (maxAttempts=3), so escalation (→ park) is only reached once 3 consecutive
+    // continuation retries have failed with the same cause.
+    for (let i = 0; i < 2; i += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+        },
+        errorCode: "provider_quota",
+        error: "Provider usage limit reached; try again at 12:00 AM (UTC)",
+        resultJson: providerQuotaResult,
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.issueIds).toContain(issueId);
+
+    // Parked, NOT cancelled and NOT blocked: status and assignee preserved, and a bare
+    // monitor is scheduled at the provider's reset time for tickDueIssueMonitors to wake.
+    const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_progress");
+    expect(parked?.assigneeAgentId).toBe(agentId);
+    expect(parked?.monitorNextCheckAt).not.toBeNull();
+    expect(Math.abs((parked?.monitorNextCheckAt?.getTime() ?? 0) - resetAt.getTime())).toBeLessThan(1000);
+    expect(parked?.monitorWakeRequestedAt).toBeNull();
+
+    // No terminal cancel and no zombie recovery issue.
+    expect(parked?.status).not.toBe("cancelled");
+    const nestedRecoveries = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(nestedRecoveries).toHaveLength(0);
+
+    // A single plain-language system comment explains the pause + automatic retry.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("provider usage limit");
+    expect(comments[0]?.body).toContain("automatic retry once capacity resets");
+
+    // Activity log records the quota-wait disposition.
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(
+      activity.some(
+        (event) =>
+          event.action === "issue.updated" &&
+          (event.details as { source?: string } | null)?.source === "recovery.reconcile_provider_quota_wait",
+      ),
+    ).toBe(true);
+
+    // Idempotent: a second sweep treats the pending monitor as a live recovery path and
+    // skips it — no re-park, no duplicate comment, monitor unchanged.
+    const firstMonitorAt = parked?.monitorNextCheckAt?.getTime();
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.issueIds).not.toContain(issueId);
+    const reparked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(reparked?.status).toBe("in_progress");
+    expect(reparked?.monitorNextCheckAt?.getTime()).toBe(firstMonitorAt);
+    const commentsAfter = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(commentsAfter).toHaveLength(1);
+  });
+
   it("blocks failed recovery work in place during immediate terminal-run cleanup", async () => {
     const sourceIssueId = randomUUID();
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
