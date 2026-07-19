@@ -90,7 +90,13 @@ export function inferHeartbeatRunStopReason(input: {
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";
   if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
-  if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
+  // ENGA-2152: host_resource_pressure is a finer attribution of a process loss
+  // (host memory pressure rather than an ambiguous "server may have restarted").
+  // It shares the process_lost stop-reason category so dashboards and retry
+  // classification treat it identically; only the errorCode differs.
+  if (input.outcome === "failed" && (input.errorCode === "process_lost" || input.errorCode === "host_resource_pressure")) {
+    return "process_lost";
+  }
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();
     if (message.includes("budget")) return "budget_paused";
