@@ -295,6 +295,18 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
+
+// When an issue is parked waiting on review, every re-enqueued interaction-continuation
+// recovery run is immediately cancelled as a no-op by the queued-run staleness gate
+// (errorCode below). That cancel never counts as "a successful run since the interaction
+// resolved", so without a cap the reconciliation sweep re-enqueues the same
+// (issue, interaction) on every tick, and the `retry_of_run_id` chain self-propagates into
+// a flood of cancelled-never-started runs that starve the host. Stop re-scheduling once this
+// many consecutive no-op cancels have accrued with no change in disposition. This is not a
+// dead end: the assignee re-wakes naturally when the review disposition changes (a reviewer
+// comment or a status transition), which does not depend on this recovery loop.
+const INTERACTION_CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE = "issue_continuation_waiting_on_review";
+const INTERACTION_CONTINUATION_NOOP_CANCEL_CAP = 3;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 // Worktree-swap backoff: base 5 min, exponential. With 4 attempts the retries
 // land at +5, +15, +35 min cumulative before escalating — so the last retry
@@ -3529,6 +3541,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+
+          // Loop cap: if the last N continuation runs were all cancelled as the same
+          // no-op waiting-on-review stale gate, the issue's disposition has not moved
+          // and re-enqueuing will only produce another immediate no-op cancel. Stop the
+          // self-propagating retry chain here (see the constant above) rather than
+          // re-scheduling every sweep.
+          const noopCancelStreak = await summarizeRecentContinuationRetries(
+            issue.companyId,
+            issue.id,
+            INTERACTION_CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE,
+          );
+          if (noopCancelStreak.consecutive >= INTERACTION_CONTINUATION_NOOP_CANCEL_CAP) {
             result.skipped += 1;
             continue;
           }

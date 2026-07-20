@@ -4752,6 +4752,133 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  // Regression: the interaction-continuation recovery must not re-enqueue forever when
+  // every run it schedules is immediately cancelled as a no-op waiting-on-review stale
+  // gate. Below the cap it still re-enqueues; at/after the cap it stops so the
+  // `retry_of_run_id` chain cannot self-propagate into a flood of cancelled runs.
+  async function seedWaitingOnReviewInteraction(opts: { noopCancelCount: number }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    const resolvedAt = new Date("2026-03-19T00:05:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Accepted plan parked waiting on review",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: { version: 1, prompt: "Approve the plan?" },
+      result: { outcome: "accepted" },
+    });
+
+    // Prior no-op cancels: each is a continuation run the recovery loop enqueued that the
+    // queued-run staleness gate immediately cancelled because the issue is parked waiting
+    // on review. They form the contiguous streak the cap counts.
+    for (let i = 0; i < opts.noopCancelCount; i += 1) {
+      const at = new Date(resolvedAt.getTime() + (i + 1) * 60_000);
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "cancelled",
+        errorCode: "issue_continuation_waiting_on_review",
+        error: "Cancelled because the continuation summary says the executor should wait for review",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.interaction_continuation_recovery",
+          interactionId,
+        },
+        finishedAt: at,
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+
+    return { companyId, agentId, issueId, interactionId };
+  }
+
+  it("still re-enqueues an accepted interaction continuation below the no-op cancel cap", async () => {
+    const { agentId } = await seedWaitingOnReviewInteraction({ noopCancelCount: 2 });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(1);
+
+    // The two prior no-op cancels remain, plus exactly one freshly enqueued (non-cancelled)
+    // continuation run — the loop re-enqueues while still under the cap.
+    const recoveryRuns = await db
+      .select({ status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const continuationRuns = recoveryRuns.filter(
+      (row) => (row.contextSnapshot as Record<string, unknown> | null)?.source === "issue.interaction_continuation_recovery",
+    );
+    expect(continuationRuns).toHaveLength(3);
+    expect(continuationRuns.filter((row) => row.status !== "cancelled")).toHaveLength(1);
+  });
+
+  it("stops re-enqueuing an accepted interaction continuation at the no-op cancel cap", async () => {
+    const { agentId } = await seedWaitingOnReviewInteraction({ noopCancelCount: 3 });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+
+    // No new queued continuation run was created: the three prior cancelled runs remain
+    // the only continuation runs, so the loop is broken rather than self-propagating.
+    const recoveryRuns = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(recoveryRuns).toHaveLength(3);
+    expect(recoveryRuns.every((row) => row.status === "cancelled")).toBe(true);
+  });
+
   // Scenario 5: enqueue-failure at accept time is no longer a silent permanent
   // stall. When the accept-time continuation wake is dropped (routes/issues.ts fire-and-forget
   // enqueue swallowed the error), the issue is left in_review with an accepted interaction but
