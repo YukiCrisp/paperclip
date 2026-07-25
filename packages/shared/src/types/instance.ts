@@ -48,6 +48,7 @@ export interface InstanceExperimentalSettings {
   enableEnvironments: boolean;
   enableIsolatedWorkspaces: boolean;
   enableStreamlinedLeftNavigation: boolean;
+  enableApps: boolean;
   enablePipelines: boolean;
   enableCases: boolean;
   enableConferenceRoomChat: boolean;
@@ -56,7 +57,10 @@ export interface InstanceExperimentalSettings {
   enableExperimentalFileViewer: boolean;
   enableCloudSync: boolean;
   enableExternalObjects: boolean;
+  enableSmokeLab: boolean;
   enableBuiltInAgents: boolean;
+  enableSummaries: boolean;
+  enableStatusCards: boolean;
   enableDecisions: boolean;
   enableGoalsSidebarLink: boolean;
   enableServerInfoDebugView: boolean;
@@ -84,11 +88,39 @@ export interface InstanceExperimentalSettings {
   issueGraphLivenessAutoRecoveryLookbackHours: number;
 }
 
+/**
+ * Boolean feature-flag keys of the experimental settings — the only keys a
+ * cloud managed-config overlay may target. Server-managed bookkeeping fields
+ * (activation cutoffs, lookback hours) are excluded by construction.
+ */
+export type ManagedExperimentalFeatureKey = {
+  [K in keyof InstanceExperimentalSettings]-?: InstanceExperimentalSettings[K] extends boolean
+    ? K
+    : never;
+}[keyof InstanceExperimentalSettings];
+
+export const PAPERCLIP_CLOUD_MANAGED_BY = "paperclip-cloud" as const;
+
+/** Per-key metadata attached to settings responses for cloud-overlaid keys. */
+export interface ManagedSettingMetadata {
+  managed: true;
+  managedBy: typeof PAPERCLIP_CLOUD_MANAGED_BY;
+}
+
+/**
+ * Experimental settings as returned by the settings API. On cloud-managed
+ * instances (`PAPERCLIP_MANAGED_CONFIG` present) `managedKeys` lists every key
+ * whose value is overlaid by the harness; self-hosted responses omit it.
+ */
+export interface InstanceExperimentalSettingsWithManaged extends InstanceExperimentalSettings {
+  managedKeys?: Partial<Record<ManagedExperimentalFeatureKey, ManagedSettingMetadata>>;
+}
+
 export interface InstanceSettings {
   id: string;
   defaultEnvironmentId: string | null;
   general: InstanceGeneralSettings;
-  experimental: InstanceExperimentalSettings;
+  experimental: InstanceExperimentalSettingsWithManaged;
   createdAt: Date;
   updatedAt: Date;
 }
