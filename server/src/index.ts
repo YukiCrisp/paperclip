@@ -4,7 +4,8 @@
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -33,6 +34,11 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { resolveEmbeddedPostgresReuse } from "./lib/embedded-postgres-reuse.js";
+import {
+  commandLooksLikePostgres,
+  readPostmasterPidInfo,
+  type PostmasterPidInfo,
+} from "./lib/postmaster-pid-file.js";
 import { logger } from "./middleware/logger.js";
 import {
   getManagedInstanceConfig,
@@ -400,30 +406,54 @@ export async function startServer(): Promise<StartedServer> {
         return false;
       }
     };
-  
+    // Guards the SIGINT/SIGQUIT path against a recycled PID: a postmaster that
+    // died uncleanly leaves its pid file behind, and that PID is eventually
+    // handed to an unrelated program (ENGA-2447). `ps -o comm=` prints the
+    // executable name (a full path on macOS), which is enough to tell them apart.
+    const isPostgresProcess = (pid: number): boolean => {
+      try {
+        const command = execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        return commandLooksLikePostgres(command);
+      } catch {
+        // ps exits non-zero when the PID is gone, and can be missing entirely in
+        // a stripped container. Either way we have not identified a postmaster.
+        return false;
+      }
+    };
+    const normalizePath = (path: string): string => {
+      try {
+        return realpathSync(resolve(path));
+      } catch {
+        return resolve(path);
+      }
+    };
+
     // postmaster.pid line 1 is the PID and line 4 is the port the postmaster is
     // actually listening on. That port can differ from the configured one: when
     // 54329 is already taken, boot falls back to the next free port
     // (`selectedPort=54330` in server.log) and the postmaster owning this data
     // directory ends up there. Probing the configured port would then call a
     // healthy postmaster unreachable and eventually SIGQUIT it (ENGA-2446).
-    const readPostmasterPidInfo = (): { pid: number; port: number } | null => {
-      if (!existsSync(postmasterPidFile)) return null;
-      try {
-        const lines = readFileSync(postmasterPidFile, "utf8").split("\n");
-        const pid = Number(lines[0]?.trim());
-        if (!Number.isInteger(pid) || pid <= 0) return null;
-        if (!isPidRunning(pid)) return null;
-        const pidFilePort = Number(lines[3]?.trim());
-        // A pid file still being written has no port line yet; fall back to the
-        // configured port rather than failing the probe outright.
-        const port = Number.isInteger(pidFilePort) && pidFilePort > 0 ? pidFilePort : configuredPort;
-        return { pid, port };
-      } catch {
-        return null;
-      }
-    };
-    const getRunningPid = (): number | null => readPostmasterPidInfo()?.pid ?? null;
+    const readPidInfo = (): PostmasterPidInfo | null =>
+      readPostmasterPidInfo({
+        readPidFile: () => {
+          if (!existsSync(postmasterPidFile)) return null;
+          try {
+            return readFileSync(postmasterPidFile, "utf8");
+          } catch {
+            return null;
+          }
+        },
+        isPidRunning,
+        isPostgresProcess,
+        normalizePath,
+        expectedDataDir: dataDir,
+        fallbackPort: configuredPort,
+      });
+    const getRunningPid = (): number | null => readPidInfo()?.pid ?? null;
 
     // Set by isConnectable so a "reuse" decision talks to the port we just proved
     // healthy rather than to the configured one.
@@ -435,7 +465,7 @@ export async function startServer(): Promise<StartedServer> {
     const reuseDecision = await resolveEmbeddedPostgresReuse({
       getRunningPid,
       isConnectable: async () => {
-        const info = readPostmasterPidInfo();
+        const info = readPidInfo();
         if (info === null) return false;
         const reachableDataDir = await getPostgresDataDirectory(
           `postgres://paperclip:paperclip@127.0.0.1:${info.port}/postgres`,

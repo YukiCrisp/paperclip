@@ -8,6 +8,7 @@ import {
   resolveEmbeddedPostgresReuse,
   type EmbeddedPostgresReuseDeps,
 } from "../lib/embedded-postgres-reuse.js";
+import { readPostmasterPidInfo } from "../lib/postmaster-pid-file.js";
 
 function buildDeps(overrides: Partial<EmbeddedPostgresReuseDeps> = {}): EmbeddedPostgresReuseDeps {
   return {
@@ -123,6 +124,31 @@ describe("resolveEmbeddedPostgresReuse", () => {
       Math.ceil(EMBEDDED_POSTGRES_FAST_SHUTDOWN_WAIT_MS / EMBEDDED_POSTGRES_REUSE_POLL_INTERVAL_MS) +
       Math.ceil(EMBEDDED_POSTGRES_IMMEDIATE_SHUTDOWN_WAIT_MS / EMBEDDED_POSTGRES_REUSE_POLL_INTERVAL_MS);
     expect(vi.mocked(deps.sleep).mock.calls.length).toBe(totalPolls);
+  });
+
+  it("never signals a pid that the pid file cannot vouch for", async () => {
+    // ENGA-2447 end-to-end guard, with the real pid-file reader wired in as
+    // `getRunningPid`: an uncleanly killed postmaster left its pid file behind
+    // and the kernel handed pid 52795 to an unrelated program. kill(pid, 0)
+    // succeeds and the port in the file answers nothing, which is exactly the
+    // state that ends in SIGINT/SIGQUIT — so the identity check has to reject it
+    // before we get there. Make `isPostgresProcess` return true and this test
+    // goes red on `signal`.
+    const dataDir = "/Users/yuki/.paperclip/instances/default/db";
+    const recycledPid = () =>
+      readPostmasterPidInfo({
+        readPidFile: () => [52795, dataDir, 1785034846, 54329, "/tmp", "localhost", ""].join("\n"),
+        isPidRunning: () => true,
+        isPostgresProcess: () => false,
+        normalizePath: (path) => path,
+        expectedDataDir: dataDir,
+        fallbackPort: 54329,
+      })?.pid ?? null;
+
+    const deps = buildDeps({ getRunningPid: vi.fn(recycledPid) });
+    await expect(resolveEmbeddedPostgresReuse(deps)).resolves.toEqual({ action: "start-fresh" });
+    expect(deps.signal).not.toHaveBeenCalled();
+    expect(deps.sleep).not.toHaveBeenCalled();
   });
 
   it("ignores signal delivery failures (postmaster exited between poll and kill)", async () => {
