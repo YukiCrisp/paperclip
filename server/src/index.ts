@@ -5,7 +5,7 @@
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -33,6 +33,10 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import {
+  normalizeDataDirPath,
+  reachableDataDirMatches,
+} from "./lib/embedded-postgres-data-dir.js";
 import { resolveEmbeddedPostgresReuse } from "./lib/embedded-postgres-reuse.js";
 import {
   commandLooksLikePostgres,
@@ -423,13 +427,6 @@ export async function startServer(): Promise<StartedServer> {
         return false;
       }
     };
-    const normalizePath = (path: string): string => {
-      try {
-        return realpathSync(resolve(path));
-      } catch {
-        return resolve(path);
-      }
-    };
 
     // postmaster.pid line 1 is the PID and line 4 is the port the postmaster is
     // actually listening on. That port can differ from the configured one: when
@@ -449,7 +446,7 @@ export async function startServer(): Promise<StartedServer> {
         },
         isPidRunning,
         isPostgresProcess,
-        normalizePath,
+        normalizePath: normalizeDataDirPath,
         expectedDataDir: dataDir,
         fallbackPort: configuredPort,
       });
@@ -470,7 +467,10 @@ export async function startServer(): Promise<StartedServer> {
         const reachableDataDir = await getPostgresDataDirectory(
           `postgres://paperclip:paperclip@127.0.0.1:${info.port}/postgres`,
         );
-        const matches = typeof reachableDataDir === "string" && resolve(reachableDataDir) === resolve(dataDir);
+        // Symlink-resolving both sides: a mismatch here means "another cluster
+        // answered", which sends this postmaster down the SIGINT/SIGQUIT path
+        // (ENGA-2448).
+        const matches = reachableDataDirMatches(reachableDataDir, dataDir);
         reusablePort = matches ? info.port : null;
         return matches;
       },
@@ -487,10 +487,7 @@ export async function startServer(): Promise<StartedServer> {
       const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
       try {
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
-        if (
-          typeof actualDataDir !== "string" ||
-          resolve(actualDataDir) !== resolve(dataDir)
-        ) {
+        if (!reachableDataDirMatches(actualDataDir, dataDir)) {
           throw new Error("reachable postgres does not use the expected embedded data directory");
         }
         await ensurePostgresDatabase(configuredAdminConnectionString, "paperclip");
