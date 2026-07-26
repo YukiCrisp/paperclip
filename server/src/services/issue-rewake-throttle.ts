@@ -96,9 +96,8 @@ export const ISSUE_NEW_INPUT_ACTIVITY_ACTIONS: string[] = [
 ];
 
 /**
- * Error codes emitted by the dequeue-time staleness filter
- * (`evaluateQueuedRunStaleness`). Each is a deterministic "this wake was
- * invalid" verdict reached *before* the adapter session starts: the run is
+ * Error codes emitted by the dequeue-time gates in `claimQueuedRun`. Each is a
+ * deterministic verdict reached *before* the adapter session starts: the run is
  * cancelled with no process, no tokens, and no issue-visible effect, and
  * re-waking produces the identical verdict until some external state changes.
  *
@@ -109,10 +108,29 @@ export const ISSUE_NEW_INPUT_ACTIVITY_ACTIONS: string[] = [
  * by how fast the producer re-enqueues (ENGA-2429 measured 358 wakes in 76
  * minutes, 13s median inter-arrival, on `issue_continuation_waiting_on_review`).
  *
+ * Two gates feed this set, and they say different things:
+ *
+ * - The staleness filter (`evaluateQueuedRunStaleness`) says "this wake was
+ *   already invalid" — the issue moved, the assignee changed, the lock is gone.
+ * - The dependency gate (`cancelQueuedRunForBlockedDependencies`) says "not
+ *   yet" — the issue is real and still assigned, but its blockers are
+ *   unresolved.
+ *
+ * Both are safe to throttle for the same reason: nothing inside the cooldown
+ * window changes the verdict, and the escape hatch does not depend on the
+ * cooldown expiring. When blockers actually resolve, the wake that follows
+ * carries `issue_blockers_resolved`, which is absent from
+ * `THROTTLED_ISSUE_REWAKE_REASONS` and so is never a throttle candidate at all
+ * — emitted inline by the issue update/comment routes, and re-emitted by the
+ * issue-graph liveness backstop when the inline emit was missed. The
+ * `issue.blockers_resolved_wake_emitted` activity those paths log is also new
+ * input, so it clears the streak for any later event-free wake (ENGA-2434
+ * exercised both routes against a real database).
+ *
  * Crash-shaped cancels (`process_lost`, interrupts, failures) stay outside
  * this set: their follow-up is recovery, which must not be delayed.
  */
-export const STALE_WAKE_VERDICT_ERROR_CODES: ReadonlySet<string> = new Set([
+export const PRE_SPAWN_NO_OP_CANCEL_ERROR_CODES: ReadonlySet<string> = new Set([
   "issue_not_found",
   "issue_assignee_changed",
   "issue_terminal_status",
@@ -120,6 +138,7 @@ export const STALE_WAKE_VERDICT_ERROR_CODES: ReadonlySet<string> = new Set([
   "issue_execution_lock_changed",
   "issue_review_participant_changed",
   "issue_continuation_waiting_on_review",
+  "issue_dependencies_blocked",
 ]);
 
 export interface IssueRewakeCandidateInput {
@@ -149,11 +168,11 @@ export interface RecentIssueRunSample {
 }
 
 /**
- * A run cancelled by the dequeue-time staleness filter: no session was ever
- * spawned, and the same wake would be judged stale again.
+ * A run cancelled by a dequeue-time gate: no session was ever spawned, and the
+ * same wake would reach the same verdict again.
  */
-export function isStaleWakeVerdictRun(run: RecentIssueRunSample): boolean {
-  return run.status === "cancelled" && STALE_WAKE_VERDICT_ERROR_CODES.has(run.errorCode ?? "");
+export function isPreSpawnNoOpCancelRun(run: RecentIssueRunSample): boolean {
+  return run.status === "cancelled" && PRE_SPAWN_NO_OP_CANCEL_ERROR_CODES.has(run.errorCode ?? "");
 }
 
 export interface IssueRewakeThrottleInput {
@@ -190,10 +209,10 @@ export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): Is
 
   let noProgressStreak = 0;
   for (const run of runs) {
-    // A staleness verdict is the dequeue filter saying "this wake was invalid"
-    // before any session started. Repeating it changes nothing, so it counts
-    // as no-progress rather than breaking the streak.
-    if (isStaleWakeVerdictRun(run) && run.finishedAt) {
+    // A pre-spawn cancel is a dequeue gate saying "this wake was invalid" or
+    // "not yet" before any session started. Repeating it changes nothing, so it
+    // counts as no-progress rather than breaking the streak.
+    if (isPreSpawnNoOpCancelRun(run) && run.finishedAt) {
       noProgressStreak += 1;
       continue;
     }
