@@ -11,6 +11,12 @@
 // exiting so the caller can start a fresh one, escalating to a PostgreSQL fast
 // shutdown (SIGINT) and then an immediate shutdown (SIGQUIT) only after the
 // wait deadline passes.
+//
+// The wait polls connectability alongside PID liveness: "alive but unreachable"
+// also covers a postmaster still doing crash recovery, which becomes usable on
+// its own. Polling both means such a postmaster is reused within a poll interval
+// instead of costing the whole 60s deadline inside the supervisor's 90s boot
+// health window.
 
 export const EMBEDDED_POSTGRES_REUSE_POLL_INTERVAL_MS = 1_000;
 // Common case: a SIGTERM'd parent server whose postmaster is checkpointing.
@@ -23,7 +29,7 @@ export const EMBEDDED_POSTGRES_IMMEDIATE_SHUTDOWN_WAIT_MS = 5_000;
 export type EmbeddedPostgresReuseDeps = {
   /** Re-reads postmaster.pid and probes liveness; null once the postmaster is gone. */
   getRunningPid: () => number | null;
-  /** True when the configured port answers and serves the expected data directory. */
+  /** True when the port advertised in postmaster.pid answers and serves the expected data directory. */
   isConnectable: () => Promise<boolean>;
   signal: (pid: number, signal: "SIGINT" | "SIGQUIT") => void;
   sleep: (ms: number) => Promise<void>;
@@ -34,14 +40,36 @@ export type EmbeddedPostgresReuseResult =
   | { action: "reuse"; pid: number }
   | { action: "start-fresh" };
 
-async function waitForPostmasterExit(deps: EmbeddedPostgresReuseDeps, waitMs: number): Promise<number | null> {
+type PostmasterWaitResult =
+  | { state: "gone" }
+  | { state: "connectable"; pid: number }
+  | { state: "alive"; pid: number };
+
+/**
+ * Polls until the postmaster exits or the deadline passes.
+ *
+ * `probeConnectable` also checks connectability on every poll, so a postmaster
+ * that is merely slow to come up (crash recovery) is picked up within one poll
+ * interval instead of after the whole deadline. Waits that follow a shutdown
+ * signal leave it off: we have already committed to killing that postmaster,
+ * and one in fast/immediate shutdown refuses new connections anyway.
+ */
+async function waitForPostmasterExit(
+  deps: EmbeddedPostgresReuseDeps,
+  waitMs: number,
+  { probeConnectable }: { probeConnectable: boolean },
+): Promise<PostmasterWaitResult> {
   const polls = Math.ceil(waitMs / EMBEDDED_POSTGRES_REUSE_POLL_INTERVAL_MS);
   let pid = deps.getRunningPid();
   for (let i = 0; i < polls && pid !== null; i++) {
     await deps.sleep(EMBEDDED_POSTGRES_REUSE_POLL_INTERVAL_MS);
     pid = deps.getRunningPid();
+    if (pid === null) break;
+    if (probeConnectable && (await deps.isConnectable())) {
+      return { state: "connectable", pid };
+    }
   }
-  return pid;
+  return pid === null ? { state: "gone" } : { state: "alive", pid };
 }
 
 export async function resolveEmbeddedPostgresReuse(
@@ -56,8 +84,15 @@ export async function resolveEmbeddedPostgresReuse(
     `Embedded PostgreSQL pid ${pid} is alive but not accepting connections (likely shutting down); ` +
       `waiting up to ${EMBEDDED_POSTGRES_SHUTDOWN_WAIT_MS / 1000}s for it to exit before starting fresh`,
   );
-  pid = await waitForPostmasterExit(deps, EMBEDDED_POSTGRES_SHUTDOWN_WAIT_MS);
-  if (pid === null) return { action: "start-fresh" };
+  const waited = await waitForPostmasterExit(deps, EMBEDDED_POSTGRES_SHUTDOWN_WAIT_MS, {
+    probeConnectable: true,
+  });
+  if (waited.state === "gone") return { action: "start-fresh" };
+  if (waited.state === "connectable") {
+    deps.warn(`Embedded PostgreSQL pid ${waited.pid} started accepting connections while waiting; reusing it`);
+    return { action: "reuse", pid: waited.pid };
+  }
+  pid = waited.pid;
 
   for (const [signalName, waitMs] of [
     ["SIGINT", EMBEDDED_POSTGRES_FAST_SHUTDOWN_WAIT_MS],
@@ -79,8 +114,9 @@ export async function resolveEmbeddedPostgresReuse(
     } catch {
       // ESRCH etc. — the postmaster exited between the poll and the kill.
     }
-    pid = await waitForPostmasterExit(deps, waitMs);
-    if (pid === null) return { action: "start-fresh" };
+    const signalled = await waitForPostmasterExit(deps, waitMs, { probeConnectable: false });
+    if (signalled.state === "gone") return { action: "start-fresh" };
+    pid = signalled.pid;
   }
 
   throw new Error(

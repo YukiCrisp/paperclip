@@ -65,6 +65,27 @@ describe("resolveEmbeddedPostgresReuse", () => {
     expect(deps.signal).not.toHaveBeenCalled();
   });
 
+  it("reuses a slow-to-start postmaster within a poll interval, not after the whole deadline", async () => {
+    // Regression guard for ENGA-2446: connectability used to be probed only at
+    // the escalation boundary, so a postmaster that finished crash recovery two
+    // seconds in still burned the full 60s wait inside the supervisor's 90s boot
+    // health window. Assert the elapsed wait, which a mocked sleep hides.
+    let elapsedMs = 0;
+    const becomesConnectableAtMs = 2 * EMBEDDED_POSTGRES_REUSE_POLL_INTERVAL_MS;
+    const deps = buildDeps({
+      getRunningPid: vi.fn(() => 4242),
+      sleep: vi.fn(async (ms: number) => {
+        elapsedMs += ms;
+      }),
+      isConnectable: vi.fn(async () => elapsedMs >= becomesConnectableAtMs),
+    });
+
+    await expect(resolveEmbeddedPostgresReuse(deps)).resolves.toEqual({ action: "reuse", pid: 4242 });
+    expect(elapsedMs).toBe(becomesConnectableAtMs);
+    expect(elapsedMs).toBeLessThan(EMBEDDED_POSTGRES_SHUTDOWN_WAIT_MS);
+    expect(deps.signal).not.toHaveBeenCalled();
+  });
+
   it("escalates to a fast shutdown (SIGINT) when the wait deadline passes", async () => {
     let sigintSent = false;
     const deps = buildDeps({
