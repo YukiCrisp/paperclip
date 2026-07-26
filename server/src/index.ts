@@ -401,35 +401,57 @@ export async function startServer(): Promise<StartedServer> {
       }
     };
   
-    const getRunningPid = (): number | null => {
+    // postmaster.pid line 1 is the PID and line 4 is the port the postmaster is
+    // actually listening on. That port can differ from the configured one: when
+    // 54329 is already taken, boot falls back to the next free port
+    // (`selectedPort=54330` in server.log) and the postmaster owning this data
+    // directory ends up there. Probing the configured port would then call a
+    // healthy postmaster unreachable and eventually SIGQUIT it (ENGA-2446).
+    const readPostmasterPidInfo = (): { pid: number; port: number } | null => {
       if (!existsSync(postmasterPidFile)) return null;
       try {
-        const pidLine = readFileSync(postmasterPidFile, "utf8").split("\n")[0]?.trim();
-        const pid = Number(pidLine);
+        const lines = readFileSync(postmasterPidFile, "utf8").split("\n");
+        const pid = Number(lines[0]?.trim());
         if (!Number.isInteger(pid) || pid <= 0) return null;
         if (!isPidRunning(pid)) return null;
-        return pid;
+        const pidFilePort = Number(lines[3]?.trim());
+        // A pid file still being written has no port line yet; fall back to the
+        // configured port rather than failing the probe outright.
+        const port = Number.isInteger(pidFilePort) && pidFilePort > 0 ? pidFilePort : configuredPort;
+        return { pid, port };
       } catch {
         return null;
       }
     };
-  
+    const getRunningPid = (): number | null => readPostmasterPidInfo()?.pid ?? null;
+
+    // Set by isConnectable so a "reuse" decision talks to the port we just proved
+    // healthy rather than to the configured one.
+    let reusablePort: number | null = null;
+
     // Reuse requires "alive AND accepting connections" — a postmaster mid-shutdown
     // still holds postmaster.pid, so PID liveness alone would boot against a dying
     // server and fail within seconds (ENGA-1310).
     const reuseDecision = await resolveEmbeddedPostgresReuse({
       getRunningPid,
       isConnectable: async () => {
+        const info = readPostmasterPidInfo();
+        if (info === null) return false;
         const reachableDataDir = await getPostgresDataDirectory(
-          `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`,
+          `postgres://paperclip:paperclip@127.0.0.1:${info.port}/postgres`,
         );
-        return typeof reachableDataDir === "string" && resolve(reachableDataDir) === resolve(dataDir);
+        const matches = typeof reachableDataDir === "string" && resolve(reachableDataDir) === resolve(dataDir);
+        reusablePort = matches ? info.port : null;
+        return matches;
       },
       signal: (pid, signalName) => process.kill(pid, signalName),
       sleep: (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
       warn: (message) => logger.warn(message),
     });
     if (reuseDecision.action === "reuse") {
+      // The reused postmaster may sit on a fallback port; every connection string
+      // below is built from `port`, so adopt the one we probed.
+      port = reusablePort ?? configuredPort;
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${reuseDecision.pid}, port=${port})`);
     } else {
       const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
