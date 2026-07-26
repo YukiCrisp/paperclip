@@ -50,6 +50,21 @@ describe("resolveEmbeddedPostgresReuse", () => {
     expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining("not accepting connections"));
   });
 
+  it("reuses a postmaster that becomes reachable during the wait instead of signalling it", async () => {
+    // Alive the whole time, unreachable at first (e.g. "the database system is
+    // starting up" during crash recovery), serving by the time the wait ends.
+    let connectable = false;
+    const deps = buildDeps({
+      getRunningPid: vi.fn(() => 4242),
+      sleep: vi.fn(async () => {
+        connectable = true;
+      }),
+      isConnectable: vi.fn(async () => connectable),
+    });
+    await expect(resolveEmbeddedPostgresReuse(deps)).resolves.toEqual({ action: "reuse", pid: 4242 });
+    expect(deps.signal).not.toHaveBeenCalled();
+  });
+
   it("escalates to a fast shutdown (SIGINT) when the wait deadline passes", async () => {
     let sigintSent = false;
     const deps = buildDeps({

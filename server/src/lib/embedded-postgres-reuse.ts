@@ -63,6 +63,14 @@ export async function resolveEmbeddedPostgresReuse(
     ["SIGINT", EMBEDDED_POSTGRES_FAST_SHUTDOWN_WAIT_MS],
     ["SIGQUIT", EMBEDDED_POSTGRES_IMMEDIATE_SHUTDOWN_WAIT_MS],
   ] as const) {
+    // Not every "alive but unreachable" postmaster is dying — one still doing
+    // crash recovery ("the database system is starting up") also refuses
+    // connections, and it becomes usable on its own. Re-probe before each
+    // escalation so we never signal a postmaster that has just come up.
+    if (await deps.isConnectable()) {
+      deps.warn(`Embedded PostgreSQL pid ${pid} started accepting connections while waiting; reusing it`);
+      return { action: "reuse", pid };
+    }
     deps.warn(
       `Embedded PostgreSQL pid ${pid} still alive after wait deadline; sending ${signalName} and waiting up to ${waitMs / 1000}s`,
     );
