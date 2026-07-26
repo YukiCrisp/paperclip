@@ -15,6 +15,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -82,6 +83,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       try {
         await db.delete(environmentLeases);
         await db.delete(issueComments);
+        await db.delete(issueRelations);
         await db.delete(issues);
         await db.delete(heartbeatRunEvents);
         await db.delete(activityLog);
@@ -333,6 +335,152 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
 
     const recoveryWake = await assignmentWake(agentId, issueId);
     expect(recoveryWake).not.toBeNull();
+  });
+
+  // ENGA-2434: `issue_dependencies_blocked` is the other pre-spawn cancel code.
+  // These four cases are the measurement the ticket asked for — where the
+  // dependency spin is actually absorbed, and how an issue gets out of the
+  // cooldown once its blockers resolve.
+  describe("dependency-gate cancels", () => {
+    async function seedUnresolvedBlocker(companyId: string, agentId: string, issueId: string) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Upstream blocker",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+      return blockerId;
+    }
+
+    function seedDependencyBlockedStreak(companyId: string, agentId: string, issueId: string) {
+      // The shape a claim-time dependency cancel leaves behind: the run was
+      // queued while dependencies looked ready, the blocker landed before
+      // `claimQueuedRun` reached it, and the run died before spawning.
+      return Promise.all(
+        [39, 26, 13].map((finishedSecondsAgo) =>
+          seedTerminalRun({
+            companyId,
+            agentId,
+            issueId,
+            status: "cancelled",
+            errorCode: "issue_dependencies_blocked",
+            neverStarted: true,
+            finishedSecondsAgo,
+          }),
+        ),
+      );
+    }
+
+    // The ticket assumed a blocked issue could spin the same way ENGA-2429's
+    // issue did. It cannot: `enqueueWakeup` has its own dependency gate that
+    // fires before the throttle, so a persistently blocked issue never gets a
+    // run row at all. The claim-time cancel this change covers is the narrower
+    // race where the blocker lands after the run was already queued.
+    it("never reaches the throttle while blockers are unresolved: no run is created at all", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      await seedUnresolvedBlocker(companyId, agentId, issueId);
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        expect(await assignmentWake(agentId, issueId)).toBeNull();
+      }
+
+      const skipped = await latestWakeRequest(agentId);
+      expect(skipped?.status).toBe("skipped");
+      // Skipped by the dependency gate, not the throttle.
+      expect(skipped?.reason).toBe("issue_dependencies_blocked");
+
+      const runCount = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, companyId))
+        .then((rows) => rows[0]?.count ?? 0);
+      expect(runCount).toBe(0);
+    });
+
+    it("throttles event-free wakes after a streak of claim-time dependency cancels", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      await seedDependencyBlockedStreak(companyId, agentId, issueId);
+
+      const wake = await assignmentWake(agentId, issueId);
+      expect(wake).toBeNull();
+
+      const skipped = await latestWakeRequest(agentId);
+      expect(skipped?.reason).toBe("issue_rewake_throttled");
+      const heartbeatSkip = (skipped?.payload as Record<string, unknown> | null)?.heartbeatSkip as
+        | Record<string, unknown>
+        | undefined;
+      expect(heartbeatSkip?.noProgressStreak).toBe(3);
+
+      const runCount = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, companyId))
+        .then((rows) => rows[0]?.count ?? 0);
+      expect(runCount).toBe(3);
+    });
+
+    // The load-bearing check. Recovery must not depend on the cooldown expiring,
+    // or a 30-minute ceiling would become a 30-minute stall on every unblock.
+    it("admits the blockers-resolved wake while the cooldown is still running", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      const blockerId = randomUUID();
+      await seedDependencyBlockedStreak(companyId, agentId, issueId);
+
+      expect(await assignmentWake(agentId, issueId)).toBeNull();
+      expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
+
+      // Same wake the issue update/comment routes and the issue-graph liveness
+      // backstop emit when the last blocker clears.
+      const resolvedWake = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: { issueId, resolvedBlockerIssueId: blockerId, blockerIssueIds: [blockerId] },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_blockers_resolved",
+          source: "issue.update",
+          resolvedBlockerIssueId: blockerId,
+          blockerIssueIds: [blockerId],
+        },
+        requestedByActorType: "system",
+        requestedByActorId: "test",
+      });
+      expect(resolvedWake).not.toBeNull();
+    });
+
+    it("clears the streak for later event-free wakes once the resolution activity lands", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      await seedDependencyBlockedStreak(companyId, agentId, issueId);
+
+      expect(await assignmentWake(agentId, issueId)).toBeNull();
+
+      // Logged by every path that emits `issue_blockers_resolved`, so an
+      // assignment poller that arrives after the wake was consumed is admitted
+      // too instead of waiting out the cooldown.
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "issue_update",
+        agentId,
+        action: "issue.blockers_resolved_wake_emitted",
+        entityType: "issue",
+        entityId: issueId,
+      });
+
+      expect(await assignmentWake(agentId, issueId)).not.toBeNull();
+    });
   });
 
   it("does not throttle when a recent run produced issue-visible progress", async () => {

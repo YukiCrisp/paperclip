@@ -237,7 +237,9 @@ describe("evaluateIssueRewakeThrottle", () => {
     }
   });
 
-  it("counts every staleness verdict code, and mixes them with no-progress successes", () => {
+  it("counts every pre-spawn cancel code, and mixes them with no-progress successes", () => {
+    // Spelled out rather than iterated from the exported set: this list is the
+    // spec, so dropping a code from the set has to fail here.
     for (const errorCode of [
       "issue_not_found",
       "issue_assignee_changed",
@@ -246,6 +248,7 @@ describe("evaluateIssueRewakeThrottle", () => {
       "issue_execution_lock_changed",
       "issue_review_participant_changed",
       "issue_continuation_waiting_on_review",
+      "issue_dependencies_blocked",
     ]) {
       const decision = evaluateIssueRewakeThrottle({
         now: NOW,
@@ -285,6 +288,45 @@ describe("evaluateIssueRewakeThrottle", () => {
       });
       expect(decision, String(errorCode)).toEqual({ blocked: false, noProgressStreak: 0 });
     }
+  });
+
+  // ENGA-2434: the dependency gate cancels blocked wakes in the same pre-spawn
+  // position as the staleness filter, so the same spin loop was still reachable
+  // for a blocker-waiting issue.
+  it("damps a dependency-gate spin loop and lets blocker resolution through", () => {
+    const blockedRuns = Array.from({ length: 8 }, (_unused, index) =>
+      runSample({
+        id: `blocked-${index}`,
+        status: "cancelled",
+        errorCode: "issue_dependencies_blocked",
+        finishedSecondsAgo: 13 * (index + 1),
+      }),
+    );
+
+    const decision = evaluateIssueRewakeThrottle({
+      now: NOW,
+      recentTerminalRuns: blockedRuns,
+      runIdsWithIssueProgress: new Set(),
+      hasNewIssueInputSinceLastRun: false,
+    });
+    expect(decision.blocked).toBe(true);
+    if (decision.blocked) {
+      expect(decision.noProgressStreak).toBe(8);
+      expect(decision.cooldownMs).toBe(ISSUE_REWAKE_MAX_COOLDOWN_MS);
+    }
+
+    // The cooldown must not be able to strand the issue. Blocker resolution
+    // logs `issue.blockers_resolved_wake_emitted`, which is new input, so the
+    // very next event-free wake is admitted with the streak reset — no waiting
+    // out the remaining 30 minutes.
+    expect(
+      evaluateIssueRewakeThrottle({
+        now: NOW,
+        recentTerminalRuns: blockedRuns,
+        runIdsWithIssueProgress: new Set(),
+        hasNewIssueInputSinceLastRun: true,
+      }),
+    ).toEqual({ blocked: false, noProgressStreak: 0 });
   });
 
   it("does not count a staleness verdict that never recorded a finish time", () => {
