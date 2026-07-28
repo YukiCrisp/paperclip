@@ -471,8 +471,41 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   return "fresh_session_safer_invocation";
 }
 
-function readHeartbeatRunErrorFamily(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+// acpx phase buckets. These are *generic* codes — the adapter's error classifier
+// falls back to them for any failure raised during `ensure_session`/`turn`, so a
+// real model-side turn failure lands on the same code as a host that cannot reach
+// the API. Mapping them to `transient_upstream` unconditionally would hide genuine
+// failures behind the retry ladder, so the codes only qualify together with the
+// message gate below.
+const ACPX_CONNECTIVITY_FAILURE_CODES = new Set<string>([
+  "acpx_turn_failed",
+  "acpx_session_init_failed",
+]);
+
+// Host-side connectivity loss as it actually surfaces on acpx runs. Deliberately an
+// explicit enumeration rather than a broad "connect"/"network" pattern: the codes it
+// gates are generic, so a loose pattern would silently reclassify real failures.
+// The first two alternatives are the observed strings for an upstream API outage;
+// the socket-level ones are the same class raised one layer down.
+const ACPX_CONNECTIVITY_ERROR_RE =
+  /(?:Unable to connect to API \(ConnectionRefused\)|ACP session creation timed out before session\/new completed|\bECONNREFUSED\b|\bENOTFOUND\b|socket hang up)/i;
+
+function isAcpxConnectivityFailure(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode">,
+) {
+  if (!run.errorCode || !ACPX_CONNECTIVITY_FAILURE_CODES.has(run.errorCode)) return false;
+  // `error` only. It is the adapter's own `errorMessage` — engine/protocol text — and
+  // is the sole carrier that actually holds these strings in production (all 34 of the
+  // observed outage runs matched on this column alone). Notably NOT `resultJson.summary`:
+  // on the `acpx_turn_failed` path that field is the agent's own assistant output
+  // (`textParts.join("")` in acpx-engine/execute.ts), so gating on it would reclassify a
+  // genuine turn failure as transient whenever the agent happened to write "ECONNREFUSED"
+  // or "socket hang up" in its reply — most likely of all for an agent fixing this code.
+  return typeof run.error === "string" && ACPX_CONNECTIVITY_ERROR_RE.test(run.error);
+}
+
+export function readHeartbeatRunErrorFamily(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
@@ -486,6 +519,9 @@ function readHeartbeatRunErrorFamily(
     run.errorCode === "claude_transient_upstream" ||
     run.errorCode === "codex_harness_crash"
   ) {
+    return "transient_upstream";
+  }
+  if (isAcpxConnectivityFailure(run)) {
     return "transient_upstream";
   }
   return null;
@@ -512,7 +548,7 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
 }
 
 function readTransientRecoveryContractFromRun(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
   const errorFamily = readHeartbeatRunErrorFamily(run);
   return errorFamily === "transient_upstream" || errorFamily === "provider_quota"
@@ -14526,14 +14562,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       }
+      // A failure the platform already knows how to retry (quota park, transient
+      // upstream) must not park the agent in `error`: the bounded retry ladder owns
+      // the recovery, and an agent without a periodic beat has no way back out of
+      // `error` on its own.
+      const failureErrorFamily =
+        outcome === "failed"
+          ? readHeartbeatRunErrorFamily(
+              finalizedRun ?? {
+                error: runErrorMessage,
+                errorCode: runErrorCode,
+                resultJson: persistedResultJson,
+              },
+            )
+          : null;
       await finalizeAgentStatus(
         agent.id,
         outcome,
         outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
         {
           keepIdleOnFailure:
-            outcome === "failed" &&
-            (finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota"),
+            failureErrorFamily === "provider_quota" || failureErrorFamily === "transient_upstream",
         },
       );
     } catch (err) {

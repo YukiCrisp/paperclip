@@ -35,6 +35,7 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const ACPX_CONNECTIVITY_TEST_ADAPTER = "acpx_connectivity_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -88,6 +89,33 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    // Mirrors what an acpx run records when the host cannot reach the API: the
+    // generic turn-phase code, the connectivity message on `errorMessage`, and —
+    // unlike the quota adapter above — no `errorFamily` hint at all. The family has
+    // to be derived from the code plus that message, which is what this fixture
+    // exercises. `resultJson.summary` repeats the string only because the real runs
+    // did (Claude Code streamed the error as assistant text); the classifier does
+    // not read that field, so the error column alone drives the outcome here.
+    registerServerAdapter({
+      type: ACPX_CONNECTIVITY_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "Internal error: API Error: Unable to connect to API (ConnectionRefused)",
+        errorCode: "acpx_turn_failed",
+        resultJson: {
+          summary: "API Error: Unable to connect to API (ConnectionRefused)",
+          stopReason: "adapter_failed",
+        },
+      }),
+      testEnvironment: async () => ({
+        adapterType: ACPX_CONNECTIVITY_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -96,6 +124,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(ACPX_CONNECTIVITY_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -274,6 +303,84 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     );
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.codexTransientFallbackMode ?? null).toBeNull();
 
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ status: agents.status, errorReason: agents.errorReason })
+            .from(agents)
+            .where(eq(agents.id, agentId))
+            .then((rows) => rows[0] ?? null),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("keeps the agent idle and schedules a bounded retry when acpx cannot reach the API", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Connectivity Test",
+      role: "engineer",
+      status: "idle",
+      adapterType: ACPX_CONNECTIVITY_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("acpx_turn_failed");
+
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.retryOfRunId, run!.id))
+            .then((rows) => rows.length),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toBe(1);
+
+    const retryRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, run!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.errorFamily).toBe(
+      "transient_upstream",
+    );
+
+    // The point of the whole change: an agent that has no periodic beat cannot
+    // climb out of `error` by itself, so a host-side outage must leave it idle.
     await expect
       .poll(
         () =>
