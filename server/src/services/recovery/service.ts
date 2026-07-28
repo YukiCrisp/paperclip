@@ -301,6 +301,13 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "codex_harness_crash",
   "claude_transient_upstream",
+  // acpx phase buckets. Like `adapter_failed` above these are generic rather than
+  // connectivity-specific, and they are treated the same way: a continuation run that
+  // dies inside session setup or a turn is worth a bounded retry before the issue is
+  // escalated. Without them an acpx run that hits a host-side outage escalates the
+  // issue to `blocked` on a single strike, because the default policy is one attempt.
+  "acpx_session_init_failed",
+  "acpx_turn_failed",
   "provider_quota",
   "timeout",
 ]);
