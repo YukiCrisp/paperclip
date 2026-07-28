@@ -491,15 +491,17 @@ const ACPX_CONNECTIVITY_ERROR_RE =
   /(?:Unable to connect to API \(ConnectionRefused\)|ACP session creation timed out before session\/new completed|\bECONNREFUSED\b|\bENOTFOUND\b|socket hang up)/i;
 
 function isAcpxConnectivityFailure(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
-  resultJson: Record<string, unknown>,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode">,
 ) {
   if (!run.errorCode || !ACPX_CONNECTIVITY_FAILURE_CODES.has(run.errorCode)) return false;
-  // The message lives on `error` for adapter-reported failures and is mirrored into
-  // `resultJson.summary` by the acpx engine; check both plus the generic carriers.
-  return [run.error, resultJson.summary, resultJson.errorMessage, resultJson.message].some(
-    (candidate) => typeof candidate === "string" && ACPX_CONNECTIVITY_ERROR_RE.test(candidate),
-  );
+  // `error` only. It is the adapter's own `errorMessage` — engine/protocol text — and
+  // is the sole carrier that actually holds these strings in production (all 34 of the
+  // observed outage runs matched on this column alone). Notably NOT `resultJson.summary`:
+  // on the `acpx_turn_failed` path that field is the agent's own assistant output
+  // (`textParts.join("")` in acpx-engine/execute.ts), so gating on it would reclassify a
+  // genuine turn failure as transient whenever the agent happened to write "ECONNREFUSED"
+  // or "socket hang up" in its reply — most likely of all for an agent fixing this code.
+  return typeof run.error === "string" && ACPX_CONNECTIVITY_ERROR_RE.test(run.error);
 }
 
 export function readHeartbeatRunErrorFamily(
@@ -519,7 +521,7 @@ export function readHeartbeatRunErrorFamily(
   ) {
     return "transient_upstream";
   }
-  if (isAcpxConnectivityFailure(run, resultJson)) {
+  if (isAcpxConnectivityFailure(run)) {
     return "transient_upstream";
   }
   return null;

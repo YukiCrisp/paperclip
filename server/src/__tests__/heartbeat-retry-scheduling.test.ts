@@ -90,9 +90,12 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       }),
     });
     // Mirrors what an acpx run records when the host cannot reach the API: the
-    // generic turn-phase code, the connectivity message, and — unlike the quota
-    // adapter above — no `errorFamily` hint at all. The family has to be derived
-    // from the code plus the message, which is what this fixture exercises.
+    // generic turn-phase code, the connectivity message on `errorMessage`, and —
+    // unlike the quota adapter above — no `errorFamily` hint at all. The family has
+    // to be derived from the code plus that message, which is what this fixture
+    // exercises. `resultJson.summary` repeats the string only because the real runs
+    // did (Claude Code streamed the error as assistant text); the classifier does
+    // not read that field, so the error column alone drives the outcome here.
     registerServerAdapter({
       type: ACPX_CONNECTIVITY_TEST_ADAPTER,
       execute: async () => ({

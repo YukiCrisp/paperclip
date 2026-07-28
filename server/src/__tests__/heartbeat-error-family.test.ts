@@ -56,7 +56,25 @@ describe("readHeartbeatRunErrorFamily", () => {
     ).toBe("transient_upstream");
   });
 
-  it("reads the connectivity message from result json when the error column is empty", () => {
+  // `resultJson.summary` is NOT a carrier, and must not become one. On the
+  // `acpx_turn_failed` path the acpx engine fills that field with the agent's own
+  // assistant output (`textParts.join("")`), not with engine text — the real outage
+  // runs only carried the connectivity string there because Claude Code streamed the
+  // error as assistant text. Reading it would flip a genuine turn failure to
+  // transient whenever the agent wrote a socket word in its reply.
+  it("ignores connectivity strings that only appear in the agent's own output", () => {
+    expect(
+      readHeartbeatRunErrorFamily(
+        failedRun({
+          errorCode: "acpx_turn_failed",
+          error: "Internal error: tool execution failed after 3 attempts",
+          resultJson: {
+            summary:
+              "I added handling for ECONNREFUSED and socket hang up in the retry ladder, then the tool call failed.",
+          },
+        }),
+      ),
+    ).toBeNull();
     expect(
       readHeartbeatRunErrorFamily(
         failedRun({
@@ -64,20 +82,7 @@ describe("readHeartbeatRunErrorFamily", () => {
           resultJson: { summary: "API Error: Unable to connect to API (ConnectionRefused)" },
         }),
       ),
-    ).toBe("transient_upstream");
-    expect(
-      readHeartbeatRunErrorFamily(
-        failedRun({
-          errorCode: "acpx_turn_failed",
-          resultJson: { errorMessage: "connect ECONNREFUSED 127.0.0.1:443" },
-        }),
-      ),
-    ).toBe("transient_upstream");
-    expect(
-      readHeartbeatRunErrorFamily(
-        failedRun({ errorCode: "acpx_turn_failed", resultJson: { message: "socket hang up" } }),
-      ),
-    ).toBe("transient_upstream");
+    ).toBeNull();
   });
 
   it("leaves genuine acpx failures unclassified so they still surface as errors", () => {
