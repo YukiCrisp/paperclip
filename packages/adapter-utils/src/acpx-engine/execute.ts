@@ -82,6 +82,15 @@ import {
   DEFAULT_ACP_ENGINE_TIMEOUT_SEC,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
+import {
+  ACPX_EVENT_INACTIVITY_ERROR_CODE,
+  acpxEventInactivityCancelGraceMs,
+  acpxEventInactivityTimeoutMs,
+  formatAcpxEventInactivityErrorMessage,
+  formatAcpxEventInactivityStartLogLine,
+  resolveAcpxEventInactivityTimeout,
+  type AcpxEventInactivityResolution,
+} from "./event-inactivity.js";
 import { measureStartupStep } from "./startup-timing.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -340,6 +349,10 @@ interface AcpxPreparedRuntime {
   fastMode: boolean;
   timeoutSec: number;
   timeoutResolution: AdapterExecutionTargetTimeoutResolution;
+  // Bound on event silence within a turn. Independent of `timeoutResolution`:
+  // that one is a wall-clock cap that local/SSH targets resolve to "unlimited",
+  // leaving the event loop with no bound at all.
+  eventInactivity: AcpxEventInactivityResolution;
   sessionKey: string;
   fingerprint: string;
   agentCommand: string | null;
@@ -1291,6 +1304,11 @@ async function buildRuntime(input: {
     asNumber(config.timeoutSec, DEFAULT_ACP_ENGINE_TIMEOUT_SEC),
   );
   const timeoutSec = timeoutResolution.timeoutSec;
+  // Shared with the non-ACPX claude-local/codex-local output monitors: same knob,
+  // same meaning ("fail the run after this much agent silence"). It already
+  // reached this config object via `buildClaudeAcpConfig`, but no ACPX code path
+  // had ever read it.
+  const eventInactivity = resolveAcpxEventInactivityTimeout(config.outputInactivityTimeoutMs);
   const stateDir = path.resolve(asString(config.stateDir, "") || defaultStateDir(agent.companyId, agent.id));
   await fs.mkdir(stateDir, { recursive: true });
 
@@ -1792,6 +1810,7 @@ async function buildRuntime(input: {
     fastMode,
     timeoutSec,
     timeoutResolution,
+    eventInactivity,
     sessionKey,
     fingerprint,
     agentCommand,
@@ -2008,6 +2027,32 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
 
 async function emitAcpxLog(ctx: AdapterExecutionContext, payload: Record<string, unknown>) {
   await ctx.onLog("stdout", `${JSON.stringify(payload)}\n`);
+}
+
+/**
+ * Await a turn terminal, but give up after `graceMs` and synthesize a
+ * `cancelled` terminal instead.
+ *
+ * Only used on the event-inactivity watchdog path. Abort is delivered to the
+ * agent as an in-band ACP `session/cancel`, so a child wedged badly enough to
+ * have gone silent for the whole watchdog window may also never settle the
+ * turn. Without this bound, escaping the event loop would just move the same
+ * unbounded wait one line down.
+ */
+export async function settleTurnResultWithinGrace(
+  result: Promise<AcpRuntimeTurnResult>,
+  graceMs: number,
+  stopReason: string,
+): Promise<AcpRuntimeTurnResult> {
+  let graceTimer: NodeJS.Timeout | null = null;
+  const grace = new Promise<null>((resolve) => {
+    graceTimer = setTimeout(() => resolve(null), graceMs);
+  });
+  try {
+    return (await Promise.race([result, grace])) ?? { status: "cancelled", stopReason };
+  } finally {
+    if (graceTimer) clearTimeout(graceTimer);
+  }
 }
 
 async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeEvent) {
@@ -2563,6 +2608,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       "stderr",
       `[paperclip] ${formatAdapterExecutionTimeoutStartLogLine(prepared.timeoutResolution)}\n`,
     );
+    // The wall-clock line above says "none" on every local/SSH target, so state
+    // the event-silence bound too: on those targets it is the only bound there is.
+    await ctx.onLog(
+      "stderr",
+      `[paperclip] ${formatAcpxEventInactivityStartLogLine(prepared.eventInactivity)}\n`,
+    );
     await cleanupIdleHandles({ handles: warmHandles, now: now(), idleMs: warmIdleMs });
 
     const previousParams = parseObject(ctx.runtime.sessionParams);
@@ -2776,6 +2827,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     let controller: AbortController | null = null;
     let timeout: NodeJS.Timeout | null = null;
     let timedOut = false;
+    let inactivityTimer: NodeJS.Timeout | null = null;
+    let eventInactivityFired = false;
+    const eventInactivityMs = acpxEventInactivityTimeoutMs(prepared.eventInactivity);
+    const clearTurnTimers = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = null;
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      inactivityTimer = null;
+    };
     const textParts: string[] = [];
     let eventBreakdown: AcpRuntimeUsageBreakdown | null = null;
     let eventCostUsd: number | null = null;
@@ -2803,7 +2863,48 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       cancelActiveTurn = async (reason: string) => {
         await turn.cancel({ reason });
       };
-      for await (const event of turn.events) {
+      // Event-silence watchdog. `inactivityTripped` resolves to `null` when it
+      // fires; racing it against `iterator.next()` is what actually releases the
+      // loop. Firing only `controller.abort()` would not: abort reaches the agent
+      // as an in-band ACP `session/cancel`, and a child that has been silent for
+      // the whole window is exactly the child least likely to act on it.
+      let tripInactivity: (() => void) | null = null;
+      const inactivityTripped =
+        eventInactivityMs > 0
+          ? new Promise<null>((resolve) => {
+              tripInactivity = () => resolve(null);
+            })
+          : null;
+      const armInactivityWatchdog = () => {
+        if (eventInactivityMs <= 0) return;
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(() => {
+          eventInactivityFired = true;
+          controller?.abort();
+          void cancelActiveTurn?.(formatAcpxEventInactivityErrorMessage(eventInactivityMs)).catch(() => {});
+          tripInactivity?.();
+        }, eventInactivityMs);
+      };
+      const eventIterator = turn.events[Symbol.asyncIterator]();
+      armInactivityWatchdog();
+      for (;;) {
+        const stepped = await (inactivityTripped
+          ? Promise.race([eventIterator.next(), inactivityTripped])
+          : eventIterator.next());
+        // `null` is the watchdog sentinel; a real step is always an object.
+        if (!stepped) {
+          // Signal cleanup but never await it: an async iterator suspended at an
+          // `await` (which is precisely where a wedged agent leaves it) does not
+          // settle `return()` until it reaches a yield point, so awaiting here
+          // would re-introduce the unbounded wait.
+          void Promise.resolve(eventIterator.return?.()).catch(() => {});
+          break;
+        }
+        if (stepped.done) break;
+        // Any event at all is proof of life — including thought deltas and
+        // tool-call updates — so reset before doing any work with it.
+        armInactivityWatchdog();
+        const event = stepped.value;
         if (event.type === "text_delta") textParts.push(event.text);
         if (event.type === "status" && event.tag === "usage_update") {
           eventBreakdown = event.breakdown ?? eventBreakdown;
@@ -2811,8 +2912,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         }
         await emitRuntimeEvent(ctx, event);
       }
-      const terminal = await turn.result;
-      if (timeout) clearTimeout(timeout);
+      // Disarm before awaiting the terminal. The watchdog guards the event
+      // stream, and that stream is now over; leaving it armed would let it fire
+      // during a slow-but-legitimate `turn.result` and condemn a turn that had
+      // already finished streaming.
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      inactivityTimer = null;
+      const terminal = eventInactivityFired
+        ? await settleTurnResultWithinGrace(
+            turn.result,
+            acpxEventInactivityCancelGraceMs(eventInactivityMs),
+            "paperclip event inactivity watchdog",
+          )
+        : await turn.result;
+      clearTurnTimers();
       // Read usage before the close/warm-handle paths below can discard state.
       const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
       const turnUsage = summarizeAcpxTurnUsage({
@@ -2821,21 +2934,32 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         eventBreakdown,
         eventCostUsd,
       });
-      if (terminal.status === "failed" || terminal.status === "cancelled" || timedOut) {
+      // A watchdog kill counts as an unclean turn even if `turn.result` raced in a
+      // late `completed`: the session was cancelled mid-flight, so it must not be
+      // kept warm or resumed.
+      const uncleanTurn =
+        terminal.status === "failed" || terminal.status === "cancelled" || timedOut || eventInactivityFired;
+      const cleanupReason = timedOut
+        ? "paperclip timeout cleanup"
+        : eventInactivityFired
+          ? "paperclip event inactivity cleanup"
+          : `paperclip turn ${terminal.status}`;
+      const discardPersistentState = terminal.status === "cancelled" || timedOut || eventInactivityFired;
+      if (uncleanTurn) {
         const existing = warmHandles.get(prepared.sessionKey);
         if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
           await closeWarmHandle({
             handles: warmHandles,
             key: prepared.sessionKey,
             entry: existing,
-            reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${terminal.status}`,
-            discardPersistentState: terminal.status === "cancelled" || timedOut,
+            reason: cleanupReason,
+            discardPersistentState,
           });
         } else {
           await runtime.close({
             handle: sessionHandle,
-            reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${terminal.status}`,
-            discardPersistentState: terminal.status === "cancelled" || timedOut,
+            reason: cleanupReason,
+            discardPersistentState,
           }).catch(() => {});
         }
       } else if (prepared.mode === "persistent" && warmIdleMs > 0 && !prepared.processSessionBridge) {
@@ -2886,7 +3010,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // next run stages fresh instead of reusing a torn-down session's staged
       // credentials. Copy-back still fires for every outcome via
       // `cleanupRemoteBridges` below (unchanged from PR 2).
-      if (terminal.status === "completed" && !timedOut) {
+      if (terminal.status === "completed" && !timedOut && !eventInactivityFired) {
         saveStagedRuntimeAfterCleanTurn({ handles: stagedRuntimes, prepared, now: now() });
       } else {
         await discardStagedRuntime({ handles: stagedRuntimes, prepared });
@@ -2894,7 +3018,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
 
       const errorMessage = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
-        : resultErrorMessage(terminal);
+        : eventInactivityFired
+          ? formatAcpxEventInactivityErrorMessage(eventInactivityMs)
+          : resultErrorMessage(terminal);
       const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
       await emitAcpxLog(ctx, {
         type: terminal.status === "completed" ? "acpx.result" : "acpx.error",
@@ -2905,11 +3031,24 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       await cleanupRemoteBridges(prepared);
       flushChildStderr(childStderrState);
       return {
-        exitCode: terminal.status === "completed" ? 0 : 1,
+        exitCode: terminal.status === "completed" && !eventInactivityFired ? 0 : 1,
         signal: timedOut ? "SIGTERM" : null,
+        // Deliberately NOT folded into `timedOut`: that flag drives the
+        // `timed_out` run outcome and the adapter wall-clock telemetry
+        // (`timeoutFired`/`timeoutSource`), and a watchdog kill is neither. The
+        // dedicated error code carries the meaning instead.
         timedOut,
         errorMessage,
-        errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+        // The watchdog code wins over the generic `acpx_turn_failed` phase
+        // bucket: we know exactly why this run ended, and the specific code is
+        // what lets the server classify it as retryable without a message gate.
+        errorCode: eventInactivityFired
+          ? ACPX_EVENT_INACTIVITY_ERROR_CODE
+          : terminal.status === "failed"
+            ? "acpx_turn_failed"
+            : timedOut
+              ? "acpx_timeout"
+              : null,
         sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
         sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
         sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -2934,18 +3073,24 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         clearSession,
       };
     } catch (err) {
-      if (timeout) clearTimeout(timeout);
+      clearTurnTimers();
       const messageOverride = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
-        : undefined;
+        : eventInactivityFired
+          ? formatAcpxEventInactivityErrorMessage(eventInactivityMs)
+          : undefined;
       const cancel = cancelActiveTurn as ((reason: string) => Promise<void>) | null;
       const preEmitMessage =
         messageOverride ?? (err instanceof Error ? err.message : String(err));
       if (cancel) await cancel(preEmitMessage).catch(() => {});
       await runtime.close({
         handle: sessionHandle,
-        reason: timedOut ? "paperclip timeout cleanup" : "paperclip error cleanup",
-        discardPersistentState: timedOut,
+        reason: timedOut
+          ? "paperclip timeout cleanup"
+          : eventInactivityFired
+            ? "paperclip event inactivity cleanup"
+            : "paperclip error cleanup",
+        discardPersistentState: timedOut || eventInactivityFired,
       }).catch(() => {});
       const existing = warmHandles.get(prepared.sessionKey);
       if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
@@ -2967,11 +3112,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         signal: timedOut ? "SIGTERM" : null,
         timedOut,
         errorMessage: message,
-        errorCode: timedOut ? "acpx_timeout" : classified.errorCode,
+        errorCode: timedOut
+          ? "acpx_timeout"
+          : eventInactivityFired
+            ? ACPX_EVENT_INACTIVITY_ERROR_CODE
+            : classified.errorCode,
         errorMeta: classified.errorMeta,
         ...billingFields,
         model: prepared.requestedModel || null,
-        clearSession: clearSession || timedOut,
+        clearSession: clearSession || timedOut || eventInactivityFired,
         resultJson: { phase: "turn" },
         summary: message,
       };

@@ -35,6 +35,24 @@ describe("readHeartbeatRunErrorFamily", () => {
     expect(readHeartbeatRunErrorFamily(failedRun({ errorCode: "adapter_failed" }))).toBeNull();
   });
 
+  // The event-inactivity watchdog code is Paperclip-authored and unambiguous, so
+  // unlike the generic acpx phase buckets it classifies on the code alone. It has
+  // to: when the watchdog cuts a hung turn the run's `error` is the watchdog's own
+  // message, so a connectivity message gate would never match it.
+  it("classifies the acpx event-inactivity watchdog as transient upstream without a message gate", () => {
+    expect(readHeartbeatRunErrorFamily(failedRun({ errorCode: "acpx_event_inactivity" }))).toBe(
+      "transient_upstream",
+    );
+    expect(
+      readHeartbeatRunErrorFamily(
+        failedRun({
+          errorCode: "acpx_event_inactivity",
+          error: "watchdog: no ACP events for 45m 0s; the turn was cancelled as unresponsive.",
+        }),
+      ),
+    ).toBe("transient_upstream");
+  });
+
   it("still prefers a family the adapter persisted on the run", () => {
     expect(
       readHeartbeatRunErrorFamily(

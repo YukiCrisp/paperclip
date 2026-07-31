@@ -2795,3 +2795,233 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     expect(emitted.has("bridge.process-session")).toBe(false);
   });
 });
+
+describe("ACPX event-inactivity watchdog", () => {
+  // A turn that establishes a session and then goes completely silent is the
+  // exact shape measured in production behind "Unable to connect to API
+  // (ConnectionRefused)": the child retries upstream internally, emits nothing,
+  // and the run hung 50-130 minutes. `events` never yielding and `result` never
+  // settling is that shape at its worst.
+  function buildSilentRuntime(input: {
+    onCancel?: (reason: string | undefined) => void;
+    settleResultOnCancel?: boolean;
+  }) {
+    let settleResult: ((value: unknown) => void) | null = null;
+    return {
+      ensureSession: async () => ({
+        backendSessionId: "backend-session",
+        agentSessionId: "agent-session",
+        runtimeSessionName: "runtime-session",
+      }),
+      startTurn: () => ({
+        events: (async function* () {
+          // Never yields, never returns — the loop has nothing to wake it.
+          await new Promise(() => {});
+        })(),
+        result: new Promise((resolve) => {
+          settleResult = resolve;
+        }),
+        cancel: async (cancelInput?: { reason?: string }) => {
+          input.onCancel?.(cancelInput?.reason);
+          if (input.settleResultOnCancel) {
+            settleResult?.({ status: "cancelled", stopReason: "cancelled" });
+          }
+        },
+      }),
+      close: async () => {},
+    } as never;
+  }
+
+  async function runSilentTurn(
+    config: Record<string, unknown>,
+    options: { settleResultOnCancel?: boolean } = {},
+  ) {
+    const cancelReasons: Array<string | undefined> = [];
+    const logs: Array<{ stream: string; text: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        buildSilentRuntime({
+          onCancel: (reason) => cancelReasons.push(reason),
+          settleResultOnCancel: options.settleResultOnCancel ?? true,
+        }),
+    });
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config,
+      context: {},
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+    return { result, cancelReasons, logs };
+  }
+
+  it("bounds a turn whose event stream never produces anything", async () => {
+    const root = await makeTempRoot();
+    const { result, cancelReasons } = await runSilentTurn({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+      outputInactivityTimeoutMs: 25,
+    });
+
+    expect(result.exitCode).toBe(1);
+    // NOT the generic `acpx_turn_failed` phase bucket: the server maps this code
+    // to the transient retry ladder on the code alone, without a message gate.
+    expect(result.errorCode).toBe("acpx_event_inactivity");
+    expect(result.errorMessage).toBe("watchdog: no ACP events for 0m 0s; the turn was cancelled as unresponsive.");
+    // The wall-clock timeout did not fire; `timedOut` must stay honest so
+    // timeout telemetry keeps meaning "the adapter deadline elapsed".
+    expect(result.timedOut).toBe(false);
+    expect(cancelReasons).toEqual([
+      "watchdog: no ACP events for 0m 0s; the turn was cancelled as unresponsive.",
+    ]);
+  });
+
+  // Aborting alone is not enough: abort reaches the agent as an in-band ACP
+  // `session/cancel`, and a child silent for the whole window is the one least
+  // likely to honor it. If the engine still awaited `turn.result` unbounded,
+  // this test would hang instead of failing.
+  it("still returns when the cancelled turn never settles its result", async () => {
+    const root = await makeTempRoot();
+    const { result } = await runSilentTurn(
+      {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        outputInactivityTimeoutMs: 25,
+      },
+      { settleResultOnCancel: false },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_event_inactivity");
+  });
+
+  it("logs the effective watchdog window at the start of the run", async () => {
+    const root = await makeTempRoot();
+    const { logs } = await runSilentTurn({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+      outputInactivityTimeoutMs: 25,
+    });
+
+    expect(logs.map((entry) => entry.text).join("")).toContain(
+      "[paperclip] ACP event inactivity watchdog: 0m 0s (25ms), configured via adapterConfig.outputInactivityTimeoutMs.",
+    );
+  });
+
+  it("does not fire while the turn keeps producing events", async () => {
+    const root = await makeTempRoot();
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        ({
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            // Each gap is under the window; only the *total* exceeds it. A
+            // wall-clock cap would kill this turn, an inactivity watchdog must not.
+            events: (async function* () {
+              for (let i = 0; i < 6; i += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                yield { type: "text_delta", text: `chunk-${i}` };
+              }
+            })(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async () => {},
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        outputInactivityTimeoutMs: 50,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode ?? null).toBe(null);
+    expect(result.summary).toBe("chunk-0chunk-1chunk-2chunk-3chunk-4chunk-5");
+  });
+
+  // The watchdog guards the *event stream*. Once that stream has ended, a slow
+  // `turn.result` is not agent silence, and firing there would condemn a turn
+  // that had already finished streaming — the nastiest possible false positive.
+  it("disarms once the event stream ends, even if the terminal is slow to settle", async () => {
+    const root = await makeTempRoot();
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        ({
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {
+              yield { type: "text_delta", text: "all done" };
+            })(),
+            result: new Promise((resolve) =>
+              setTimeout(() => resolve({ status: "completed", stopReason: "end_turn" }), 120),
+            ),
+            cancel: async () => {},
+          }),
+          close: async () => {},
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        // Shorter than the terminal's own delay: an armed watchdog would fire.
+        outputInactivityTimeoutMs: 25,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode ?? null).toBe(null);
+    expect(result.summary).toBe("all done");
+  });
+
+  it("stays out of the way when disabled with an explicit null", async () => {
+    const root = await makeTempRoot();
+    const { logs, result } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+      outputInactivityTimeoutMs: null,
+    });
+
+    // Disabling is logged loudly on purpose: with no watchdog and no wall-clock
+    // timeout on a local target, nothing in the adapter bounds the turn at all.
+    expect(logs.map((entry) => entry.text).join("")).toContain(
+      "ACP event inactivity watchdog: DISABLED",
+    );
+    expect(result.errorCode ?? null).toBe(null);
+  });
+});

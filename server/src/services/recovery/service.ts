@@ -25,6 +25,7 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
+import { ACPX_EVENT_INACTIVITY_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/event-inactivity";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -308,6 +309,10 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   // issue to `blocked` on a single strike, because the default policy is one attempt.
   "acpx_session_init_failed",
   "acpx_turn_failed",
+  // The acpx event-inactivity watchdog cut a silent turn. Retryable by
+  // construction: the watchdog is what makes an unbounded hang finite, and a
+  // bounded retry is the only useful thing to do with the run it ended.
+  ACPX_EVENT_INACTIVITY_ERROR_CODE,
   "provider_quota",
   "timeout",
 ]);
