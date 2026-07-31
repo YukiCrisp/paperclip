@@ -251,6 +251,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import { ACPX_EVENT_INACTIVITY_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/event-inactivity";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -517,7 +518,15 @@ export function readHeartbeatRunErrorFamily(
   if (
     run.errorCode === "codex_transient_upstream" ||
     run.errorCode === "claude_transient_upstream" ||
-    run.errorCode === "codex_harness_crash"
+    run.errorCode === "codex_harness_crash" ||
+    // The acpx event-inactivity watchdog. Unlike the generic `acpx_*` phase
+    // buckets gated by `isAcpxConnectivityFailure` below, this code is
+    // Paperclip-authored and means exactly one thing — the adapter cut a turn
+    // whose event stream had gone silent — so it needs no message gate.
+    // Retrying is right either way: a genuine upstream stall clears on the
+    // ladder, and a false positive on a legitimately slow turn is re-attempted
+    // instead of escalating the issue to `blocked` on one strike.
+    run.errorCode === ACPX_EVENT_INACTIVITY_ERROR_CODE
   ) {
     return "transient_upstream";
   }
