@@ -86,8 +86,10 @@ import {
   ACPX_EVENT_INACTIVITY_ERROR_CODE,
   acpxEventInactivityCancelGraceMs,
   acpxEventInactivityTimeoutMs,
+  acpxFirstEventTimeoutMs,
   formatAcpxEventInactivityErrorMessage,
   formatAcpxEventInactivityStartLogLine,
+  formatAcpxFirstEventTimeoutErrorMessage,
   resolveAcpxEventInactivityTimeout,
   type AcpxEventInactivityResolution,
 } from "./event-inactivity.js";
@@ -287,6 +289,16 @@ export interface AcpxRemoteManagedHomeResult {
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
+  /**
+   * Override for the pre-first-event watchdog window
+   * (`DEFAULT_ACPX_FIRST_EVENT_TIMEOUT_MS`). Not an operator knob — there is
+   * deliberately only one of those, `adapterConfig.outputInactivityTimeoutMs`,
+   * which still caps this window and still disables it with `null`. It exists
+   * because the interesting behaviour (the window widening once the first event
+   * lands) is only observable when the two windows differ, and the real default
+   * pair is 10 minutes vs 45.
+   */
+  firstEventTimeoutMs?: number;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -2612,7 +2624,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     // the event-silence bound too: on those targets it is the only bound there is.
     await ctx.onLog(
       "stderr",
-      `[paperclip] ${formatAcpxEventInactivityStartLogLine(prepared.eventInactivity)}\n`,
+      `[paperclip] ${formatAcpxEventInactivityStartLogLine(prepared.eventInactivity, deps.firstEventTimeoutMs)}\n`,
     );
     await cleanupIdleHandles({ handles: warmHandles, now: now(), idleMs: warmIdleMs });
 
@@ -2830,6 +2842,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     let inactivityTimer: NodeJS.Timeout | null = null;
     let eventInactivityFired = false;
     const eventInactivityMs = acpxEventInactivityTimeoutMs(prepared.eventInactivity);
+    const firstEventMs = acpxFirstEventTimeoutMs(eventInactivityMs, deps.firstEventTimeoutMs);
+    // The watchdog runs two windows: a short one until the turn's first event,
+    // then the long one for the rest of it. Which one fired decides both the
+    // wording of the error and how long we wait for the cancel ack, so it is
+    // recorded rather than re-derived.
+    let sawFirstEvent = false;
+    let firedWindowMs = eventInactivityMs;
+    let firedBeforeFirstEvent = false;
+    const eventInactivityErrorMessage = () =>
+      firedBeforeFirstEvent
+        ? formatAcpxFirstEventTimeoutErrorMessage(firedWindowMs)
+        : formatAcpxEventInactivityErrorMessage(firedWindowMs);
     const clearTurnTimers = () => {
       if (timeout) clearTimeout(timeout);
       timeout = null;
@@ -2877,13 +2901,21 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           : null;
       const armInactivityWatchdog = () => {
         if (eventInactivityMs <= 0) return;
+        // Before the first event, the short window; after it, the long one. A
+        // session that came up and then said nothing at all is a shape that
+        // does not occur on healthy runs, so there is no reason to grant it the
+        // slack a mid-turn tool call needs.
+        const beforeFirstEvent = !sawFirstEvent;
+        const windowMs = beforeFirstEvent ? firstEventMs : eventInactivityMs;
         if (inactivityTimer) clearTimeout(inactivityTimer);
         inactivityTimer = setTimeout(() => {
           eventInactivityFired = true;
+          firedWindowMs = windowMs;
+          firedBeforeFirstEvent = beforeFirstEvent;
           controller?.abort();
-          void cancelActiveTurn?.(formatAcpxEventInactivityErrorMessage(eventInactivityMs)).catch(() => {});
+          void cancelActiveTurn?.(eventInactivityErrorMessage()).catch(() => {});
           tripInactivity?.();
-        }, eventInactivityMs);
+        }, windowMs);
       };
       const eventIterator = turn.events[Symbol.asyncIterator]();
       armInactivityWatchdog();
@@ -2902,7 +2934,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         }
         if (stepped.done) break;
         // Any event at all is proof of life — including thought deltas and
-        // tool-call updates — so reset before doing any work with it.
+        // tool-call updates — so reset before doing any work with it. This is
+        // also what widens the window from the first-event bound to the full
+        // one: past this point silence can legitimately mean a long tool call.
+        sawFirstEvent = true;
         armInactivityWatchdog();
         const event = stepped.value;
         if (event.type === "text_delta") textParts.push(event.text);
@@ -2921,7 +2956,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const terminal = eventInactivityFired
         ? await settleTurnResultWithinGrace(
             turn.result,
-            acpxEventInactivityCancelGraceMs(eventInactivityMs),
+            acpxEventInactivityCancelGraceMs(firedWindowMs),
             "paperclip event inactivity watchdog",
           )
         : await turn.result;
@@ -3019,7 +3054,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const errorMessage = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
         : eventInactivityFired
-          ? formatAcpxEventInactivityErrorMessage(eventInactivityMs)
+          ? eventInactivityErrorMessage()
           : resultErrorMessage(terminal);
       const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
       await emitAcpxLog(ctx, {
@@ -3077,7 +3112,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const messageOverride = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
         : eventInactivityFired
-          ? formatAcpxEventInactivityErrorMessage(eventInactivityMs)
+          ? eventInactivityErrorMessage()
           : undefined;
       const cancel = cancelActiveTurn as ((reason: string) => Promise<void>) | null;
       const preEmitMessage =

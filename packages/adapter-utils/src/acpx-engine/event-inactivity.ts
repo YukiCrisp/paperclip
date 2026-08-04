@@ -29,6 +29,27 @@
 export const DEFAULT_ACPX_EVENT_INACTIVITY_TIMEOUT_MS = 45 * 60 * 1000;
 
 /**
+ * Tighter window for the stretch between "session established" and the *first*
+ * event of the turn.
+ *
+ * The 45-minute default above is sized for silence *inside* a turn, where a
+ * single long-running tool call can legitimately go quiet for a long time.
+ * Before the first event there is no such shape: measured over 408 production
+ * runs, session-established -> first-event is a median of 1.5s, p90 3.3s, p99
+ * 9.9s, and every one of the three runs that exceeded 19s was inside a known
+ * upstream-API outage. A turn that has said literally nothing since the session
+ * came up is not working slowly, it is not working.
+ *
+ * Waiting 45 minutes on that shape is what turned one upstream outage into 22
+ * runs x 45 minutes of dead air. 10 minutes is ~32x the worst healthy
+ * observation, so it is still far outside anything normal -- deliberately
+ * generous, because the cost of being wrong is one extra retry (the watchdog
+ * error code is on the transient ladder), while the cost of the old behaviour
+ * was 16.5 hours of spin.
+ */
+export const DEFAULT_ACPX_FIRST_EVENT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
  * Ceiling on how long to wait for `turn.result` after the watchdog has aborted
  * the turn.
  *
@@ -100,6 +121,23 @@ export function acpxEventInactivityTimeoutMs(resolution: AcpxEventInactivityReso
   return resolution.mode === "disabled" ? 0 : resolution.timeoutMs;
 }
 
+/**
+ * Effective pre-first-event window in ms, or 0 when the watchdog is off.
+ *
+ * There is deliberately no separate knob. The first-event window is derived
+ * from the one the operator already tuned: it is never longer than that window
+ * (someone who asks for a 2-minute bound on the whole turn is not asking to
+ * wait 10 minutes for the first event), and `outputInactivityTimeoutMs = null`
+ * disables both together. One escape hatch, not two.
+ */
+export function acpxFirstEventTimeoutMs(
+  eventInactivityMs: number,
+  firstEventMs: number = DEFAULT_ACPX_FIRST_EVENT_TIMEOUT_MS,
+): number {
+  if (eventInactivityMs <= 0) return 0;
+  return Math.min(firstEventMs, eventInactivityMs);
+}
+
 function formatDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.round(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -113,6 +151,7 @@ function formatDuration(ms: number): string {
  */
 export function formatAcpxEventInactivityStartLogLine(
   resolution: AcpxEventInactivityResolution,
+  firstEventOverrideMs?: number,
 ): string {
   if (resolution.mode === "disabled") {
     return (
@@ -121,22 +160,45 @@ export function formatAcpxEventInactivityStartLogLine(
     );
   }
   const window = `${formatDuration(resolution.timeoutMs)} (${resolution.timeoutMs}ms)`;
+  const firstEventMs = acpxFirstEventTimeoutMs(resolution.timeoutMs, firstEventOverrideMs);
+  const firstEvent =
+    ` Until the first event of the turn: ${formatDuration(firstEventMs)} (${firstEventMs}ms).`;
   if (resolution.mode === "configured") {
-    return `ACP event inactivity watchdog: ${window}, configured via adapterConfig.outputInactivityTimeoutMs.`;
+    return (
+      `ACP event inactivity watchdog: ${window}, configured via adapterConfig.outputInactivityTimeoutMs.` +
+      firstEvent
+    );
   }
   if ("reason" in resolution && resolution.reason === "non_positive") {
     return (
       `ACP event inactivity watchdog: ${window} (default). ` +
-      "Ignoring non-positive adapterConfig.outputInactivityTimeoutMs; set it to null to disable."
+      "Ignoring non-positive adapterConfig.outputInactivityTimeoutMs; set it to null to disable." +
+      firstEvent
     );
   }
   return (
     `ACP event inactivity watchdog: ${window} (default); ` +
-    "set adapterConfig.outputInactivityTimeoutMs to override, or null to disable."
+    "set adapterConfig.outputInactivityTimeoutMs to override, or null to disable." +
+    firstEvent
   );
 }
 
-/** Error message surfaced on the run when the watchdog fires. */
+/** Error message surfaced on the run when the watchdog fires mid-turn. */
 export function formatAcpxEventInactivityErrorMessage(timeoutMs: number): string {
   return `watchdog: no ACP events for ${formatDuration(timeoutMs)}; the turn was cancelled as unresponsive.`;
+}
+
+/**
+ * Error message for the pre-first-event flavour of the same kill.
+ *
+ * Same `errorCode` — the retry classification is identical and there is nothing
+ * to gain from splitting it — but the wording has to let an operator reading a
+ * failed run tell "went quiet halfway through a tool call" apart from "never
+ * said anything at all", because those two point at completely different causes.
+ */
+export function formatAcpxFirstEventTimeoutErrorMessage(timeoutMs: number): string {
+  return (
+    `watchdog: no ACP events at all in the ${formatDuration(timeoutMs)} since the session was established; ` +
+    "the turn was cancelled as unresponsive."
+  );
 }
