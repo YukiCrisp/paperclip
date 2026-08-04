@@ -51,6 +51,20 @@ describe("readHeartbeatRunErrorFamily", () => {
         }),
       ),
     ).toBe("transient_upstream");
+    // The watchdog has a second, shorter window for the stretch before the
+    // turn's first event, and it reports that kill in different words. Same
+    // code on purpose — the retry behaviour is identical — which is exactly why
+    // the wording is free to change without anyone re-tuning classification.
+    expect(
+      readHeartbeatRunErrorFamily(
+        failedRun({
+          errorCode: "acpx_event_inactivity",
+          error:
+            "watchdog: no ACP events at all in the 10m 0s since the session was established; " +
+            "the turn was cancelled as unresponsive.",
+        }),
+      ),
+    ).toBe("transient_upstream");
   });
 
   it("still prefers a family the adapter persisted on the run", () => {

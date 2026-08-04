@@ -2805,8 +2805,12 @@ describe("ACPX event-inactivity watchdog", () => {
   function buildSilentRuntime(input: {
     onCancel?: (reason: string | undefined) => void;
     settleResultOnCancel?: boolean;
+    // Events emitted before the stream goes quiet forever. The empty default is
+    // the pre-first-event shape; one leading event is the mid-turn shape.
+    leadingEvents?: number;
   }) {
     let settleResult: ((value: unknown) => void) | null = null;
+    const leadingEvents = input.leadingEvents ?? 0;
     return {
       ensureSession: async () => ({
         backendSessionId: "backend-session",
@@ -2815,7 +2819,10 @@ describe("ACPX event-inactivity watchdog", () => {
       }),
       startTurn: () => ({
         events: (async function* () {
-          // Never yields, never returns — the loop has nothing to wake it.
+          for (let i = 0; i < leadingEvents; i += 1) {
+            yield { type: "text_delta", text: `chunk-${i}` };
+          }
+          // Never yields again, never returns — the loop has nothing to wake it.
           await new Promise(() => {});
         })(),
         result: new Promise((resolve) => {
@@ -2834,15 +2841,23 @@ describe("ACPX event-inactivity watchdog", () => {
 
   async function runSilentTurn(
     config: Record<string, unknown>,
-    options: { settleResultOnCancel?: boolean } = {},
+    options: {
+      settleResultOnCancel?: boolean;
+      leadingEvents?: number;
+      firstEventTimeoutMs?: number;
+    } = {},
   ) {
     const cancelReasons: Array<string | undefined> = [];
     const logs: Array<{ stream: string; text: string }> = [];
     const execute = createAcpxEngineExecutor({
+      ...(options.firstEventTimeoutMs != null
+        ? { firstEventTimeoutMs: options.firstEventTimeoutMs }
+        : {}),
       createRuntime: () =>
         buildSilentRuntime({
           onCancel: (reason) => cancelReasons.push(reason),
           settleResultOnCancel: options.settleResultOnCancel ?? true,
+          leadingEvents: options.leadingEvents,
         }),
     });
     const result = await execute({
@@ -2872,13 +2887,110 @@ describe("ACPX event-inactivity watchdog", () => {
     // NOT the generic `acpx_turn_failed` phase bucket: the server maps this code
     // to the transient retry ladder on the code alone, without a message gate.
     expect(result.errorCode).toBe("acpx_event_inactivity");
-    expect(result.errorMessage).toBe("watchdog: no ACP events for 0m 0s; the turn was cancelled as unresponsive.");
+    // Nothing was ever emitted, so this is the pre-first-event flavour. Same
+    // code (same retry ladder), distinct wording — an operator has to be able to
+    // tell "never spoke" from "went quiet mid-tool-call" off the run alone.
+    expect(result.errorMessage).toBe(
+      "watchdog: no ACP events at all in the 0m 0s since the session was established; " +
+        "the turn was cancelled as unresponsive.",
+    );
     // The wall-clock timeout did not fire; `timedOut` must stay honest so
     // timeout telemetry keeps meaning "the adapter deadline elapsed".
     expect(result.timedOut).toBe(false);
     expect(cancelReasons).toEqual([
-      "watchdog: no ACP events for 0m 0s; the turn was cancelled as unresponsive.",
+      "watchdog: no ACP events at all in the 0m 0s since the session was established; " +
+        "the turn was cancelled as unresponsive.",
     ]);
+  });
+
+  // The pre-first-event window is derived from the configured one and can only
+  // ever be shorter. Here the default first-event bound is 10 minutes and the
+  // configured bound is 25ms — if the derivation were the other way round (or
+  // additive), this test would sit for ten minutes instead of failing.
+  it("never stretches the first-event window past a tighter configured timeout", async () => {
+    const root = await makeTempRoot();
+    const startedAt = Date.now();
+    const { result } = await runSilentTurn(
+      {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        outputInactivityTimeoutMs: 25,
+      },
+      // Deliberately far longer than the configured window: the smaller wins.
+      { firstEventTimeoutMs: 60_000 },
+    );
+
+    expect(result.errorCode).toBe("acpx_event_inactivity");
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+  });
+
+  // Once anything has been emitted, silence is no longer diagnostic of a dead
+  // session — it is what a long tool call looks like — so the kill reverts to
+  // the full window and says so.
+  it("reports post-first-event silence with the mid-turn wording", async () => {
+    const root = await makeTempRoot();
+    const { result } = await runSilentTurn(
+      {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        outputInactivityTimeoutMs: 25,
+      },
+      { leadingEvents: 1 },
+    );
+
+    expect(result.errorCode).toBe("acpx_event_inactivity");
+    expect(result.errorMessage).toBe(
+      "watchdog: no ACP events for 0m 0s; the turn was cancelled as unresponsive.",
+    );
+  });
+
+  // The whole point of splitting the windows: a single event has to buy back
+  // the full 45-minute allowance. The gap here is four times the first-event
+  // bound and would have been fatal before that event landed.
+  it("widens the window to the configured timeout once the first event lands", async () => {
+    const root = await makeTempRoot();
+    const execute = createAcpxEngineExecutor({
+      firstEventTimeoutMs: 100,
+      createRuntime: () =>
+        ({
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {
+              yield { type: "text_delta", text: "hello" };
+              await new Promise((resolve) => setTimeout(resolve, 400));
+              yield { type: "text_delta", text: " world" };
+            })(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async () => {},
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        outputInactivityTimeoutMs: 5_000,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode ?? null).toBe(null);
+    expect(result.summary).toBe("hello world");
   });
 
   // Aborting alone is not enough: abort reaches the agent as an in-band ACP
@@ -2911,7 +3023,8 @@ describe("ACPX event-inactivity watchdog", () => {
     });
 
     expect(logs.map((entry) => entry.text).join("")).toContain(
-      "[paperclip] ACP event inactivity watchdog: 0m 0s (25ms), configured via adapterConfig.outputInactivityTimeoutMs.",
+      "[paperclip] ACP event inactivity watchdog: 0m 0s (25ms), configured via adapterConfig.outputInactivityTimeoutMs." +
+        " Until the first event of the turn: 0m 0s (25ms).",
     );
   });
 
