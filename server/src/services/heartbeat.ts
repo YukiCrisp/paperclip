@@ -9779,12 +9779,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const spentAttempts = retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON && issueId
       ? Math.max(
           run.scheduledRetryAttempt ?? 0,
+          // This runs while handling a failure, and a database that is unwell is
+          // most likely to be so during the very outage that brings us here. An
+          // uncaught throw would escape to the outer failure handler, whose
+          // `setRunStatusIfRunning` no-ops on this already-terminal run and
+          // returns early — skipping `releaseIssueExecutionAndPromote` and
+          // leaving the issue holding a finished run as its execution lock, which
+          // is the symptom this change exists to remove. Degrade to the old
+          // run-local attempt count instead; `Math.max` makes that lossless.
           (await summarizeIssueAutomaticRetryFailureStreak({
             db,
             companyId: run.companyId,
             issueId,
             agentId: run.agentId,
-          })).consecutive,
+          }).catch(() => ({ consecutive: 0, latestFinishedAt: null, policyKey: null }))).consecutive,
         )
       : run.scheduledRetryAttempt ?? 0;
     const nextAttempt = spentAttempts + 1;

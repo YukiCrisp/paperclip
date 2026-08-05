@@ -112,7 +112,29 @@ describe("automatic retry failure streak", () => {
     expect(summarizeAutomaticRetryFailureStreak(runs).consecutive).toBe(0);
   });
 
+  it("does not let a provider-quota wait reset the count", () => {
+    // `provider_quota_recovery` reschedules the issue after the usage limit
+    // resets, and its run is created with `scheduledRetryAttempt = 1`. If it were
+    // not an automatic retry reason it would break the streak here and hand the
+    // transient ladder a near-full budget again — the same shape as the
+    // mechanism hand-off above. `provider_quota` classifies into the same
+    // `transient_infra` policy as the acpx codes, so this is one episode.
+    const runs = sample([
+      { id: "d", errorCode: "acpx_event_inactivity", retryReason: "transient_failure" },
+      { id: "c", errorCode: "acpx_turn_failed", retryReason: "provider_quota_recovery" },
+      { id: "b", errorCode: "provider_quota", retryReason: "transient_failure" },
+      { id: "a", errorCode: "acpx_event_inactivity", retryReason: "transient_failure" },
+    ]);
+    expect(summarizeAutomaticRetryFailureStreak(runs).consecutive).toBe(4);
+  });
+
   it("does not merge failures that carry different retry budgets", () => {
+    // Forward guard, not a regression guard for ENGA-2912: this passes both
+    // before and after the fix (the old rule broke on the differing error code,
+    // the new one breaks on the differing policy key). It pins the *granularity*
+    // of `retryPolicyKey` — that widening the key from error code to policy did
+    // not also pool two budgets that are deliberately sized differently.
+    //
     // `skills_source_unavailable` has its own swap-window budget and
     // `agent_not_invokable` is not retryable at all; neither is the same
     // episode as a generic transient outage.
@@ -143,8 +165,36 @@ describe("automatic retry reasons", () => {
     expect(isAutomaticRetryReason("issue_continuation_needed")).toBe(true);
   });
 
+  it("covers every failure-driven retry reason the server emits", () => {
+    // Kept in step with the `retryReason` literals written into a run's
+    // contextSnapshot by heartbeat.ts and recovery/service.ts. A reason that
+    // re-runs a failed issue but is missing here does not merely go uncounted —
+    // it *breaks* the streak, so it restores the budget it should have spent.
+    for (const reason of [
+      "transient_failure",
+      "issue_continuation_needed",
+      "assignment_recovery",
+      "execution_review_participant_recovery",
+      "interaction_continuation_infra_retry",
+      "process_lost",
+      "provider_quota_recovery",
+    ]) {
+      expect(isAutomaticRetryReason(reason)).toBe(true);
+    }
+  });
+
   it("excludes wakes that carry new input or resume a run that did not fail", () => {
-    for (const reason of [null, "issue_assigned", "issue_commented", "max_turns_continuation"]) {
+    // `max_turns_continuation` resumes a turn that ran out of turns and
+    // `missing_issue_comment` re-runs one that finished without posting its
+    // comment. Both follow a run that did not fail, so neither is an attempt at
+    // the same failing work and neither belongs to this budget.
+    for (const reason of [
+      null,
+      "issue_assigned",
+      "issue_commented",
+      "max_turns_continuation",
+      "missing_issue_comment",
+    ]) {
       expect(isAutomaticRetryReason(reason)).toBe(false);
     }
   });
