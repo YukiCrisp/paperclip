@@ -217,7 +217,11 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS, recoveryService } from "./recovery/service.js";
+import {
+  ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+  recoveryService,
+  summarizeIssueAutomaticRetryFailureStreak,
+} from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -9764,7 +9768,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
     const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS));
-    const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    // ENGA-2912: `scheduledRetryAttempt` only travels along this mechanism's own
+    // retry chain, so a run produced by the recovery reconciler arrives at 0 and
+    // silently hands the transient budget a full fresh start — which is how one
+    // stuck issue burned 15 runs over 10 hours instead of the 4 this budget
+    // allows. Count the attempts the issue has actually spent on automatic
+    // retries, whichever mechanism queued them.
+    const spentAttempts = retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON && issueId
+      ? Math.max(
+          run.scheduledRetryAttempt ?? 0,
+          (await summarizeIssueAutomaticRetryFailureStreak({
+            db,
+            companyId: run.companyId,
+            issueId,
+            agentId: run.agentId,
+          })).consecutive,
+        )
+      : run.scheduledRetryAttempt ?? 0;
+    const nextAttempt = spentAttempts + 1;
     const computedBaseSchedule = opts?.delayMs != null
       ? nextAttempt <= maxAttempts
         ? {
@@ -9788,18 +9811,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
-    const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
 
     if (!baseSchedule) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
+        message: `Bounded retry exhausted after ${spentAttempts} scheduled attempts; no further automatic retry will be queued`,
         payload: {
           retryReason,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
+          automaticRetryAttemptsSpent: spentAttempts,
           maxAttempts,
         },
       });
