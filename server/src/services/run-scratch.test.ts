@@ -139,8 +139,12 @@ describe("heartbeat run scratch root resolution", () => {
     else process.env.TMPDIR = originalTmpDir;
   });
 
+  // Synthetic root on purpose: resolution is pure path arithmetic, and
+  // `os.tmpdir()` is itself a `paperclip-run-*` scratch whenever the suite runs
+  // inside an agent run — the very nesting this un-nests — so using it as the
+  // expected root would fail everywhere it matters.
   it("walks back out of nested run scratch segments", () => {
-    const real = path.resolve(os.tmpdir());
+    const real = path.join(path.sep, "fixture-temp-root");
     const nested = path.join(real, "paperclip-run-a-1-aaaaaa", "paperclip-run-b-2-bbbbbb");
 
     expect(resolveHeartbeatRunScratchRoot(nested)).toBe(real);
