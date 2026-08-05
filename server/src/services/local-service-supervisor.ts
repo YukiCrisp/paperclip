@@ -362,37 +362,91 @@ export async function touchLocalServiceRegistryRecord(
   return next;
 }
 
+export type LocalServiceTerminationOutcome =
+  /** The signal could not be delivered and nothing answers the liveness probe. */
+  | "not_running"
+  /** The target went away within the grace window after the first signal. */
+  | "exited"
+  /** The target needed SIGKILL and was confirmed gone afterwards. */
+  | "force_killed"
+  /** The target answered the liveness probe after we ran out of escalation. */
+  | "still_alive";
+
+export interface LocalServiceTerminationResult {
+  outcome: LocalServiceTerminationOutcome;
+  /**
+   * `true` only when the liveness probe says the target is gone. Callers that
+   * are about to write a terminal status must not read a `false` here as
+   * "probably fine" — it is the one signal that separates "the run finished"
+   * from "the row says finished while the child keeps running" (ENGA-2918).
+   */
+  confirmedDead: boolean;
+  pid: number;
+  processGroupId: number | null;
+  targetedProcessGroup: boolean;
+}
+
+/**
+ * Terminate a supervised local process (or its whole process group) and report
+ * whether it actually died.
+ *
+ * This used to be fire-and-forget: `process.kill` errors were swallowed and the
+ * final SIGKILL was never followed by a liveness re-check, so every caller
+ * marked its run terminal on the strength of "we sent a signal". That is how a
+ * run reads `finished` in the API while its `claude-agent-acp` child lives on
+ * for hours (ENGA-2912 / ENGA-2918).
+ *
+ * The liveness probe is `kill(pid, 0)`, which still answers for a not-yet-reaped
+ * zombie child, so a `still_alive` verdict is a best-effort upper bound rather
+ * than proof. It is reported, never acted on destructively.
+ */
 export async function terminateLocalService(
   record: Pick<LocalServiceRegistryRecord, "pid" | "processGroupId">,
-  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number },
-) {
+  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number; confirmKillMs?: number },
+): Promise<LocalServiceTerminationResult> {
   const signal = opts?.signal ?? "SIGTERM";
-  const targetProcessGroup = process.platform !== "win32" && record.processGroupId && record.processGroupId > 0;
+  const targetProcessGroup = !!(
+    process.platform !== "win32" &&
+    record.processGroupId &&
+    record.processGroupId > 0
+  );
+  const base = {
+    pid: record.pid,
+    processGroupId: record.processGroupId ?? null,
+    targetedProcessGroup: targetProcessGroup,
+  };
+  const isTargetAlive = () =>
+    targetProcessGroup ? isProcessGroupAlive(record.processGroupId) : isPidAlive(record.pid);
+
   try {
     if (targetProcessGroup) {
       process.kill(-record.processGroupId!, signal);
     } else {
       process.kill(record.pid, signal);
     }
-  } catch {
-    return;
+  } catch (err) {
+    // ESRCH (already gone) and EPERM (alive, but not ours to signal) both land
+    // here. `isPidAlive` cannot tell them apart — it treats any throw as dead —
+    // so read the errno before falling back to the probe.
+    if ((err as NodeJS.ErrnoException | null)?.code === "EPERM") {
+      return { ...base, outcome: "still_alive", confirmedDead: false };
+    }
+    return isTargetAlive()
+      ? { ...base, outcome: "still_alive", confirmedDead: false }
+      : { ...base, outcome: "not_running", confirmedDead: true };
   }
 
   const deadline = Date.now() + (opts?.forceAfterMs ?? 2_000);
   while (Date.now() < deadline) {
-    const targetAlive = targetProcessGroup
-      ? isProcessGroupAlive(record.processGroupId)
-      : isPidAlive(record.pid);
-    if (!targetAlive) {
-      return;
+    if (!isTargetAlive()) {
+      return { ...base, outcome: "exited", confirmedDead: true };
     }
     await delay(100);
   }
 
-  const stillAlive = targetProcessGroup
-    ? isProcessGroupAlive(record.processGroupId)
-    : isPidAlive(record.pid);
-  if (!stillAlive) return;
+  if (!isTargetAlive()) {
+    return { ...base, outcome: "exited", confirmedDead: true };
+  }
   try {
     if (targetProcessGroup) {
       process.kill(-record.processGroupId!, "SIGKILL");
@@ -400,7 +454,20 @@ export async function terminateLocalService(
       process.kill(record.pid, "SIGKILL");
     }
   } catch {
-    // Ignore cleanup races.
+    // Ignore cleanup races; the confirmation loop below decides the outcome.
+  }
+
+  // SIGKILL is asynchronous. Give the kernel a bounded window to tear the
+  // target down so the answer reflects reality rather than intent.
+  const confirmDeadline = Date.now() + (opts?.confirmKillMs ?? 1_000);
+  for (;;) {
+    if (!isTargetAlive()) {
+      return { ...base, outcome: "force_killed", confirmedDead: true };
+    }
+    if (Date.now() >= confirmDeadline) {
+      return { ...base, outcome: "still_alive", confirmedDead: false };
+    }
+    await delay(50);
   }
 }
 

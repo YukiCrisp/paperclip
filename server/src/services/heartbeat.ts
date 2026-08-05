@@ -164,14 +164,20 @@ import {
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import {
+  isProcessGroupAlive,
+  terminateLocalService,
+  type LocalServiceTerminationResult,
+} from "./local-service-supervisor.js";
 import { isProcessAlive, isTrackedProcessAlive } from "./process-liveness.js";
 import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
+  reapOrphanedRunScratchDirs as reapOrphanedRunScratchDirsInTemp,
   type HeartbeatRunScratch,
+  type HeartbeatRunScratchOwnerVerdict,
 } from "./run-scratch.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -5281,12 +5287,14 @@ async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
-}) {
+  runId?: string;
+  reason?: string;
+}): Promise<LocalServiceTerminationResult | null> {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
+  if (typeof pid !== "number" && typeof processGroupId !== "number") return null;
 
-  await terminateLocalService(
+  const result = await terminateLocalService(
     {
       pid:
         typeof pid === "number" && Number.isInteger(pid) && pid > 0
@@ -5299,6 +5307,38 @@ async function terminateHeartbeatRunProcess(input: {
     },
     input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
   );
+  // (ENGA-2918) Every terminate path writes a terminal run status right after
+  // this call. Surface a survivor here, once, so no call site can quietly
+  // record "finished" over a child that outlived SIGKILL.
+  if (!result.confirmedDead) {
+    logger.warn(
+      {
+        runId: input.runId,
+        reason: input.reason,
+        ...result,
+      },
+      "run process survived termination; run will be terminalized with a live child",
+    );
+  }
+  return result;
+}
+
+// (ENGA-2918) Attach the termination verdict to the run's own lifecycle event so
+// "the row says terminal but the child is alive" is diagnosable from the run
+// timeline, not only from server logs that rotate away.
+function buildRunProcessTerminationPayload(
+  termination: LocalServiceTerminationResult | null,
+): { processTermination?: Record<string, unknown> } {
+  if (!termination) return {};
+  return {
+    processTermination: {
+      outcome: termination.outcome,
+      confirmedDead: termination.confirmedDead,
+      targetedProcessGroup: termination.targetedProcessGroup,
+      ...(termination.pid > 0 ? { pid: termination.pid } : {}),
+      ...(termination.processGroupId ? { processGroupId: termination.processGroupId } : {}),
+    },
+  };
 }
 
 function buildProcessLossMessage(run: {
@@ -9287,76 +9327,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
+    const drainFailedRunIds: string[] = [];
 
     for (const { run, agent } of activeRuns) {
-      const running = runningProcesses.get(run.id);
+      // (ENGA-2918) One run's failure must not abort the drain. Without this
+      // guard an exception here escaped to the caller's "graceful heartbeat run
+      // drain failed" log and every *later* run in `activeRuns` was skipped
+      // entirely — not even terminated — before `process.exit(0)`, leaving
+      // detached children and their scratch dirs behind. The sibling
+      // `terminateOwnedRunsForShutdown` has always been shaped this way.
       try {
-        if (running) {
-          await terminateHeartbeatRunProcess({
-            pid: running.child.pid ?? run.processPid,
-            processGroupId: running.processGroupId ?? run.processGroupId,
-            graceMs: Math.max(1, running.graceSec) * 1000,
-          });
-        } else if (run.processPid || run.processGroupId) {
-          await terminateHeartbeatRunProcess({
-            pid: run.processPid,
-            processGroupId: run.processGroupId,
-          });
+        const running = runningProcesses.get(run.id);
+        let termination: LocalServiceTerminationResult | null = null;
+        try {
+          if (running) {
+            termination = await terminateHeartbeatRunProcess({
+              pid: running.child.pid ?? run.processPid,
+              processGroupId: running.processGroupId ?? run.processGroupId,
+              graceMs: Math.max(1, running.graceSec) * 1000,
+              runId: run.id,
+              reason: "server_shutdown_interrupted",
+            });
+          } else if (run.processPid || run.processGroupId) {
+            termination = await terminateHeartbeatRunProcess({
+              pid: run.processPid,
+              processGroupId: run.processGroupId,
+              runId: run.id,
+              reason: "server_shutdown_interrupted",
+            });
+          }
+        } finally {
+          runningProcesses.delete(run.id);
         }
-      } finally {
-        runningProcesses.delete(run.id);
-      }
 
-      const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
-      const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
-        finishedAt: now,
-        error: message,
-        errorCode: "server_shutdown_interrupted",
-        signal,
-        resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-          resultJson: parseObject(run.resultJson),
+        const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
+        const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
+          finishedAt: now,
+          error: message,
           errorCode: "server_shutdown_interrupted",
-          errorMessage: message,
-        }),
-      });
-      if (!interruptedStatus.updated || !interruptedStatus.run) continue;
-      let interrupted = interruptedStatus.run;
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: now,
-        error: null,
-      });
-      interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
-
-      await releaseEnvironmentLeasesForRun({
-        runId: interrupted.id,
-        companyId: interrupted.companyId,
-        agentId: interrupted.agentId,
-        status: interrupted.status,
-        failureReason: interrupted.error ?? undefined,
-      });
-
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
-        retryRunIds.push(retry.id);
-      }
-
-      await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
           signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
+          resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
+            resultJson: parseObject(run.resultJson),
+            errorCode: "server_shutdown_interrupted",
+            errorMessage: message,
+          }),
+        });
+        if (!interruptedStatus.updated || !interruptedStatus.run) continue;
+        let interrupted = interruptedStatus.run;
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+          finishedAt: now,
+          error: null,
+        });
+        interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
 
-      await finalizeAgentStatus(run.agentId, "interrupted", message);
-      interruptedRunIds.push(interrupted.id);
+        await releaseEnvironmentLeasesForRun({
+          runId: interrupted.id,
+          companyId: interrupted.companyId,
+          agentId: interrupted.agentId,
+          status: interrupted.status,
+          failureReason: interrupted.error ?? undefined,
+        });
+
+        const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+        if (!retry) {
+          await releaseIssueExecutionAndPromote(interrupted);
+        } else {
+          retryRunIds.push(retry.id);
+        }
+
+        await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message,
+          payload: {
+            signal,
+            ...(run.processPid ? { processPid: run.processPid } : {}),
+            ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+            ...(retry ? { retryRunId: retry.id } : {}),
+            ...buildRunProcessTerminationPayload(termination),
+          },
+        });
+
+        await finalizeAgentStatus(run.agentId, "interrupted", message);
+        interruptedRunIds.push(interrupted.id);
+      } catch (err) {
+        drainFailedRunIds.push(run.id);
+        logger.warn(
+          { err, runId: run.id, agentId: run.agentId, signal },
+          "failed to drain running heartbeat run during graceful shutdown",
+        );
+      }
     }
 
     if (interruptedRunIds.length > 0) {
@@ -9365,11 +9426,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         "interrupted running heartbeat runs for graceful shutdown",
       );
     }
+    if (drainFailedRunIds.length > 0) {
+      logger.error(
+        { signal, failed: drainFailedRunIds.length, drainFailedRunIds },
+        "some heartbeat runs could not be drained for graceful shutdown; the startup reaper is the backstop",
+      );
+    }
 
     return {
       interrupted: interruptedRunIds.length,
       interruptedRunIds,
       retryRunIds,
+      drainFailedRunIds,
     };
   }
 
@@ -11697,6 +11765,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await terminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
+          runId: run.id,
+          reason: "orphan_reaper",
         });
       }
 
@@ -11729,6 +11799,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
     return { reaped: reaped.length, runIds: reaped };
+  }
+
+  // (ENGA-2918) `reapOrphanedRuns` only reconciles run *rows*; nothing owned the
+  // scratch *directories* a lost run left in the temp root, because the path is
+  // never persisted and the in-process `finally` that would remove it never
+  // settles when the child survives its kill. This sweep reads the ownership
+  // marker each scratch dir carries and asks the database whether that run is
+  // done, so it collects leftovers from previous server lifetimes too.
+  async function reapOrphanedRunScratchDirs(opts?: {
+    now?: Date;
+    unknownOwnerMinAgeMs?: number;
+    root?: string;
+  }) {
+    const verdictCache = new Map<string, HeartbeatRunScratchOwnerVerdict>();
+    const result = await reapOrphanedRunScratchDirsInTemp({
+      ...(opts?.now ? { now: opts.now } : {}),
+      ...(opts?.root ? { root: opts.root } : {}),
+      ...(opts?.unknownOwnerMinAgeMs !== undefined
+        ? { unknownOwnerMinAgeMs: opts.unknownOwnerMinAgeMs }
+        : {}),
+      resolveOwner: async (metadata) => {
+        const cached = verdictCache.get(metadata.runId);
+        if (cached) return cached;
+        const verdict = await resolveRunScratchOwnerVerdict(metadata.runId);
+        verdictCache.set(metadata.runId, verdict);
+        return verdict;
+      },
+    });
+    if (result.removed.length > 0 || result.failed.length > 0) {
+      logger.warn(
+        {
+          scanned: result.scanned,
+          removed: result.removed.length,
+          kept: result.kept.length,
+          failed: result.failed,
+        },
+        "reaped orphaned heartbeat run scratch directories",
+      );
+    }
+    return result;
+  }
+
+  async function resolveRunScratchOwnerVerdict(runId: string): Promise<HeartbeatRunScratchOwnerVerdict> {
+    // In-memory ownership is authoritative and cheaper than a query: a run this
+    // process is executing right now must keep its scratch whatever the row says.
+    if (runningProcesses.has(runId) || activeRunExecutions.has(runId)) return "keep";
+    // Markers written by other tooling (or by tests) need not carry a real run
+    // id, and a malformed uuid is a query error rather than an empty result.
+    if (!isUuidLike(runId)) return "unknown";
+    const row = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!row) return "unknown";
+    return isHeartbeatRunTerminalStatus(row.status) ? "reclaim" : "keep";
   }
 
   // Safe service-layer termination of a single dead orphaned run, shared by the
@@ -17094,17 +17220,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : options.resultJson;
 
     const running = runningProcesses.get(run.id);
+    let termination: LocalServiceTerminationResult | null = null;
     try {
       if (running) {
-        await terminateHeartbeatRunProcess({
+        termination = await terminateHeartbeatRunProcess({
           pid: running.child.pid ?? run.processPid,
           processGroupId: running.processGroupId ?? run.processGroupId,
           graceMs: Math.max(1, running.graceSec) * 1000,
+          runId: run.id,
+          reason: errorCode,
         });
       } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
+        termination = await terminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
+          runId: run.id,
+          reason: errorCode,
         });
       }
     } finally {
@@ -17130,7 +17261,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stream: "system",
         level: "warn",
         message: options.eventMessage ?? "run cancelled",
-        ...(options.eventPayload ? { payload: options.eventPayload } : {}),
+        ...(options.eventPayload || termination
+          ? {
+              payload: {
+                ...(options.eventPayload ?? {}),
+                ...buildRunProcessTerminationPayload(termination),
+              },
+            }
+          : {}),
       });
       await releaseIssueExecutionAndPromote(cancelled);
     }
@@ -17182,17 +17320,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : undefined;
 
         const running = runningProcesses.get(run.id);
+        let termination: LocalServiceTerminationResult | null = null;
         try {
           if (running) {
-            await terminateHeartbeatRunProcess({
+            termination = await terminateHeartbeatRunProcess({
               pid: running.child.pid ?? run.processPid,
               processGroupId: running.processGroupId ?? run.processGroupId,
               graceMs: Math.max(1, running.graceSec) * 1000,
+              runId: run.id,
+              reason: "server_shutdown",
             });
           } else if (run.processPid || run.processGroupId) {
-            await terminateHeartbeatRunProcess({
+            termination = await terminateHeartbeatRunProcess({
               pid: run.processPid,
               processGroupId: run.processGroupId,
+              runId: run.id,
+              reason: "server_shutdown",
             });
           }
         } finally {
@@ -17213,6 +17356,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             stream: "system",
             level: "warn",
             message: "run cancelled due to server shutdown",
+            ...(termination ? { payload: buildRunProcessTerminationPayload(termination) } : {}),
           });
           await releaseIssueExecutionAndPromote(cancelled, { releaseLocksOnly: true });
           await finalizeAgentStatus(run.agentId, "cancelled");
@@ -17263,12 +17407,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           pid: running.child.pid ?? run.processPid,
           processGroupId: running.processGroupId ?? run.processGroupId,
           graceMs: Math.max(1, running.graceSec) * 1000,
+          runId: run.id,
+          reason: errorCode,
         });
         runningProcesses.delete(run.id);
       } else if (run.processPid || run.processGroupId) {
         await terminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
+          runId: run.id,
+          reason: errorCode,
         });
       }
       await releaseIssueExecutionAndPromote(run);
@@ -17614,6 +17762,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    reapOrphanedRunScratchDirs,
     terminateOwnedRunsForShutdown,
     reapRunById,
     // Override-aware scheduling-suppression check (honors the worktree

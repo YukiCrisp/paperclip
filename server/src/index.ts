@@ -1023,6 +1023,28 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
+        // (ENGA-2918) Run rows are only half the leak: a run whose child
+        // outlived its kill also leaves its scratch directory in the temp root
+        // with nobody left to remove it. Sweep after the run reap so the
+        // freshly terminalized rows are already visible to the ownership check.
+        try {
+          const scratchReap = await heartbeat.reapOrphanedRunScratchDirs();
+          logger.info(
+            {
+              scanned: scratchReap.scanned,
+              removed: scratchReap.removed.length,
+              kept: scratchReap.kept.length,
+              failed: scratchReap.failed.length,
+            },
+            "startup reap of orphaned heartbeat run scratch directories complete",
+          );
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup reap of orphaned heartbeat run scratch directories failed - leftovers stay until the next boot",
+          );
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();

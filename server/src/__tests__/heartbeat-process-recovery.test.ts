@@ -254,6 +254,17 @@ async function cancelActiveRunsForCleanup(
   }
 }
 
+// Stand-in for a `terminateLocalService` call that confirmed the target died.
+function confirmedTermination(pid: number) {
+  return {
+    outcome: "exited" as const,
+    confirmedDead: true,
+    pid,
+    processGroupId: null,
+    targetedProcessGroup: false,
+  };
+}
+
 async function spawnOrphanedProcessGroup() {
   const leader = spawn(
     process.execPath,
@@ -1437,7 +1448,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       graceSec: 1,
       processGroupId: null,
     });
-    mockTerminateLocalService.mockResolvedValueOnce(undefined);
+    mockTerminateLocalService.mockResolvedValueOnce(confirmedTermination(23456));
 
     const { terminated } = await heartbeat.terminateOwnedRunsForShutdown();
 
@@ -2003,6 +2014,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
     expect(issue?.executionRunId).toBe(retryRun?.id);
+  });
+
+  // (ENGA-2918) The drain loop used to have no per-run guard: one throw escaped
+  // to index.ts's "graceful heartbeat run drain failed" log and every remaining
+  // run reached process.exit(0) without so much as a terminate call, which is
+  // how a shutdown left live children and unreleased issue locks behind.
+  it("drains the remaining runs after one run's termination throws", async () => {
+    const failing = await seedRunFixture({ agentStatus: "running", processPid: 424242 });
+    const healthy = await seedRunFixture({ agentStatus: "running" });
+    const heartbeat = heartbeatService(db);
+
+    mockTerminateLocalService.mockImplementation(async (record: { pid: number }) => {
+      if (record.pid === 424242) throw new Error("simulated termination failure");
+      return {
+        outcome: "not_running",
+        confirmedDead: true,
+        pid: record.pid,
+        processGroupId: null,
+        targetedProcessGroup: false,
+      };
+    });
+
+    const result = await heartbeat.drainRunningRunsForShutdown(
+      "SIGTERM",
+      new Date("2026-03-19T00:06:00.000Z"),
+    );
+
+    expect(result.drainFailedRunIds).toEqual([failing.runId]);
+    expect(result.interruptedRunIds).toEqual([healthy.runId]);
+
+    const failedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, failing.runId))
+      .then((rows) => rows[0] ?? null);
+    expect(failedRun?.status).toBe("running");
+
+    const drainedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, healthy.runId))
+      .then((rows) => rows[0] ?? null);
+    expect(drainedRun).toMatchObject({
+      status: "interrupted",
+      errorCode: "server_shutdown_interrupted",
+    });
   });
 
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
@@ -4099,7 +4156,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       graceSec: 1,
       processGroupId: null,
     });
-    mockTerminateLocalService.mockResolvedValueOnce(undefined);
+    mockTerminateLocalService.mockResolvedValueOnce(confirmedTermination(12345));
     const updateSpy = vi.spyOn(db, "update");
     updateSpy.mockImplementationOnce((() => {
       throw new Error("db update unavailable");
