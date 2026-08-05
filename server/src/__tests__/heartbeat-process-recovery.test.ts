@@ -667,7 +667,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
-    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "execution_review_participant_recovery" | null;
+    retryReason?:
+      | "assignment_recovery"
+      | "issue_continuation_needed"
+      | "execution_review_participant_recovery"
+      | "transient_failure"
+      | null;
     runSource?: string | null;
     assignToUser?: boolean;
     activePauseHold?: boolean;
@@ -6195,7 +6200,93 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Latest cause: `adapter_failed`");
   });
 
-  it("does not count mixed-cause continuation failures toward the transient cap", async () => {
+  // ENGA-2912. This used to assert the opposite ("does not count mixed-cause
+  // continuation failures toward the transient cap"): the cap was measured by
+  // walking recent runs and breaking on the first one whose error code differed
+  // from the latest, or whose retryReason was not this reconciler's own. A real
+  // host outage satisfies neither condition — it flips between the generic acpx
+  // phase codes, and the bounded transient retry in heartbeat.ts interleaves its
+  // own runs between the continuations. On 2026-08-05 that made the cap
+  // unreachable: 15 runs over 10 hours on an issue with a 3-attempt budget,
+  // because each mechanism reset the other's counter on every hand-off. The cap
+  // is now measured over consecutive automatic retries sharing a retry *policy*,
+  // so one outage is one streak no matter which code it reports or which
+  // mechanism queued the run.
+  it("counts interleaved transient retries and mixed acpx causes as one capped streak", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "transient_failure",
+      runErrorCode: "acpx_session_init_failed",
+      runError: "Claude ACP session creation timed out before session/new completed.",
+    });
+
+    // The three attempts before it: a different acpx phase code each time, and
+    // the mechanism alternating between the bounded transient retry and this
+    // reconciler — the exact shape ENGA-2906 recorded.
+    const priorAttempts = [
+      { at: "2026-03-18T23:45:00.000Z", errorCode: "acpx_event_inactivity", retryReason: "issue_continuation_needed" },
+      { at: "2026-03-18T23:50:00.000Z", errorCode: "acpx_turn_failed", retryReason: "transient_failure" },
+      { at: "2026-03-18T23:55:00.000Z", errorCode: "acpx_event_inactivity", retryReason: "issue_continuation_needed" },
+    ];
+    for (const attempt of priorAttempts) {
+      const at = new Date(attempt.at);
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: attempt.retryReason === "transient_failure"
+            ? "transient_failure_retry"
+            : "issue_continuation_needed",
+          retryReason: attempt.retryReason,
+          source: "issue.continuation_recovery",
+        },
+        errorCode: attempt.errorCode,
+        error: "host-side outage",
+        startedAt: at,
+        finishedAt: at,
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    // No fresh retry was queued. The status-only recovery-action run the
+    // escalation raises for the recovery owner is bounded and does not re-enter
+    // the loop, so the stuck issue stops re-claiming the agent indefinitely.
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const queuedRetries = runs.filter((row) => {
+      const ctx = row.contextSnapshot as Record<string, unknown> | null;
+      return !["failed", "cancelled", "timed_out"].includes(row.status) &&
+        typeof ctx?.retryReason === "string";
+    });
+    expect(queuedRetries).toEqual([]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("4× attempts");
+    expect(comments[0]?.body).toContain("Latest cause: `acpx_session_init_failed`");
+  });
+
+  it("keeps causes carrying different retry budgets out of one another's streak", async () => {
+    // `skills_source_unavailable` has its own swap-window budget, so its
+    // attempts must not spend the generic transient cap (or vice versa) even
+    // though both are retryable.
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -6204,8 +6295,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runError: "ssh: connection reset",
     });
 
-    await db.insert(heartbeatRuns).values([
-      {
+    for (const at of ["2026-03-18T23:45:00.000Z", "2026-03-18T23:50:00.000Z", "2026-03-18T23:55:00.000Z"]) {
+      const finishedAt = new Date(at);
+      await db.insert(heartbeatRuns).values({
         id: randomUUID(),
         companyId,
         agentId,
@@ -6219,56 +6311,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           retryReason: "issue_continuation_needed",
           source: "issue.continuation_recovery",
         },
-        errorCode: "timeout",
-        error: "request timed out",
-        startedAt: new Date("2026-03-18T23:45:00.000Z"),
-        finishedAt: new Date("2026-03-18T23:45:00.000Z"),
-        createdAt: new Date("2026-03-18T23:45:00.000Z"),
-        updatedAt: new Date("2026-03-18T23:45:00.000Z"),
-      },
-      {
-        id: randomUUID(),
-        companyId,
-        agentId,
-        invocationSource: "automation",
-        triggerDetail: "system",
-        status: "failed",
-        contextSnapshot: {
-          issueId,
-          taskId: issueId,
-          wakeReason: "issue_continuation_needed",
-          retryReason: "issue_continuation_needed",
-          source: "issue.continuation_recovery",
-        },
-        errorCode: "timeout",
-        error: "request timed out",
-        startedAt: new Date("2026-03-18T23:50:00.000Z"),
-        finishedAt: new Date("2026-03-18T23:50:00.000Z"),
-        createdAt: new Date("2026-03-18T23:50:00.000Z"),
-        updatedAt: new Date("2026-03-18T23:50:00.000Z"),
-      },
-      {
-        id: randomUUID(),
-        companyId,
-        agentId,
-        invocationSource: "automation",
-        triggerDetail: "system",
-        status: "failed",
-        contextSnapshot: {
-          issueId,
-          taskId: issueId,
-          wakeReason: "issue_continuation_needed",
-          retryReason: "issue_continuation_needed",
-          source: "issue.continuation_recovery",
-        },
-        errorCode: "adapter_failed",
-        error: "ssh: connection reset",
-        startedAt: new Date("2026-03-18T23:55:00.000Z"),
-        finishedAt: new Date("2026-03-18T23:55:00.000Z"),
-        createdAt: new Date("2026-03-18T23:55:00.000Z"),
-        updatedAt: new Date("2026-03-18T23:55:00.000Z"),
-      },
-    ]);
+        errorCode: "skills_source_unavailable",
+        error: "skills source unreadable during a deploy worktree swap",
+        startedAt: finishedAt,
+        finishedAt,
+        createdAt: finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
 
     const heartbeat = heartbeatService(db);
 

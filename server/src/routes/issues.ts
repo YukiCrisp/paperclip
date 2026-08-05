@@ -988,6 +988,18 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "missing_issue_comment",
   "process_lost_retry",
   "run_liveness_continuation",
+  // Automatic retry/recovery wakes. Without these the endpoint reported a retry
+  // storm as an undifferentiated run of `other`, which reads as "one uncapped
+  // driver" — ENGA-2912 was first diagnosed that way, when the wakes were in
+  // fact two separately *capped* mechanisms alternating and resetting each
+  // other's counter. Naming the mechanism is what makes that distinguishable.
+  "transient_failure_retry",
+  "issue_continuation_needed",
+  "issue_assignment_recovery",
+  "issue_execution_promoted",
+  "execution_review_participant_recovery",
+  "interaction_continuation_infra_retry",
+  "max_turns_continuation_retry",
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
