@@ -75,9 +75,16 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  AUTOMATIC_RETRY_STREAK_RUN_SAMPLE_LIMIT,
+  UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES,
+  isAutomaticRetryReason,
+  isUnsuccessfulTerminalRunStatus,
+  summarizeAutomaticRetryFailureStreak,
+  type AutomaticRetryStreakSummary,
+} from "./automatic-retry-streak.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -265,6 +272,26 @@ function didAutomaticRecoveryFail(
     UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
       latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
     );
+}
+
+/**
+ * Whether the issue's latest run was an automatic retry that failed — by *any*
+ * mechanism, not just the continuation reconciler's own.
+ *
+ * The narrow `didAutomaticRecoveryFail(run, "issue_continuation_needed")` check
+ * this replaces at the `in_progress` continuation site was blind to its own
+ * budget being spent elsewhere: whenever the latest run came from the bounded
+ * transient retry instead, the cap-and-backoff block was skipped entirely and
+ * the reconciler enqueued yet another continuation with nothing counted
+ * (ENGA-2912).
+ */
+function didAnyAutomaticRecoveryFail(latestRun: LatestIssueRun) {
+  if (!latestRun) return false;
+  const latestContext = parseObject(latestRun.contextSnapshot);
+  return (
+    isAutomaticRetryReason(readNonEmptyString(latestContext.retryReason)) &&
+    isUnsuccessfulTerminalRunStatus(latestRun.status)
+  );
 }
 
 function isTerminalIssueRun(latestRun: LatestIssueRun) {
@@ -513,6 +540,71 @@ export function classifyContinuationFailure(latestRun: LatestIssueRun): Continua
     baseBackoffMs: 0,
     errorCode,
   };
+}
+
+/**
+ * Identity of the retry *policy* a failure falls under, deliberately dropping
+ * the error code itself. Two attempts killed by the same outage rarely report
+ * the identical code — ENGA-2906 alternated between `acpx_event_inactivity`,
+ * `acpx_session_init_failed` and `acpx_turn_failed` — but they carry the same
+ * budget and backoff, so for streak purposes they are the same failure.
+ */
+export function continuationRetryPolicyKey(
+  classification: Pick<ContinuationRetryClassification, "kind" | "maxAttempts" | "baseBackoffMs">,
+) {
+  return `${classification.kind}:${classification.maxAttempts}:${classification.baseBackoffMs}`;
+}
+
+export function continuationRetryPolicyKeyForErrorCode(errorCode: string | null | undefined) {
+  return continuationRetryPolicyKey(
+    classifyContinuationFailure({ errorCode: errorCode ?? null } as NonNullable<LatestIssueRun>),
+  );
+}
+
+/**
+ * The shared automatic-retry budget for one (agent, issue): how many consecutive
+ * automatic re-runs have failed against the same retry policy, counting every
+ * mechanism (see `./automatic-retry-streak.ts`).
+ *
+ * Exported standalone rather than as a recovery-service method because
+ * `heartbeat.ts` reads the same number before it grants the bounded transient
+ * retry its next attempt — that is what stops the two budgets from handing each
+ * other a fresh start.
+ */
+export async function summarizeIssueAutomaticRetryFailureStreak(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  agentId: string;
+}): Promise<AutomaticRetryStreakSummary> {
+  const rows = await input.db
+    .select({
+      id: heartbeatRuns.id,
+      status: heartbeatRuns.status,
+      errorCode: heartbeatRuns.errorCode,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      finishedAt: heartbeatRuns.finishedAt,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+    .limit(AUTOMATIC_RETRY_STREAK_RUN_SAMPLE_LIMIT);
+
+  return summarizeAutomaticRetryFailureStreak(
+    rows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      finishedAt: row.finishedAt,
+      retryReason: readNonEmptyString(parseObject(row.contextSnapshot).retryReason),
+      retryPolicyKey: continuationRetryPolicyKeyForErrorCode(row.errorCode),
+    })),
+  );
 }
 
 function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): SuccessfulRunHandoffRecoveryEvidence | null {
@@ -4425,13 +4517,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
-          const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
-            issue.companyId,
-            issue.id,
+        // ENGA-2912: the cap is measured across every automatic retry mechanism,
+        // not just this reconciler's own continuations. The bounded transient
+        // retry in heartbeat.ts re-runs the same issue for the same reason, and
+        // when its runs were excluded from both the gate and the count, the two
+        // mechanisms handed each other an unspent budget on every alternation
+        // and neither cap could ever be reached.
+        if (didAnyAutomaticRecoveryFail(latestRun)) {
+          const { consecutive, latestFinishedAt } = await summarizeIssueAutomaticRetryFailureStreak({
+            db,
+            companyId: issue.companyId,
+            issueId: issue.id,
             agentId,
-            classification.errorCode,
-          );
+          });
           if (consecutive >= classification.maxAttempts) {
             const failureSummary = summarizeRunFailureForIssueComment(latestRun);
             const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
