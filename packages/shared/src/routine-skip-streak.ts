@@ -1,6 +1,7 @@
 import {
   ROUTINE_SKIP_STREAK_ALERT_REASONS,
   ROUTINE_SKIP_STREAK_ALERT_THRESHOLD,
+  ROUTINE_SKIP_TOUCHED_STATES,
   type RoutineRunSkipReason,
 } from "./constants.js";
 
@@ -25,6 +26,23 @@ export interface RoutineSkipStreak {
 export function isAlertingRoutineSkipReason(reason: string | null | undefined): boolean {
   if (!reason) return false;
   return (ROUTINE_SKIP_STREAK_ALERT_REASONS as readonly string[]).includes(reason);
+}
+
+/**
+ * Whether a dispatch outcome should extend the skip streak rather than clear it.
+ *
+ * Either signal alone is enough, and that is deliberate. A tick that recorded a structured
+ * skip reason counts even if its label is one this list has never heard of, and a labelled
+ * skip counts even if the reason went unrecorded. Both halves fail toward "keep counting",
+ * because the failure this streak exists to catch is a routine going quiet — a detector
+ * that quietly resets to zero would reproduce it.
+ */
+export function isRoutineSkipTouchedState(
+  status: string,
+  skipReason: string | null | undefined,
+): boolean {
+  if (skipReason) return true;
+  return (ROUTINE_SKIP_TOUCHED_STATES as readonly string[]).includes(status);
 }
 
 function toDate(value: Date | string | null | undefined): Date | null {

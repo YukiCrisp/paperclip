@@ -2128,6 +2128,7 @@ export {
 
 export {
   isAlertingRoutineSkipReason,
+  isRoutineSkipTouchedState,
   resolveRoutineSkipStreak,
   type RoutineSkipStreak,
   type RoutineSkipStreakState,

@@ -608,6 +608,19 @@ export type RoutineSkipStreakAlertReason = (typeof ROUTINE_SKIP_STREAK_ALERT_REA
 // being worked. Two in a row already outlasts a healthy execution on the schedules we run.
 export const ROUTINE_SKIP_STREAK_ALERT_THRESHOLD = 2;
 
+// The touched-state labels that mean "this tick did no work". These are the trigger-facing
+// labels (routine_triggers.lastResult), which are finer-grained than ROUTINE_RUN_STATUSES:
+// one run status "skipped" fans out into the suppression reasons below. Kept as an explicit
+// list rather than a "skipped" prefix test so that a future skip label named anything else
+// cannot silently drop out of the streak — see isRoutineSkipTouchedState.
+export const ROUTINE_SKIP_TOUCHED_STATES = [
+  "skipped",
+  "skipped_paused",
+  "skipped_no_activity",
+  "skipped_worktree_execution_cutoff",
+] as const;
+export type RoutineSkipTouchedState = (typeof ROUTINE_SKIP_TOUCHED_STATES)[number];
+
 export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook"] as const;
 export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 

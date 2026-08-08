@@ -51,6 +51,7 @@ import {
   getBuiltinRoutineVariableValues,
   extractRoutineVariableNames,
   interpolateRoutineTemplate,
+  isRoutineSkipTouchedState,
   isValidRoutineDateString,
   pluginOperationIssueOriginKind,
   resolveRoutineSkipStreak,
@@ -1189,7 +1190,7 @@ export function routineService(
     // SQL so concurrent dispatches cannot read-modify-write over each other, and the start
     // of the streak stays with the first skip that opened it.
     const skipReason = input.skipReason ?? null;
-    const isSkip = input.status === "skipped" || input.status.startsWith("skipped_");
+    const isSkip = isRoutineSkipTouchedState(input.status, skipReason);
     const skipStreakPatch = isSkip
       ? {
         consecutiveSkipCount: sql<number>`${routines.consecutiveSkipCount} + 1`,

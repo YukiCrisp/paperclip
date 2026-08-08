@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isAlertingRoutineSkipReason, resolveRoutineSkipStreak } from "./routine-skip-streak.js";
+import { ROUTINE_SKIP_TOUCHED_STATES } from "./constants.js";
+import {
+  isAlertingRoutineSkipReason,
+  isRoutineSkipTouchedState,
+  resolveRoutineSkipStreak,
+} from "./routine-skip-streak.js";
 
 describe("resolveRoutineSkipStreak", () => {
   it("reports no streak for a routine that is dispatching", () => {
@@ -71,6 +76,38 @@ describe("resolveRoutineSkipStreak", () => {
         consecutiveSkipSince: "2026-08-05T00:00:00.000Z",
       }),
     ).toEqual({ count: 0, reason: null, since: null, threshold: 2, alerting: false });
+  });
+});
+
+describe("isRoutineSkipTouchedState", () => {
+  it("counts every skip label the dispatcher writes today", () => {
+    for (const status of ROUTINE_SKIP_TOUCHED_STATES) {
+      expect(isRoutineSkipTouchedState(status, null)).toBe(true);
+    }
+  });
+
+  it("clears the streak on outcomes that did real work", () => {
+    expect(isRoutineSkipTouchedState("issue_created", null)).toBe(false);
+    expect(isRoutineSkipTouchedState("coalesced", null)).toBe(false);
+    expect(isRoutineSkipTouchedState("completed", null)).toBe(false);
+    expect(isRoutineSkipTouchedState("failed", null)).toBe(false);
+  });
+
+  it("counts a skip whose label this list has never heard of", () => {
+    // The regression this guards: keying the streak off a "skipped" prefix meant a future
+    // skip label named anything else would quietly reset the count to zero, which is the
+    // silent stall the streak exists to catch. A structured reason is enough on its own.
+    expect(isRoutineSkipTouchedState("suppressed_by_quota", "live_execution_issue_active")).toBe(true);
+    expect(isRoutineSkipTouchedState("deferred", "paused")).toBe(true);
+  });
+
+  it("counts a known skip label even when the reason went unrecorded", () => {
+    expect(isRoutineSkipTouchedState("skipped", null)).toBe(true);
+    expect(isRoutineSkipTouchedState("skipped", undefined)).toBe(true);
+  });
+
+  it("does not count an unknown label that recorded no reason", () => {
+    expect(isRoutineSkipTouchedState("suppressed_by_quota", null)).toBe(false);
   });
 });
 
