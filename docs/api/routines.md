@@ -242,10 +242,24 @@ A tick extends the streak if it recorded a `skipReason` **or** its outcome is on
 known skip labels; anything else clears it. Either signal alone suffices on purpose, so a
 skip path added later still counts even if it is named something new. Adding a skip path
 that records neither signal is the one way to reopen this hole.
-The raw columns (`consecutiveSkipCount`, `consecutiveSkipReason`, `consecutiveSkipSince`)
-are on the same responses for clients that want to apply their own threshold — a cadence
-watchdog can read `skipStreak.count` straight out of `GET /api/routines/{routineId}` and log
-`skipped-since-last: N`.
+
+The raw columns (`consecutiveSkipCount`, `consecutiveSkipReason`, `consecutiveSkipSince`) are
+on the same responses for clients that want to apply their own threshold. Read them about
+*other* routines: a streak is cleared by the subject routine's own dispatch, never by the
+observer's, so a fleet monitor sees a live count.
+
+A routine cannot read its own streak this way. The reset is written when a run is dispatched,
+before that run starts, so a routine reading `skipStreak.count` for itself from inside its own
+run gets `0` structurally — and `0` reads as "nothing was skipped", which is the silence the
+streak exists to break. Derive your own streak from run history instead:
+
+1. `GET /api/routines/{routineId}/runs?limit=200`, sorted by `triggeredAt` descending rather
+   than trusting the response order.
+2. Drop the fire you are in: every run with `triggeredAt >= lastFiredAt` of the trigger that
+   fired you.
+3. From the top of what is left, count runs that skipped — a non-null `skipReason`, or a
+   `status` of `skipped` — and stop at the first run that is neither. That count is how many
+   fires in a row did no work; each run's `skipReason` says why.
 
 ## Agent Access Rules
 
