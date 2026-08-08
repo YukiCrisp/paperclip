@@ -238,10 +238,12 @@ responses therefore carry a `skipStreak`:
 Only `live_execution_issue_active` raises `alerting`. The other reasons are deliberate
 suppressions whose cause an operator can already see, so they are counted but stay quiet.
 
-A tick extends the streak if it recorded a `skipReason` **or** its outcome is one of the
-known skip labels; anything else clears it. Either signal alone suffices on purpose, so a
-skip path added later still counts even if it is named something new. Adding a skip path
-that records neither signal is the one way to reopen this hole.
+A tick extends the streak if it recorded a `skipReason`, **or** its outcome is one of the
+known skip labels, **or** that outcome starts with `skipped_`; anything else clears it. Any
+one signal alone suffices on purpose. A skip path added later counts if it is named
+something new, and it still counts if it kept the naming convention but forgot to record a
+reason. Only a skip path that trips none of the three falls out of the count.
+
 The raw columns (`consecutiveSkipCount`, `consecutiveSkipReason`, `consecutiveSkipSince`)
 are on the same responses for clients that want to apply their own threshold — a cadence
 watchdog can read `skipStreak.count` straight out of `GET /api/routines/{routineId}` and log

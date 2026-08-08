@@ -31,18 +31,29 @@ export function isAlertingRoutineSkipReason(reason: string | null | undefined): 
 /**
  * Whether a dispatch outcome should extend the skip streak rather than clear it.
  *
- * Either signal alone is enough, and that is deliberate. A tick that recorded a structured
- * skip reason counts even if its label is one this list has never heard of, and a labelled
- * skip counts even if the reason went unrecorded. Both halves fail toward "keep counting",
- * because the failure this streak exists to catch is a routine going quiet — a detector
- * that quietly resets to zero would reproduce it.
+ * Any one of the three signals is enough, and that is deliberate. The failure this streak
+ * exists to catch is a routine going quiet, so a detector that resets to zero on an outcome
+ * it did not recognise would reproduce that failure rather than report it. Every branch
+ * therefore fails toward "keep counting":
+ *
+ * 1. A structured `skipReason` counts on its own, even under a label this list has never
+ *    heard of. This is the signal the dispatcher is supposed to write on every skip.
+ * 2. A known label counts even when the reason went unrecorded.
+ * 3. A `skipped_` prefix counts as a last resort. The prefix is no longer the foundation of
+ *    the check — it sits behind the explicit list and the structured reason — but it stays
+ *    because the two failures are not equally likely. Naming a new skip path outside the
+ *    convention is visible in review; writing `skipped_foo` and forgetting the `skipReason`
+ *    is not. Dropping the prefix would trade a loud failure for a silent one.
+ *
+ * Only a skip path that trips none of the three can fall out of the count.
  */
 export function isRoutineSkipTouchedState(
   status: string,
   skipReason: string | null | undefined,
 ): boolean {
   if (skipReason) return true;
-  return (ROUTINE_SKIP_TOUCHED_STATES as readonly string[]).includes(status);
+  if ((ROUTINE_SKIP_TOUCHED_STATES as readonly string[]).includes(status)) return true;
+  return status.startsWith("skipped_");
 }
 
 function toDate(value: Date | string | null | undefined): Date | null {

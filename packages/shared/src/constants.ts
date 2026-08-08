@@ -610,9 +610,11 @@ export const ROUTINE_SKIP_STREAK_ALERT_THRESHOLD = 2;
 
 // The touched-state labels that mean "this tick did no work". These are the trigger-facing
 // labels (routine_triggers.lastResult), which are finer-grained than ROUTINE_RUN_STATUSES:
-// one run status "skipped" fans out into the suppression reasons below. Kept as an explicit
-// list rather than a "skipped" prefix test so that a future skip label named anything else
-// cannot silently drop out of the streak — see isRoutineSkipTouchedState.
+// one run status "skipped" fans out into the suppression reasons below. The list exists so
+// that a future skip label named outside the "skipped" convention cannot silently drop out
+// of the streak. It does not replace the prefix test, which stays on behind it as a last
+// resort for a prefixed label whose skipReason went unwritten — see
+// isRoutineSkipTouchedState for why all three signals are kept.
 export const ROUTINE_SKIP_TOUCHED_STATES = [
   "skipped",
   "skipped_paused",
