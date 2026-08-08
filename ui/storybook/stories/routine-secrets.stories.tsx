@@ -196,6 +196,9 @@ function makeRoutine(latestRevisionId: string, latestRevisionNumber: number): Ro
     updatedByUserId: "user-board",
     lastTriggeredAt: null,
     lastEnqueuedAt: null,
+    consecutiveSkipCount: 0,
+    consecutiveSkipReason: null,
+    consecutiveSkipSince: null,
     createdAt: new Date("2026-05-01T11:00:00.000Z"),
     updatedAt: new Date("2026-05-04T12:00:00.000Z"),
   };

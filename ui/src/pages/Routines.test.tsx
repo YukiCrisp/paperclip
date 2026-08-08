@@ -4,7 +4,7 @@ import type { AnchorHTMLAttributes, ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { FolderListResult, Issue, RoutineListItem } from "@paperclipai/shared";
+import { ROUTINE_SKIP_STREAK_ALERT_THRESHOLD, type FolderListResult, type Issue, type RoutineListItem } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Routines, buildRoutineGroups, buildRoutineSections, sortRoutines } from "./Routines";
 
@@ -310,11 +310,15 @@ function createRoutine(overrides: Partial<RoutineListItem>): RoutineListItem {
     updatedByUserId: null,
     lastTriggeredAt: null,
     lastEnqueuedAt: null,
+    consecutiveSkipCount: 0,
+    consecutiveSkipReason: null,
+    consecutiveSkipSince: null,
     createdAt: new Date("2026-04-01T00:00:00.000Z"),
     updatedAt: new Date("2026-04-01T00:00:00.000Z"),
     triggers: [],
     lastRun: null,
     activeIssue: null,
+    skipStreak: { count: 0, reason: null, since: null, threshold: ROUTINE_SKIP_STREAK_ALERT_THRESHOLD, alerting: false },
     folderId: null,
     ...overrides,
   };
@@ -537,6 +541,7 @@ describe("Routines page", () => {
           linkedIssueId: null,
           coalescedIntoRunId: null,
           failureReason: null,
+          skipReason: null,
           completedAt: null,
           createdAt: new Date("2026-04-02T00:00:00.000Z"),
           updatedAt: new Date("2026-04-02T00:00:00.000Z"),

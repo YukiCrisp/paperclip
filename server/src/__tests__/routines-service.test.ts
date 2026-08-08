@@ -1340,6 +1340,112 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
   });
 
+  it("counts consecutive skips against a stuck execution issue and alerts once the streak crosses the threshold", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const previousRunId = randomUUID();
+    const liveHeartbeatRunId = randomUUID();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const stuckIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "in_progress",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: new Date("2026-08-05T00:00:00.000Z"),
+      linkedIssueId: stuckIssue.id,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: liveHeartbeatRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: stuckIssue.id },
+      startedAt: new Date("2026-08-05T00:01:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: liveHeartbeatRunId,
+        executionRunId: liveHeartbeatRunId,
+        executionLockedAt: new Date("2026-08-05T00:01:00.000Z"),
+      })
+      .where(eq(issues.id, stuckIssue.id));
+
+    const firstSkip = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(firstSkip.status).toBe("skipped");
+    expect(firstSkip.skipReason).toBe("live_execution_issue_active");
+
+    const afterFirstSkip = await svc.getDetail(routine.id);
+    expect(afterFirstSkip?.skipStreak).toMatchObject({
+      count: 1,
+      reason: "live_execution_issue_active",
+      threshold: 2,
+      alerting: false,
+    });
+    const streakStart = afterFirstSkip?.skipStreak.since;
+    expect(streakStart).toBeInstanceOf(Date);
+
+    const secondSkip = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(secondSkip.status).toBe("skipped");
+    expect(secondSkip.skipReason).toBe("live_execution_issue_active");
+
+    const afterSecondSkip = await svc.getDetail(routine.id);
+    expect(afterSecondSkip?.skipStreak).toMatchObject({
+      count: 2,
+      reason: "live_execution_issue_active",
+      alerting: true,
+    });
+    // The streak keeps the moment it opened, so "silent since" is readable from the alert.
+    expect(afterSecondSkip?.skipStreak.since?.getTime()).toBe(streakStart?.getTime());
+
+    const listed = await svc.list(companyId);
+    expect(listed.find((item) => item.id === routine.id)?.skipStreak).toMatchObject({
+      count: 2,
+      alerting: true,
+    });
+    expect(afterSecondSkip?.recentRuns.filter((run) => run.skipReason === "live_execution_issue_active")).toHaveLength(2);
+
+    // Finishing the stuck execution lets the next firing dispatch, which clears the streak.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed" })
+      .where(eq(heartbeatRuns.id, liveHeartbeatRunId));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, stuckIssue.id));
+
+    const dispatched = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(dispatched.status).toBe("issue_created");
+    expect(dispatched.skipReason).toBeNull();
+
+    const afterDispatch = await svc.getDetail(routine.id);
+    expect(afterDispatch?.skipStreak).toEqual({
+      count: 0,
+      reason: null,
+      since: null,
+      threshold: 2,
+      alerting: false,
+    });
+  });
+
   it("does not coalesce live routine runs with different resolved variables", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const variableRoutine = await svc.create(
@@ -2280,6 +2386,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(skippedRuns[0]?.status).toBe("skipped");
     expect(skippedRuns[0]?.source).toBe("schedule");
     expect(skippedRuns[0]?.failureReason).toBe("paused");
+    expect(skippedRuns[0]?.skipReason).toBe("paused");
     expect(skippedRuns[0]?.linkedIssueId).toBeNull();
     expect(skippedRuns[0]?.completedAt).not.toBeNull();
 
@@ -2303,6 +2410,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .set({ nextRunAt: pastDue })
       .where(eq(routineTriggers.id, trigger.id));
 
+    // A pause is a visible cause, so the streak is counted but never alerts on its own.
+    const pausedDetail = await svc.getDetail(routine.id);
+    expect(pausedDetail?.skipStreak).toMatchObject({ count: 1, reason: "paused", alerting: false });
+
     const resumedResult = await svc.tickScheduledTriggers(new Date());
     expect(resumedResult.triggered).toBe(1);
 
@@ -2318,6 +2429,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(routineRuns.routineId, routine.id));
     expect(runsAfterResume).toHaveLength(2);
     expect(runsAfterResume.some((run) => run.status === "issue_created")).toBe(true);
+
+    const resumedDetail = await svc.getDetail(routine.id);
+    expect(resumedDetail?.skipStreak).toMatchObject({ count: 0, reason: null, alerting: false });
   });
 
   it("skips a gated scheduled tick when quiet without advancing the activity window", async () => {

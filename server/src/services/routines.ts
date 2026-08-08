@@ -37,6 +37,7 @@ import type {
   RoutineManagedByPlugin,
   RoutineRevision,
   RoutineRevisionSnapshotV1,
+  RoutineRunSkipReason,
   RoutineRunSummary,
   RoutineTrigger,
   RoutineTriggerSecretMaterial,
@@ -52,6 +53,7 @@ import {
   interpolateRoutineTemplate,
   isValidRoutineDateString,
   pluginOperationIssueOriginKind,
+  resolveRoutineSkipStreak,
   routineRevisionSnapshotSchema,
   stringifyRoutineVariableValue,
   syncRoutineVariablesWithTemplate,
@@ -1023,6 +1025,7 @@ export function routineService(
         linkedIssueId: routineRuns.linkedIssueId,
         coalescedIntoRunId: routineRuns.coalescedIntoRunId,
         failureReason: routineRuns.failureReason,
+        skipReason: routineRuns.skipReason,
         completedAt: routineRuns.completedAt,
         createdAt: routineRuns.createdAt,
         updatedAt: routineRuns.updatedAt,
@@ -1057,6 +1060,7 @@ export function routineService(
         linkedIssueId: row.linkedIssueId,
         coalescedIntoRunId: row.coalescedIntoRunId,
         failureReason: row.failureReason,
+        skipReason: row.skipReason,
         completedAt: row.completedAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
@@ -1179,12 +1183,31 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
+    skipReason?: RoutineRunSkipReason | null;
   }, executor: Db = db) {
+    // A skip extends the streak; every other outcome clears it. The count is incremented in
+    // SQL so concurrent dispatches cannot read-modify-write over each other, and the start
+    // of the streak stays with the first skip that opened it.
+    const skipReason = input.skipReason ?? null;
+    const isSkip = input.status === "skipped" || input.status.startsWith("skipped_");
+    const skipStreakPatch = isSkip
+      ? {
+        consecutiveSkipCount: sql<number>`${routines.consecutiveSkipCount} + 1`,
+        consecutiveSkipReason: skipReason,
+        consecutiveSkipSince: sql<Date>`coalesce(${routines.consecutiveSkipSince}, ${input.triggeredAt.toISOString()}::timestamptz)`,
+      }
+      : {
+        consecutiveSkipCount: 0,
+        consecutiveSkipReason: null,
+        consecutiveSkipSince: null,
+      };
+
     await executor
       .update(routines)
       .set({
         lastTriggeredAt: input.triggeredAt,
         lastEnqueuedAt: input.issueId ? input.triggeredAt : undefined,
+        ...skipStreakPatch,
         updatedAt: new Date(),
       })
       .where(eq(routines.id, input.routineId));
@@ -1341,6 +1364,11 @@ export function routineService(
     details?: Record<string, unknown> | null;
   }) {
     const triggeredAt = new Date();
+    const suppressedSkipReason: RoutineRunSkipReason = input.reason === "paused"
+      ? "paused"
+      : input.reason === "no_external_activity"
+        ? "no_external_activity"
+        : "worktree_execution_cutoff";
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       const [createdRun] = await txDb
@@ -1353,6 +1381,7 @@ export function routineService(
           status: "skipped",
           triggeredAt,
           failureReason: input.reason,
+          skipReason: suppressedSkipReason,
           completedAt: triggeredAt,
           linkedIssueId: null,
           routineRevisionId: input.routine.latestRevisionId,
@@ -1369,6 +1398,7 @@ export function routineService(
           : input.reason === "no_external_activity"
             ? "skipped_no_activity"
             : "skipped_worktree_execution_cutoff",
+        skipReason: suppressedSkipReason,
         nextRunAt: input.nextRunAt,
       }, txDb);
       return createdRun;
@@ -1764,6 +1794,7 @@ export function routineService(
         });
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          const skipReason: RoutineRunSkipReason | null = status === "skipped" ? "live_execution_issue_active" : null;
           if (manualRunnerUserId) {
             await touchIssueForUserInbox(txDb, {
               companyId: input.routine.companyId,
@@ -1776,6 +1807,7 @@ export function routineService(
             status,
             linkedIssueId: activeIssue.id,
             coalescedIntoRunId: activeIssue.originRunId,
+            skipReason,
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -1785,6 +1817,7 @@ export function routineService(
             status,
             issueId: activeIssue.id,
             nextRunAt,
+            skipReason,
           }, txDb);
           return updated ?? createdRun;
         }
@@ -1831,6 +1864,7 @@ export function routineService(
           });
           if (!existingIssue) throw error;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          const skipReason: RoutineRunSkipReason | null = status === "skipped" ? "live_execution_issue_active" : null;
           if (manualRunnerUserId) {
             await touchIssueForUserInbox(txDb, {
               companyId: input.routine.companyId,
@@ -1843,6 +1877,7 @@ export function routineService(
             status,
             linkedIssueId: existingIssue.id,
             coalescedIntoRunId: existingIssue.originRunId,
+            skipReason,
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -1852,6 +1887,7 @@ export function routineService(
             status,
             issueId: existingIssue.id,
             nextRunAt,
+            skipReason,
           }, txDb);
           return updated ?? createdRun;
         }
@@ -1973,6 +2009,7 @@ export function routineService(
         })),
         lastRun: latestRunByRoutine.get(row.id) ?? null,
         activeIssue: activeIssueByRoutine.get(row.id) ?? null,
+        skipStreak: resolveRoutineSkipStreak(row),
       }));
     },
 
@@ -2005,6 +2042,7 @@ export function routineService(
             linkedIssueId: routineRuns.linkedIssueId,
             coalescedIntoRunId: routineRuns.coalescedIntoRunId,
             failureReason: routineRuns.failureReason,
+            skipReason: routineRuns.skipReason,
             completedAt: routineRuns.completedAt,
             createdAt: routineRuns.createdAt,
             updatedAt: routineRuns.updatedAt,
@@ -2038,6 +2076,7 @@ export function routineService(
               linkedIssueId: run.linkedIssueId,
               coalescedIntoRunId: run.coalescedIntoRunId,
               failureReason: run.failureReason,
+              skipReason: run.skipReason,
               completedAt: run.completedAt,
               createdAt: run.createdAt,
               updatedAt: run.updatedAt,
@@ -2074,6 +2113,7 @@ export function routineService(
         triggers: triggers as RoutineTrigger[],
         recentRuns,
         activeIssue,
+        skipStreak: resolveRoutineSkipStreak(row),
       };
     },
 
@@ -2902,6 +2942,7 @@ export function routineService(
           linkedIssueId: routineRuns.linkedIssueId,
           coalescedIntoRunId: routineRuns.coalescedIntoRunId,
           failureReason: routineRuns.failureReason,
+          skipReason: routineRuns.skipReason,
           completedAt: routineRuns.completedAt,
           createdAt: routineRuns.createdAt,
           updatedAt: routineRuns.updatedAt,
@@ -2935,6 +2976,7 @@ export function routineService(
         linkedIssueId: row.linkedIssueId,
         coalescedIntoRunId: row.coalescedIntoRunId,
         failureReason: row.failureReason,
+        skipReason: row.skipReason,
         completedAt: row.completedAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
