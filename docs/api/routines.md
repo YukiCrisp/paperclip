@@ -11,7 +11,7 @@ Routines are recurring tasks that fire on a schedule, webhook, or API call and c
 GET /api/companies/{companyId}/routines
 ```
 
-Returns all routines in the company.
+Returns all routines in the company, each with a `skipStreak` (see [Skip streaks and alerts](#skip-streaks-and-alerts)).
 
 ## Get Routine
 
@@ -19,7 +19,7 @@ Returns all routines in the company.
 GET /api/routines/{routineId}
 ```
 
-Returns routine details including triggers.
+Returns routine details including triggers and a `skipStreak`.
 
 ## Create Routine
 
@@ -193,6 +193,48 @@ GET /api/routines/{routineId}/runs?limit=50
 ```
 
 Returns recent run history for the routine. Defaults to 50 most recent runs.
+
+Every run that was not dispatched carries a structured `skipReason`:
+
+| Value | Meaning |
+|-------|---------|
+| `live_execution_issue_active` | `skip_if_active` fired while a previous execution issue still had a live run |
+| `paused` | The routine's project was paused at firing time |
+| `no_external_activity` | The activity gate was quiet |
+| `worktree_execution_cutoff` | The worktree was outside its execution cutoff |
+
+## Skip Streaks and Alerts
+
+A routine that fires on time and skips every time is otherwise silent: the trigger's
+`lastFiredAt` keeps advancing and nothing records that no work happened. The list and detail
+responses therefore carry a `skipStreak`:
+
+```json
+{
+  "skipStreak": {
+    "count": 5,
+    "reason": "live_execution_issue_active",
+    "since": "2026-08-05T00:00:00.000Z",
+    "threshold": 2,
+    "alerting": true
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `count` | Skipped runs since the last one that dispatched, coalesced, or failed |
+| `reason` | `skipReason` of the most recent skip in the streak |
+| `since` | When the streak opened — how long the routine has been silent |
+| `threshold` | `count` at which an alerting reason raises the alert |
+| `alerting` | `true` once the count reaches the threshold **and** the reason is unexplained |
+
+Only `live_execution_issue_active` raises `alerting`. The other reasons are deliberate
+suppressions whose cause an operator can already see, so they are counted but stay quiet.
+The raw columns (`consecutiveSkipCount`, `consecutiveSkipReason`, `consecutiveSkipSince`)
+are on the same responses for clients that want to apply their own threshold — a cadence
+watchdog can read `skipStreak.count` straight out of `GET /api/routines/{routineId}` and log
+`skipped-since-last: N`.
 
 ## Agent Access Rules
 
