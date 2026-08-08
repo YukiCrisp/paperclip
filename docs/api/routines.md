@@ -194,7 +194,7 @@ GET /api/routines/{routineId}/runs?limit=50
 
 Returns recent run history for the routine. Defaults to 50 most recent runs.
 
-Every run that was not dispatched carries a structured `skipReason`:
+Every run *skipped* since this field shipped carries a structured `skipReason`:
 
 | Value | Meaning |
 |-------|---------|
@@ -202,6 +202,12 @@ Every run that was not dispatched carries a structured `skipReason`:
 | `paused` | The routine's project was paused at firing time |
 | `no_external_activity` | The activity gate was quiet |
 | `worktree_execution_cutoff` | The worktree was outside its execution cutoff |
+
+`skipReason` is `null` on every other run, and two of those cases are easy to misread as
+skips. A `coalesced` run did not dispatch either, but it folded into the live execution
+issue rather than being dropped, so it carries `coalescedIntoRunId` instead. And runs
+recorded before this field shipped are `null` regardless of what they did — absence of a
+reason on an old run says nothing about whether it skipped.
 
 ## Skip Streaks and Alerts
 
@@ -231,6 +237,13 @@ responses therefore carry a `skipStreak`:
 
 Only `live_execution_issue_active` raises `alerting`. The other reasons are deliberate
 suppressions whose cause an operator can already see, so they are counted but stay quiet.
+
+A tick extends the streak if it recorded a `skipReason`, **or** its outcome is one of the
+known skip labels, **or** that outcome starts with `skipped_`; anything else clears it. Any
+one signal alone suffices on purpose. A skip path added later counts if it is named
+something new, and it still counts if it kept the naming convention but forgot to record a
+reason. Only a skip path that trips none of the three falls out of the count.
+
 The raw columns (`consecutiveSkipCount`, `consecutiveSkipReason`, `consecutiveSkipSince`)
 are on the same responses for clients that want to apply their own threshold — a cadence
 watchdog can read `skipStreak.count` straight out of `GET /api/routines/{routineId}` and log
