@@ -238,10 +238,11 @@ responses therefore carry a `skipStreak`:
 Only `live_execution_issue_active` raises `alerting`. The other reasons are deliberate
 suppressions whose cause an operator can already see, so they are counted but stay quiet.
 
-A tick extends the streak if it recorded a `skipReason` **or** its outcome is one of the
-known skip labels; anything else clears it. Either signal alone suffices on purpose, so a
-skip path added later still counts even if it is named something new. Adding a skip path
-that records neither signal is the one way to reopen this hole.
+A tick extends the streak if it recorded a `skipReason`, **or** its outcome is one of the
+known skip labels, **or** that outcome starts with `skipped_`; anything else clears it. Any
+one signal alone suffices on purpose. A skip path added later counts if it is named
+something new, and it still counts if it kept the naming convention but forgot to record a
+reason. Only a skip path that trips none of the three falls out of the count.
 
 The raw columns (`consecutiveSkipCount`, `consecutiveSkipReason`, `consecutiveSkipSince`) are
 on the same responses for clients that want to apply their own threshold. Read them about
@@ -260,6 +261,13 @@ streak exists to break. Derive your own streak from run history instead:
 3. From the top of what is left, count runs that skipped — a non-null `skipReason`, or a
    `status` of `skipped` — and stop at the first run that is neither. That count is how many
    fires in a row did no work; each run's `skipReason` says why.
+
+Two signals in step 3, three in the server-side check above, and the difference is which
+surface each one reads. The server reads the trigger-facing label that lands in
+`routine_triggers.lastResult`, where the single run status `skipped` fans out into
+`skipped_paused` and its siblings — hence the `skipped_` prefix as a third signal. Step 3
+reads `routineRuns.status`, a closed enum (`ROUTINE_RUN_STATUSES`) whose only skip is
+`skipped`. Add a `skipped_*` member to that enum and step 3 needs the prefix test too.
 
 ## Agent Access Rules
 

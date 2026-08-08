@@ -81,9 +81,24 @@ describe("resolveRoutineSkipStreak", () => {
 
 describe("isRoutineSkipTouchedState", () => {
   it("counts every skip label the dispatcher writes today", () => {
-    for (const status of ROUTINE_SKIP_TOUCHED_STATES) {
-      expect(isRoutineSkipTouchedState(status, null)).toBe(true);
-    }
+    expect(isRoutineSkipTouchedState("skipped", null)).toBe(true);
+    expect(isRoutineSkipTouchedState("skipped_paused", null)).toBe(true);
+    expect(isRoutineSkipTouchedState("skipped_no_activity", null)).toBe(true);
+    expect(isRoutineSkipTouchedState("skipped_worktree_execution_cutoff", null)).toBe(true);
+  });
+
+  it("pins the label list, which no behavioural assertion can do", () => {
+    // Dropping a label from the list is invisible through the helper: every entry except
+    // "skipped" also matches the skipped_ fallback, so the helper keeps returning true and
+    // the suite stays green. Comparing the constant is the only thing that turns a deletion
+    // red — and it deliberately fails on an addition too, so a new skip label has to arrive
+    // with a decision about whether it belongs here.
+    expect([...ROUTINE_SKIP_TOUCHED_STATES]).toEqual([
+      "skipped",
+      "skipped_paused",
+      "skipped_no_activity",
+      "skipped_worktree_execution_cutoff",
+    ]);
   });
 
   it("clears the streak on outcomes that did real work", () => {
@@ -94,9 +109,9 @@ describe("isRoutineSkipTouchedState", () => {
   });
 
   it("counts a skip whose label this list has never heard of", () => {
-    // The regression this guards: keying the streak off a "skipped" prefix meant a future
-    // skip label named anything else would quietly reset the count to zero, which is the
-    // silent stall the streak exists to catch. A structured reason is enough on its own.
+    // The regression this guards: keying the streak solely off a "skipped" prefix meant a
+    // future skip label named anything else would quietly reset the count to zero, which is
+    // the silent stall the streak exists to catch. A structured reason is enough on its own.
     expect(isRoutineSkipTouchedState("suppressed_by_quota", "live_execution_issue_active")).toBe(true);
     expect(isRoutineSkipTouchedState("deferred", "paused")).toBe(true);
   });
@@ -106,7 +121,16 @@ describe("isRoutineSkipTouchedState", () => {
     expect(isRoutineSkipTouchedState("skipped", undefined)).toBe(true);
   });
 
-  it("does not count an unknown label that recorded no reason", () => {
+  it("falls back to the skipped_ prefix for a new label that recorded no reason", () => {
+    // The third signal, and the one that covers the likelier mistake. Naming a skip path
+    // outside the convention is visible in review; adding skipped_foo and forgetting to
+    // write its skipReason is not. Without this fallback that omission would silently reset
+    // the count to zero — the same silent stall, arrived at from the other direction.
+    expect(isRoutineSkipTouchedState("skipped_quota_exhausted", null)).toBe(true);
+    expect(isRoutineSkipTouchedState("skipped_quota_exhausted", undefined)).toBe(true);
+  });
+
+  it("does not count a label that trips none of the three signals", () => {
     expect(isRoutineSkipTouchedState("suppressed_by_quota", null)).toBe(false);
   });
 });
