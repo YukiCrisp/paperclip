@@ -588,6 +588,41 @@ export const ROUTINE_RUN_STATUSES = [
  ] as const;
 export type RoutineRunStatus = (typeof ROUTINE_RUN_STATUSES)[number];
 
+export const ROUTINE_RUN_SKIP_REASONS = [
+  "live_execution_issue_active",
+  "paused",
+  "no_external_activity",
+  "worktree_execution_cutoff",
+] as const;
+export type RoutineRunSkipReason = (typeof ROUTINE_RUN_SKIP_REASONS)[number];
+
+// Skip reasons worth alerting on. The others are deliberate suppressions whose cause is
+// already visible to an operator (the project is paused, the activity gate is quiet, the
+// worktree is outside its cutoff), so a streak of those is not news. A streak of
+// live_execution_issue_active is: the previous execution issue never finished, so a
+// healthy-looking schedule keeps firing into nothing.
+export const ROUTINE_SKIP_STREAK_ALERT_REASONS = ["live_execution_issue_active"] as const;
+export type RoutineSkipStreakAlertReason = (typeof ROUTINE_SKIP_STREAK_ALERT_REASONS)[number];
+
+// One skip is ordinary: a routine can fire while its previous execution issue is still
+// being worked. Two in a row already outlasts a healthy execution on the schedules we run.
+export const ROUTINE_SKIP_STREAK_ALERT_THRESHOLD = 2;
+
+// The touched-state labels that mean "this tick did no work". These are the trigger-facing
+// labels (routine_triggers.lastResult), which are finer-grained than ROUTINE_RUN_STATUSES:
+// one run status "skipped" fans out into the suppression reasons below. The list exists so
+// that a future skip label named outside the "skipped" convention cannot silently drop out
+// of the streak. It does not replace the prefix test, which stays on behind it as a last
+// resort for a prefixed label whose skipReason went unwritten — see
+// isRoutineSkipTouchedState for why all three signals are kept.
+export const ROUTINE_SKIP_TOUCHED_STATES = [
+  "skipped",
+  "skipped_paused",
+  "skipped_no_activity",
+  "skipped_worktree_execution_cutoff",
+] as const;
+export type RoutineSkipTouchedState = (typeof ROUTINE_SKIP_TOUCHED_STATES)[number];
+
 export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook"] as const;
 export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 

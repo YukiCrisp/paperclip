@@ -1256,6 +1256,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             updatedByUserId: null,
             lastTriggeredAt: null,
             lastEnqueuedAt: null,
+            consecutiveSkipCount: 0,
+            consecutiveSkipReason: null,
+            consecutiveSkipSince: null,
             createdAt: now,
             updatedAt: now,
             managedByPlugin: {
@@ -1329,6 +1332,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             linkedIssueId: null,
             coalescedIntoRunId: null,
             failureReason: null,
+            skipReason: null,
             completedAt: null,
             createdAt: now,
             updatedAt: now,

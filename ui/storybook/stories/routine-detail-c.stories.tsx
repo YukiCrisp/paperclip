@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useQueryClient } from "@tanstack/react-query";
 import { Sparkles } from "lucide-react";
+import { ROUTINE_SKIP_STREAK_ALERT_THRESHOLD } from "@paperclipai/shared";
 import type {
   DocumentAnnotationThreadWithComments,
   RoutineDescriptionDocument,
@@ -99,6 +100,9 @@ const routine: RoutineDetailType = {
   updatedByUserId: null,
   lastTriggeredAt: new Date("2026-06-08T14:00:00Z"),
   lastEnqueuedAt: null,
+  consecutiveSkipCount: 0,
+  consecutiveSkipReason: null,
+  consecutiveSkipSince: null,
   createdAt: now,
   updatedAt: now,
   managedByPlugin: null,
@@ -108,6 +112,7 @@ const routine: RoutineDetailType = {
   triggers,
   recentRuns: [],
   activeIssue: null,
+  skipStreak: { count: 0, reason: null, since: null, threshold: ROUTINE_SKIP_STREAK_ALERT_THRESHOLD, alerting: false },
 };
 
 const routineDescriptionDocument: RoutineDescriptionDocument = {

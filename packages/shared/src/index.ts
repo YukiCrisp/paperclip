@@ -251,6 +251,10 @@ export {
   ROUTINE_TRIGGER_SIGNING_MODES,
   ROUTINE_VARIABLE_TYPES,
   ROUTINE_RUN_STATUSES,
+  ROUTINE_RUN_SKIP_REASONS,
+  ROUTINE_SKIP_STREAK_ALERT_REASONS,
+  ROUTINE_SKIP_STREAK_ALERT_THRESHOLD,
+  ROUTINE_SKIP_TOUCHED_STATES,
   ROUTINE_RUN_SOURCES,
   PAUSE_REASONS,
   PROJECT_COLORS,
@@ -431,6 +435,9 @@ export {
   type RoutineTriggerSigningMode,
   type RoutineVariableType,
   type RoutineRunStatus,
+  type RoutineRunSkipReason,
+  type RoutineSkipStreakAlertReason,
+  type RoutineSkipTouchedState,
   type RoutineRunSource,
   type PauseReason,
   type ApprovalType,
@@ -2120,6 +2127,14 @@ export {
   stringifyRoutineVariableValue,
   syncRoutineVariablesWithTemplate,
 } from "./routine-variables.js";
+
+export {
+  isAlertingRoutineSkipReason,
+  isRoutineSkipTouchedState,
+  resolveRoutineSkipStreak,
+  type RoutineSkipStreak,
+  type RoutineSkipStreakState,
+} from "./routine-skip-streak.js";
 
 export {
   paperclipConfigSchema,

@@ -10,6 +10,7 @@ import type {
   RoutineTriggerSigningMode,
   RoutineVariableType,
 } from "../constants.js";
+import type { RoutineSkipStreak } from "../routine-skip-streak.js";
 import type { EnvBinding } from "./secrets.js";
 import type { ExecutionWorkspaceMode, IssueExecutionWorkspaceSettings } from "./workspace-runtime.js";
 
@@ -98,9 +99,17 @@ export interface Routine {
   updatedByUserId: string | null;
   lastTriggeredAt: Date | null;
   lastEnqueuedAt: Date | null;
+  consecutiveSkipCount: number;
+  consecutiveSkipReason: string | null;
+  consecutiveSkipSince: Date | null;
   createdAt: Date;
   updatedAt: Date;
   managedByPlugin?: RoutineManagedByPlugin | null;
+  /**
+   * Alert verdict derived from the consecutiveSkip* columns. Present on the list and
+   * detail responses; absent where a Routine is assembled from raw columns alone.
+   */
+  skipStreak?: RoutineSkipStreak;
 }
 
 export interface RoutineManagedByPlugin {
@@ -213,6 +222,7 @@ export interface RoutineRun {
   linkedIssueId: string | null;
   coalescedIntoRunId: string | null;
   failureReason: string | null;
+  skipReason: string | null;
   completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -231,6 +241,7 @@ export interface RoutineDetail extends Routine {
   triggers: RoutineTrigger[];
   recentRuns: RoutineRunSummary[];
   activeIssue: RoutineIssueSummary | null;
+  skipStreak: RoutineSkipStreak;
 }
 
 export interface RoutineRunSummary extends RoutineRun {
@@ -256,4 +267,5 @@ export interface RoutineListItem extends Routine {
   triggers: Pick<RoutineTrigger, "id" | "kind" | "label" | "enabled" | "cronExpression" | "timezone" | "nextRunAt" | "lastFiredAt" | "lastResult">[];
   lastRun: RoutineRunSummary | null;
   activeIssue: RoutineIssueSummary | null;
+  skipStreak: RoutineSkipStreak;
 }

@@ -11,7 +11,7 @@ Routines are recurring tasks that fire on a schedule, webhook, or API call and c
 GET /api/companies/{companyId}/routines
 ```
 
-Returns all routines in the company.
+Returns all routines in the company, each with a `skipStreak` (see [Skip streaks and alerts](#skip-streaks-and-alerts)).
 
 ## Get Routine
 
@@ -19,7 +19,7 @@ Returns all routines in the company.
 GET /api/routines/{routineId}
 ```
 
-Returns routine details including triggers.
+Returns routine details including triggers and a `skipStreak`.
 
 ## Create Routine
 
@@ -193,6 +193,81 @@ GET /api/routines/{routineId}/runs?limit=50
 ```
 
 Returns recent run history for the routine. Defaults to 50 most recent runs.
+
+Every run *skipped* since this field shipped carries a structured `skipReason`:
+
+| Value | Meaning |
+|-------|---------|
+| `live_execution_issue_active` | `skip_if_active` fired while a previous execution issue still had a live run |
+| `paused` | The routine's project was paused at firing time |
+| `no_external_activity` | The activity gate was quiet |
+| `worktree_execution_cutoff` | The worktree was outside its execution cutoff |
+
+`skipReason` is `null` on every other run, and two of those cases are easy to misread as
+skips. A `coalesced` run did not dispatch either, but it folded into the live execution
+issue rather than being dropped, so it carries `coalescedIntoRunId` instead. And runs
+recorded before this field shipped are `null` regardless of what they did — absence of a
+reason on an old run says nothing about whether it skipped.
+
+## Skip Streaks and Alerts
+
+A routine that fires on time and skips every time is otherwise silent: the trigger's
+`lastFiredAt` keeps advancing and nothing records that no work happened. The list and detail
+responses therefore carry a `skipStreak`:
+
+```json
+{
+  "skipStreak": {
+    "count": 5,
+    "reason": "live_execution_issue_active",
+    "since": "2026-08-05T00:00:00.000Z",
+    "threshold": 2,
+    "alerting": true
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `count` | Skipped runs since the last one that dispatched, coalesced, or failed |
+| `reason` | `skipReason` of the most recent skip in the streak |
+| `since` | When the streak opened — how long the routine has been silent |
+| `threshold` | `count` at which an alerting reason raises the alert |
+| `alerting` | `true` once the count reaches the threshold **and** the reason is unexplained |
+
+Only `live_execution_issue_active` raises `alerting`. The other reasons are deliberate
+suppressions whose cause an operator can already see, so they are counted but stay quiet.
+
+A tick extends the streak if it recorded a `skipReason`, **or** its outcome is one of the
+known skip labels, **or** that outcome starts with `skipped_`; anything else clears it. Any
+one signal alone suffices on purpose. A skip path added later counts if it is named
+something new, and it still counts if it kept the naming convention but forgot to record a
+reason. Only a skip path that trips none of the three falls out of the count.
+
+The raw columns (`consecutiveSkipCount`, `consecutiveSkipReason`, `consecutiveSkipSince`) are
+on the same responses for clients that want to apply their own threshold. Read them about
+*other* routines: a streak is cleared by the subject routine's own dispatch, never by the
+observer's, so a fleet monitor sees a live count.
+
+A routine cannot read its own streak this way. The reset is written when a run is dispatched,
+before that run starts, so a routine reading `skipStreak.count` for itself from inside its own
+run gets `0` structurally — and `0` reads as "nothing was skipped", which is the silence the
+streak exists to break. Derive your own streak from run history instead:
+
+1. `GET /api/routines/{routineId}/runs?limit=200`, sorted by `triggeredAt` descending rather
+   than trusting the response order.
+2. Drop the fire you are in: every run with `triggeredAt >= lastFiredAt` of the trigger that
+   fired you.
+3. From the top of what is left, count runs that skipped — a non-null `skipReason`, or a
+   `status` of `skipped` — and stop at the first run that is neither. That count is how many
+   fires in a row did no work; each run's `skipReason` says why.
+
+Two signals in step 3, three in the server-side check above, and the difference is which
+surface each one reads. The server reads the trigger-facing label that lands in
+`routine_triggers.lastResult`, where the single run status `skipped` fans out into
+`skipped_paused` and its siblings — hence the `skipped_` prefix as a third signal. Step 3
+reads `routineRuns.status`, a closed enum (`ROUTINE_RUN_STATUSES`) whose only skip is
+`skipped`. Add a `skipped_*` member to that enum and step 3 needs the prefix test too.
 
 ## Agent Access Rules
 

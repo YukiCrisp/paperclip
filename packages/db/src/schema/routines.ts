@@ -51,6 +51,12 @@ export const routines = pgTable(
     updatedByUserId: text("updated_by_user_id"),
     lastTriggeredAt: timestamp("last_triggered_at", { withTimezone: true }),
     lastEnqueuedAt: timestamp("last_enqueued_at", { withTimezone: true }),
+    // Skips in a row since the last firing that actually dispatched work. Reset to 0 by
+    // any dispatched, coalesced, or failed run, so a growing count is the only durable
+    // trace of a routine that fires on time and never works.
+    consecutiveSkipCount: integer("consecutive_skip_count").notNull().default(0),
+    consecutiveSkipReason: text("consecutive_skip_reason"),
+    consecutiveSkipSince: timestamp("consecutive_skip_since", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -156,6 +162,9 @@ export const routineRuns = pgTable(
     linkedIssueId: uuid("linked_issue_id").references(() => issues.id, { onDelete: "set null" }),
     coalescedIntoRunId: uuid("coalesced_into_run_id"),
     failureReason: text("failure_reason"),
+    // Structured counterpart to failureReason for status: "skipped" runs. Every skip path
+    // writes one of ROUTINE_RUN_SKIP_REASONS here so a skip streak is machine-readable.
+    skipReason: text("skip_reason"),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

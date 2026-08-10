@@ -1,4 +1,4 @@
-import type { RoutineListItem } from "@paperclipai/shared";
+import { ROUTINE_SKIP_STREAK_ALERT_THRESHOLD, type RoutineListItem } from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
 import {
   getWorkspaceSpecificRoutineVariableNames,
@@ -32,11 +32,15 @@ function createRoutine(overrides: Partial<RoutineListItem> = {}): RoutineListIte
     updatedByUserId: null,
     lastTriggeredAt: null,
     lastEnqueuedAt: null,
+    consecutiveSkipCount: 0,
+    consecutiveSkipReason: null,
+    consecutiveSkipSince: null,
     createdAt: new Date("2026-04-30T00:00:00.000Z"),
     updatedAt: new Date("2026-04-30T00:00:00.000Z"),
     triggers: [],
     lastRun: null,
     activeIssue: null,
+    skipStreak: { count: 0, reason: null, since: null, threshold: ROUTINE_SKIP_STREAK_ALERT_THRESHOLD, alerting: false },
     ...overrides,
   };
 }
