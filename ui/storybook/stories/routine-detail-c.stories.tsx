@@ -113,6 +113,7 @@ const routine: RoutineDetailType = {
   recentRuns: [],
   activeIssue: null,
   skipStreak: { count: 0, reason: null, since: null, threshold: ROUTINE_SKIP_STREAK_ALERT_THRESHOLD, alerting: false },
+  executionStall: null,
 };
 
 const routineDescriptionDocument: RoutineDescriptionDocument = {
