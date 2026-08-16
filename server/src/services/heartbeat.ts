@@ -15427,14 +15427,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // status, so anything still terminal here is a leftover: promoting it
         // would run an agent against a done/cancelled issue and re-arm the
         // execution predicates that amplified the 2026-08-05 blackout.
+        //
+        // Comment-sourced wakes get no exemption here. Every production comment
+        // wake reason (`issue_commented` / `issue_comment_mentioned` /
+        // `issue_reopened_via_comment`) satisfies `allowsIssueInteractionWake`,
+        // so exempting them would mean this gate never fires on the shape that
+        // was actually reported — an agent's own comment starting a fresh run on
+        // a closed issue. The revivals worth keeping are the human ones, and the
+        // reopen branch above has already taken them off `done`/`cancelled` by
+        // the time we get here.
+        //
         // `resume: true` / `followUpRequested` stays exempt — that is the
-        // documented way to restart follow-up work on a completed issue.
+        // documented way to restart follow-up work on a completed issue, and it
+        // is the same predicate the claim-time terminal gate exempts.
         const deferredResumeIntent =
           deferredContextSeed.resumeIntent === true || deferredContextSeed.followUpRequested === true;
         if (
           (issue.status === "done" || issue.status === "cancelled") &&
-          !deferredResumeIntent &&
-          !allowsIssueInteractionWake(deferredContextSeed)
+          !deferredResumeIntent
         ) {
           await tx
             .update(agentWakeupRequests)

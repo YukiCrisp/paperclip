@@ -971,7 +971,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         issueId,
         _paperclipWakeContext: {
           issueId,
-          wakeReason: "issue_mention",
+          // A reason production actually emits; "issue_mention" (used here
+          // before ENGA-3313) exists in no production caller.
+          wakeReason: "issue_commented",
         },
       },
       status: "deferred_issue_execution",
@@ -1009,12 +1011,29 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   // `deferred_issue_execution` until that run is released. If the run closes the
   // issue on its way out, the leftovers must not turn into fresh execution on
   // work that is already terminal.
+  //
+  // These are the wake reasons production emits for a comment-sourced wake
+  // (`ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS` in issue-tree-control.ts) plus
+  // one non-comment reason. Naming the union here keeps a fixture from drifting
+  // onto a string that exists in no production code path: ENGA-3313 caught these
+  // very tests passing a `wakeReason` of "issue_mention", which no production
+  // caller emits, so the comment-wake branch of the gate was never exercised.
+  type ProductionWakeReason =
+    | "issue_commented"
+    | "issue_comment_mentioned"
+    | "issue_reopened_via_comment"
+    | "issue_children_completed";
+
   async function seedTerminalIssueWithDeferredWake(input: {
     terminalStatus: "done" | "cancelled";
     // "run_finalize" reproduces the observed shape: the holder run closes the
     // issue itself and then finalizes. "stale_cancel" covers the holder being
     // cancelled while the issue is already terminal.
     closedBy: "run_finalize" | "stale_cancel";
+    // Every value passed here has to be a reason production actually emits.
+    // A made-up string silently lands outside whichever set the gate consults,
+    // which measures nothing while staying green.
+    wakeReason?: ProductionWakeReason;
     deferredContextExtras?: Record<string, unknown>;
     requestedByActorType?: "user" | "agent" | "system";
   }) {
@@ -1088,7 +1107,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         issueId,
         _paperclipWakeContext: {
           issueId,
-          wakeReason: "issue_mention",
+          wakeReason: input.wakeReason ?? "issue_children_completed",
           ...(input.deferredContextExtras ?? {}),
         },
       },
@@ -1104,6 +1123,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         status: agentWakeupRequests.status,
         runId: agentWakeupRequests.runId,
         error: agentWakeupRequests.error,
+        finishedAt: agentWakeupRequests.finishedAt,
       })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, deferredWakeupId))
@@ -1118,7 +1138,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     return { wake, promotedRun };
   }
 
-  async function expectDeferredWakeDiscarded(input: { deferredWakeupId: string; issueId: string; holderRunId: string }) {
+  async function expectDeferredWakeDiscarded(input: {
+    deferredWakeupId: string;
+    issueId: string;
+    holderRunId: string;
+    terminalStatus: "done" | "cancelled";
+  }) {
     await waitForCondition(async () => {
       const { wake, promotedRun } = await readDeferredWakeOutcome(input.deferredWakeupId);
       if (!wake) return false;
@@ -1138,35 +1163,94 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         .filter((runId): runId is string => Boolean(runId)),
     );
 
-    // The wake is consumed, not left pending, and it never becomes execution.
-    expect(wake?.status).not.toBe("deferred_issue_execution");
-    expect(wake?.status).not.toBe("queued");
+    // The reported symptom was a wake sitting at `deferred_issue_execution` with
+    // no runId and a null finishedAt, so pin the exact terminal state rather
+    // than "not pending" — `failed` or `skipped` would satisfy a negation and
+    // still leave the leftover unaccounted for.
+    expect(wake?.status).toBe("cancelled");
+    expect(wake?.finishedAt).toBeInstanceOf(Date);
+    expect(wake?.error).toContain("terminal status");
     expect(promotedRun?.status ?? "cancelled").toBe("cancelled");
     // A terminal issue must not be revived, nor left holding an execution lock.
-    expect(issue?.status).toBe("done");
+    expect(issue?.status).toBe(input.terminalStatus);
     expect(issue?.executionRunId).toBeNull();
     expect([...executedRunIds]).toEqual([input.holderRunId].filter((id) => executedRunIds.has(id)));
     if (promotedRun) expect(executedRunIds.has(promotedRun.id)).toBe(false);
   }
 
+  // The complement of `expectDeferredWakeDiscarded`: the wake survives the gate
+  // and becomes a real run. Used for the exemptions the gate is supposed to keep.
+  async function expectDeferredWakePromoted(deferredWakeupId: string) {
+    await waitForCondition(async () => {
+      const { wake } = await readDeferredWakeOutcome(deferredWakeupId);
+      return Boolean(wake?.runId) && wake?.status !== "deferred_issue_execution";
+    }, 8_000);
+
+    const { wake, promotedRun } = await readDeferredWakeOutcome(deferredWakeupId);
+    expect(wake?.runId).toBeTruthy();
+    expect(wake?.status).not.toBe("cancelled");
+    expect(wake?.error ?? "").not.toContain("terminal status");
+    expect(promotedRun).toBeTruthy();
+    return { wake, promotedRun };
+  }
+
   for (const closedBy of ["run_finalize", "stale_cancel"] as const) {
-    it(`discards a deferred issue wake when the issue reached a terminal status (${closedBy})`, async () => {
-      const fixture = await seedTerminalIssueWithDeferredWake({
-        terminalStatus: "done",
-        closedBy,
-      });
+    for (const terminalStatus of ["done", "cancelled"] as const) {
+      it(`discards a deferred issue wake when the issue reached ${terminalStatus} (${closedBy})`, async () => {
+        const fixture = await seedTerminalIssueWithDeferredWake({
+          terminalStatus,
+          closedBy,
+        });
 
-      await heartbeat.resumeQueuedRuns();
+        await heartbeat.resumeQueuedRuns();
 
-      await expectDeferredWakeDiscarded(fixture);
-    }, 20_000);
+        await expectDeferredWakeDiscarded({ ...fixture, terminalStatus });
+      }, 20_000);
+    }
 
-    it(`discards an agent comment deferred wake when the issue reached a terminal status (${closedBy})`, async () => {
+    // Both reasons production emits for an agent's own comment. `issue_commented`
+    // is the one ENGA-3313 used to show the gate never fired; `issue_comment_mentioned`
+    // is its sibling in the same set, and a gate keyed on either would leave the other open.
+    for (const wakeReason of ["issue_commented", "issue_comment_mentioned"] as const) {
+      it(`discards an agent ${wakeReason} deferred wake when the issue reached a terminal status (${closedBy})`, async () => {
+        const commentId = randomUUID();
+        const fixture = await seedTerminalIssueWithDeferredWake({
+          terminalStatus: "done",
+          closedBy,
+          wakeReason,
+          deferredContextExtras: { wakeCommentIds: [commentId], source: "issue.comment" },
+          requestedByActorType: "agent",
+        });
+        await db.insert(issueComments).values({
+          id: commentId,
+          companyId: fixture.companyId,
+          issueId: fixture.issueId,
+          authorAgentId: fixture.agentId,
+          authorType: "agent",
+          body: "Peer follow-up posted while the holder run was still live.",
+        });
+
+        await heartbeat.resumeQueuedRuns();
+
+        // An agent comment must not revive closed work: `resume: true` is the
+        // documented way to restart follow-up work on a completed issue.
+        await expectDeferredWakeDiscarded({ ...fixture, terminalStatus: "done" });
+      }, 20_000);
+    }
+  }
+
+  // Keep-side coverage. The gate's only remaining escape hatch is the documented
+  // `resume: true` payload, which routes/issues.ts always writes as the pair
+  // `{ resumeIntent: true, followUpRequested: true }`. Each arm of the `||` gets
+  // its own case so dropping one of them cannot stay green.
+  for (const resumeField of ["resumeIntent", "followUpRequested"] as const) {
+    it(`still promotes a deferred wake carrying ${resumeField} on a terminal issue`, async () => {
       const commentId = randomUUID();
       const fixture = await seedTerminalIssueWithDeferredWake({
         terminalStatus: "done",
-        closedBy,
-        deferredContextExtras: { wakeCommentIds: [commentId] },
+        closedBy: "run_finalize",
+        wakeReason: "issue_commented",
+        deferredContextExtras: { wakeCommentIds: [commentId], source: "issue.comment", [resumeField]: true },
         requestedByActorType: "agent",
       });
       await db.insert(issueComments).values({
@@ -1175,24 +1259,32 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         issueId: fixture.issueId,
         authorAgentId: fixture.agentId,
         authorType: "agent",
-        body: "Peer follow-up posted while the holder run was still live.",
+        body: "Restarting follow-up work on this completed issue.",
       });
 
       await heartbeat.resumeQueuedRuns();
 
-      // An agent comment must not revive closed work: `resume: true` is the
-      // documented way to restart follow-up work on a completed issue.
-      await expectDeferredWakeDiscarded(fixture);
+      await expectDeferredWakePromoted(fixture.deferredWakeupId);
     }, 20_000);
   }
 
-  it("still reopens and runs a user comment deferred wake on a terminal issue", async () => {
+  // With no interaction exemption left in the gate, the reopen branch above it is
+  // the only thing standing between a legitimate revival and the discard. Both of
+  // its arms — a user-requested wake, and the `issue_reopened_via_comment` reason —
+  // therefore need their own control; a gate change that fires before reopen would
+  // otherwise take out human revivals with no test noticing.
+  for (const revival of [
+    { label: "user comment", requestedByActorType: "user" as const, wakeReason: "issue_commented" as const },
+    { label: "reopen-via-comment reason", requestedByActorType: "agent" as const, wakeReason: "issue_reopened_via_comment" as const },
+  ]) {
+  it(`still reopens and runs a ${revival.label} deferred wake on a terminal issue`, async () => {
     const commentId = randomUUID();
     const { companyId, issueId, deferredWakeupId } = await seedTerminalIssueWithDeferredWake({
       terminalStatus: "done",
       closedBy: "run_finalize",
-      deferredContextExtras: { wakeCommentIds: [commentId] },
-      requestedByActorType: "user",
+      wakeReason: revival.wakeReason,
+      deferredContextExtras: { wakeCommentIds: [commentId], source: "issue.comment.reopen" },
+      requestedByActorType: revival.requestedByActorType,
     });
     await db.insert(issueComments).values({
       id: commentId,
@@ -1228,6 +1320,78 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(["todo", "in_progress"]).toContain(issue?.status);
     expect(promotedRun?.status).not.toBe("cancelled");
     expect(promotedRun && mockAdapterExecute.mock.calls.some(([context]) => context?.runId === promotedRun.id)).toBe(true);
+  }, 20_000);
+  }
+
+  // The stale-cancel path now releases its waiters, which widens the change past
+  // terminal issues: a holder cancelled for any staleness reason frees the lock.
+  // This pins the non-terminal half of that widening — the waiter has to be
+  // promoted rather than stranded at `deferred_issue_execution`, which is the
+  // stranding ENGA-2914 observed, arrived at from a reason other than closure.
+  it("promotes a deferred wake when the holder run is cancelled for a non-terminal staleness reason", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OriginalHolder" });
+    const replacementAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: replacementAgentId,
+      companyId,
+      name: "ReplacementHolder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    const deferredWakeupId = randomUUID();
+    // Assignee already changed under the holder, so the queued run is stale and
+    // gets cancelled — but the issue itself stays live work.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reassigned while a wake was parked behind it",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: replacementAgentId,
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeupId,
+      companyId,
+      agentId: replacementAgentId,
+      source: "comment",
+      triggerDetail: "mention",
+      reason: "issue_execution_deferred",
+      requestedByActorType: "agent",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_children_completed" },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    }, 8_000);
+
+    const { wake, promotedRun } = await expectDeferredWakePromoted(deferredWakeupId);
+    expect(wake?.status).not.toBe("deferred_issue_execution");
+    expect(promotedRun?.status).not.toBe("cancelled");
   }, 20_000);
 
   it("cancels queued runs when the issue assignee changes before the run starts", async () => {
