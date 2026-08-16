@@ -158,4 +158,67 @@ describe("acpx session-limit failures", () => {
       resultJson: null,
     }, now)).toBeNull();
   });
+
+  // The entry gate does NOT stop this one. An acpx turn that ends
+  // `status:"cancelled"` returns `errorCode: null` and `errorMessage: null`
+  // (`resultErrorMessage` only speaks for `status:"failed"`), so heartbeat.ts
+  // stamps the run `adapter_failed` / "Adapter failed" — an admitted errorCode.
+  // The only text carrying "session limit" is then the agent's own assistant
+  // output, which `mergeHeartbeatRunResultJson` folds in as `resultJson.summary`.
+  it("ignores a session limit that only appears in the agent's own summary", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: "Adapter failed",
+      resultJson: {
+        status: "cancelled",
+        summary:
+          "I reviewed the park mechanism. It fires on `You've hit your session limit · resets 2pm (Asia/Tokyo)`.",
+      },
+    }, now)).toBeNull();
+  });
+
+  it("ignores a usage limit that only appears in captured adapter stdout", () => {
+    // claude-local puts the CLI's raw stream-json on `resultJson.stdout`, and the
+    // server's safe-resultJson projection keeps it (truncated). That stream
+    // embeds the agent's assistant text, so it is the same class of carrier as
+    // `summary` — an agent quoting the limit wording must not park the issue.
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: "Adapter failed",
+      resultJson: {
+        stdout:
+          '{"type":"assistant","message":{"content":[{"type":"text","text":"You\'ve hit your usage limit is the wording to match."}]}}',
+      },
+    }, now)).toBeNull();
+  });
+
+  it("still parks on quota wording captured from the adapter's stderr", () => {
+    // Boundary control for the `stdout` exclusion above: `stderr` is the adapter
+    // process's own error stream, not a channel the agent writes prose to, so it
+    // stays in the haystack. Drop it and a real quota failure whose only carrier
+    // is stderr would silently stop parking.
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: "Adapter failed",
+      resultJson: { stderr: "Error: You've hit your usage limit for this model." },
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+      parsedResetTime: false,
+    });
+  });
+
+  it("still parks when the provider error is on the run's own error column", () => {
+    // Positive control for the two negatives above: stripping agent-authored
+    // fields from the haystack must not cost us the real detection path.
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: SESSION_LIMIT,
+      resultJson: { status: "failed", summary: "The agent's closing remarks." },
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-08-16T05:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
 });

@@ -401,6 +401,27 @@ const PROVIDER_QUOTA_ERROR_RE =
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
 
+// `resultJson` fields holding the agent's OWN words rather than the provider's
+// error. `summary` is `textParts.join("")`, folded in by
+// `mergeHeartbeatRunResultJson`; `stdout` is the adapter CLI's raw stream-json,
+// which embeds the same assistant text and survives the safe-resultJson
+// projection. Matching quota wording in either parks an issue for an hour
+// because an agent merely wrote "session limit" in a reply — most likely of all
+// for an agent working on this very code path. The errorCode gate is no defence:
+// an acpx turn ending `status:"cancelled"` reports a null errorCode and reaches
+// here stamped as a plain `adapter_failed`. Same rule, for the same reason, as
+// the adapter-side `acpxProviderQuotaFields` and the heartbeat family gate.
+const AGENT_AUTHORED_RESULT_JSON_FIELDS = ["summary", "stdout"] as const;
+
+function providerErrorHaystack(
+  latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode">,
+  resultJson: Record<string, unknown>,
+) {
+  const providerFields = { ...resultJson };
+  for (const field of AGENT_AUTHORED_RESULT_JSON_FIELDS) delete providerFields[field];
+  return [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(providerFields)].join("\n");
+}
+
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
   | { kind: "configuration_incomplete" }
@@ -493,7 +514,7 @@ export function classifyAdapterFailureForRecovery(
   ) {
     return null;
   }
-  const error = [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(resultJson)].join("\n");
+  const error = providerErrorHaystack(latestRun, resultJson);
   if (
     !taggedProviderQuota &&
     (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
