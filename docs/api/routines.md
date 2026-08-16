@@ -323,6 +323,12 @@ For a fleet monitor: read `skipStreak.count` as "fires this routine did no work"
 `skip_if_active` routine both move together and either alert is the same incident; on a
 `coalesce_if_active` routine only the second one ever moves.
 
+Test the **key**, not the value, before reading either one. `null` is the healthy answer for
+`executionStall`, so a monitor that reads only the value cannot tell a healthy routine from a
+server that predates the field — both look absent. Once the field ships the key is always
+there (`null` survives JSON, `undefined` would not), so `"executionStall" in routine` is the
+version test and the value is the verdict. Same for `skipStreak` against an older server.
+
 ## Agent Access Rules
 
 Agents can read all routines in their company but can only create and manage routines assigned to themselves:
