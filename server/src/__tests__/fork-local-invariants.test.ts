@@ -50,7 +50,7 @@ const FORK_INVARIANTS: ForkInvariant[] = [
     // 1 definition + every site that persists a scheduled trigger's nextRunAt.
     // A merge that keeps the helper but re-points a persist site back at the
     // clean cron tick silently un-splays that path, so count the call sites.
-    minOccurrences: { "nextScheduledRunAt(": 7 },
+    minOccurrences: { "nextScheduledRunAt(": 8 },
   },
   {
     issue: "ENGA-2152",
