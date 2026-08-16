@@ -970,12 +970,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       reason: "issue_execution_deferred",
       payload: {
         issueId,
-        _paperclipWakeContext: {
-          issueId,
-          // A reason production actually emits; "issue_mention" (used here
-          // before ENGA-3313) exists in no production caller.
-          wakeReason: "issue_commented",
-        },
+        // A reason production actually emits; "issue_mention" (used here before
+        // ENGA-3313) exists in no production caller.
+        _paperclipWakeContext: deferredWakeContext(issueId, "issue_commented"),
       },
       status: "deferred_issue_execution",
     });
@@ -1032,6 +1029,27 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     .filter((reason) => reason !== "issue_reopened_via_comment")
     .sort();
 
+  // The `for` loops below turn this list into test cases, so shrinking it removes
+  // cases silently — the suite reports fewer tests and zero failures, which reads
+  // exactly like "still covered". Pin the contents so a hand-edited list fails loudly.
+  it("derives the agent comment discard cases from the production wake reason set", () => {
+    expect(AGENT_COMMENT_WAKE_REASONS).toEqual(["issue_commented", "issue_comment_mentioned"].sort());
+    expect(ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has("issue_reopened_via_comment")).toBe(true);
+    expect(PRODUCTION_WAKE_REASONS.has("issue_mention")).toBe(false);
+  });
+
+  // Every deferred-wake seed in this file has to go through the same guard, or a
+  // bogus reason just moves to whichever seed site still hand-rolls its payload.
+  function deferredWakeContext(issueId: string, wakeReason: string, extras?: Record<string, unknown>) {
+    if (!PRODUCTION_WAKE_REASONS.has(wakeReason)) {
+      throw new Error(
+        `Fixture wakeReason "${wakeReason}" is emitted by no production caller; `
+        + `use one of ${[...PRODUCTION_WAKE_REASONS].sort().join(", ")}.`,
+      );
+    }
+    return { issueId, wakeReason, ...(extras ?? {}) };
+  }
+
   async function seedTerminalIssueWithDeferredWake(input: {
     terminalStatus: "done" | "cancelled";
     // "run_finalize" reproduces the observed shape: the holder run closes the
@@ -1046,12 +1064,6 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     requestedByActorType?: "user" | "agent" | "system";
   }) {
     const wakeReason = input.wakeReason ?? NON_COMMENT_WAKE_REASON;
-    if (!PRODUCTION_WAKE_REASONS.has(wakeReason)) {
-      throw new Error(
-        `Fixture wakeReason "${wakeReason}" is emitted by no production caller; `
-        + `use one of ${[...PRODUCTION_WAKE_REASONS].sort().join(", ")}.`,
-      );
-    }
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
     const holderWakeupId = randomUUID();
@@ -1120,11 +1132,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       requestedByActorType: input.requestedByActorType ?? "agent",
       payload: {
         issueId,
-        _paperclipWakeContext: {
-          issueId,
-          wakeReason,
-          ...(input.deferredContextExtras ?? {}),
-        },
+        _paperclipWakeContext: deferredWakeContext(issueId, wakeReason, input.deferredContextExtras),
       },
       status: "deferred_issue_execution",
     });
@@ -1388,7 +1396,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       requestedByActorType: "agent",
       payload: {
         issueId,
-        _paperclipWakeContext: { issueId, wakeReason: "issue_children_completed" },
+        _paperclipWakeContext: deferredWakeContext(issueId, NON_COMMENT_WAKE_REASON),
       },
       status: "deferred_issue_execution",
     });
