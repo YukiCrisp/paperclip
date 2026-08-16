@@ -24,6 +24,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import { ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS } from "../services/issue-tree-control.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -1012,17 +1013,24 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   // issue on its way out, the leftovers must not turn into fresh execution on
   // work that is already terminal.
   //
-  // These are the wake reasons production emits for a comment-sourced wake
-  // (`ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS` in issue-tree-control.ts) plus
-  // one non-comment reason. Naming the union here keeps a fixture from drifting
-  // onto a string that exists in no production code path: ENGA-3313 caught these
-  // very tests passing a `wakeReason` of "issue_mention", which no production
-  // caller emits, so the comment-wake branch of the gate was never exercised.
-  type ProductionWakeReason =
-    | "issue_commented"
-    | "issue_comment_mentioned"
-    | "issue_reopened_via_comment"
-    | "issue_children_completed";
+  // ENGA-3313: these tests used to seed `wakeReason: "issue_mention"`, a string
+  // no production caller emits, so the comment-wake branch of the gate was never
+  // exercised and the suite stayed green over the reported bug. Guard the fixture
+  // against that class of drift by checking every seeded reason against the real
+  // production set rather than a hand-copied list. `server/tsconfig.json` excludes
+  // `src/__tests__`, so a type-level union would not be checked by `tsc` — this
+  // has to be a runtime assertion to mean anything.
+  const NON_COMMENT_WAKE_REASON = "issue_children_completed";
+  const PRODUCTION_WAKE_REASONS = new Set<string>([
+    ...ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
+    NON_COMMENT_WAKE_REASON,
+  ]);
+  // Derived from the production set, minus the reason that routes into the reopen
+  // branch above the gate. If production grows a fourth comment reason, it joins
+  // the discard cases here automatically instead of quietly going uncovered.
+  const AGENT_COMMENT_WAKE_REASONS = [...ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS]
+    .filter((reason) => reason !== "issue_reopened_via_comment")
+    .sort();
 
   async function seedTerminalIssueWithDeferredWake(input: {
     terminalStatus: "done" | "cancelled";
@@ -1030,13 +1038,20 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     // issue itself and then finalizes. "stale_cancel" covers the holder being
     // cancelled while the issue is already terminal.
     closedBy: "run_finalize" | "stale_cancel";
-    // Every value passed here has to be a reason production actually emits.
-    // A made-up string silently lands outside whichever set the gate consults,
-    // which measures nothing while staying green.
-    wakeReason?: ProductionWakeReason;
+    // Every value passed here has to be a reason production actually emits. A
+    // made-up string lands outside whichever set the gate consults, which
+    // measures nothing while staying green.
+    wakeReason?: string;
     deferredContextExtras?: Record<string, unknown>;
     requestedByActorType?: "user" | "agent" | "system";
   }) {
+    const wakeReason = input.wakeReason ?? NON_COMMENT_WAKE_REASON;
+    if (!PRODUCTION_WAKE_REASONS.has(wakeReason)) {
+      throw new Error(
+        `Fixture wakeReason "${wakeReason}" is emitted by no production caller; `
+        + `use one of ${[...PRODUCTION_WAKE_REASONS].sort().join(", ")}.`,
+      );
+    }
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
     const holderWakeupId = randomUUID();
@@ -1107,7 +1122,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         issueId,
         _paperclipWakeContext: {
           issueId,
-          wakeReason: input.wakeReason ?? "issue_children_completed",
+          wakeReason,
           ...(input.deferredContextExtras ?? {}),
         },
       },
@@ -1208,10 +1223,10 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       }, 20_000);
     }
 
-    // Both reasons production emits for an agent's own comment. `issue_commented`
-    // is the one ENGA-3313 used to show the gate never fired; `issue_comment_mentioned`
-    // is its sibling in the same set, and a gate keyed on either would leave the other open.
-    for (const wakeReason of ["issue_commented", "issue_comment_mentioned"] as const) {
+    // Every reason production emits for an agent's own comment. `issue_commented`
+    // is the one ENGA-3313 used to show the gate never fired; its siblings in the
+    // same set matter too, because a gate keyed on one would leave the others open.
+    for (const wakeReason of AGENT_COMMENT_WAKE_REASONS) {
       it(`discards an agent ${wakeReason} deferred wake when the issue reached a terminal status (${closedBy})`, async () => {
         const commentId = randomUUID();
         const fixture = await seedTerminalIssueWithDeferredWake({
