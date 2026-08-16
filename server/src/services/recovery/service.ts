@@ -26,6 +26,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { ACPX_EVENT_INACTIVITY_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/event-inactivity";
+import { extractQuotaRetryNotBefore } from "@paperclipai/adapter-utils/quota-text";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -391,10 +392,35 @@ const CONTINUATION_RECOVERY_WORKTREE_SWAP_MAX_ATTEMPTS = 4;
 const CONTINUATION_RECOVERY_WORKTREE_SWAP_BASE_BACKOFF_MS = 5 * 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 
+// `session limit` is the wording the Claude runtime actually uses when a seat's
+// window is exhausted ("You've hit your session limit · resets 2pm
+// (Asia/Tokyo)"). It was missing here, so those failures fell through the quota
+// gate entirely and were answered with a re-dispatch instead of a park.
 const PROVIDER_QUOTA_ERROR_RE =
-  /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
+  /(?:you(?:'|’)ve hit your (?:usage|session) limit|usage limit(?: reached| exceeded)?|session limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
+
+// `resultJson` fields holding the agent's OWN words rather than the provider's
+// error. `summary` is `textParts.join("")`, folded in by
+// `mergeHeartbeatRunResultJson`; `stdout` is the adapter CLI's raw stream-json,
+// which embeds the same assistant text and survives the safe-resultJson
+// projection. Matching quota wording in either parks an issue for an hour
+// because an agent merely wrote "session limit" in a reply — most likely of all
+// for an agent working on this very code path. The errorCode gate is no defence:
+// an acpx turn ending `status:"cancelled"` reports a null errorCode and reaches
+// here stamped as a plain `adapter_failed`. Same rule, for the same reason, as
+// the adapter-side `acpxProviderQuotaFields` and the heartbeat family gate.
+const AGENT_AUTHORED_RESULT_JSON_FIELDS = ["summary", "stdout"] as const;
+
+function providerErrorHaystack(
+  latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode">,
+  resultJson: Record<string, unknown>,
+) {
+  const providerFields = { ...resultJson };
+  for (const field of AGENT_AUTHORED_RESULT_JSON_FIELDS) delete providerFields[field];
+  return [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(providerFields)].join("\n");
+}
 
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
@@ -473,19 +499,35 @@ export function classifyAdapterFailureForRecovery(
   latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode" | "resultJson">,
   now = new Date(),
 ): AdapterFailureRecoveryClassification {
+  const resultJson = parseObject(latestRun.resultJson);
+  // Admit on the adapter's own family tag rather than by widening the errorCode
+  // enum. Engines that report a phase bucket instead of a semantic code (acpx
+  // reports `acpx_turn_failed` for every turn-time failure) would otherwise never
+  // reach the park mechanism, and enumerating their codes here would drag every
+  // unrelated turn failure in with them.
+  const taggedProviderQuota = readNonEmptyString(resultJson.errorFamily) === "provider_quota";
   if (
+    !taggedProviderQuota &&
     latestRun.errorCode !== "adapter_failed" &&
     latestRun.errorCode !== "provider_quota" &&
     latestRun.errorCode !== "configuration_incomplete"
   ) {
     return null;
   }
-  const resultJson = parseObject(latestRun.resultJson);
-  const error = [latestRun.errorCode ?? "", latestRun.error ?? "", JSON.stringify(resultJson)].join("\n");
-  if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
+  const error = providerErrorHaystack(latestRun, resultJson);
+  if (
+    !taggedProviderQuota &&
+    (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
+  ) {
     return { kind: "configuration_incomplete" };
   }
-  if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
+  if (
+    !taggedProviderQuota &&
+    latestRun.errorCode !== "provider_quota" &&
+    !PROVIDER_QUOTA_ERROR_RE.test(error)
+  ) {
+    return null;
+  }
 
   const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??
     readNonEmptyString(resultJson.transientRetryNotBefore) ??
@@ -495,7 +537,12 @@ export function classifyAdapterFailureForRecovery(
     return { kind: "provider_quota", retryAt: parsedPersistedRetryAt, parsedResetTime: true };
   }
 
-  const parsedClockReset = parseProviderQuotaClockReset(error, now);
+  // `try again at ...` first (unchanged), then the `resets <clock> (<zone>)`
+  // wording. Falling through to the flat one-hour backoff is not harmless: the
+  // observed session-limit failure hit at 03:24Z against a 05:00Z reset, so the
+  // default would resume at 04:24Z and burn one more failed run for nothing.
+  const parsedClockReset =
+    parseProviderQuotaClockReset(error, now) ?? extractQuotaRetryNotBefore(error, now);
   if (parsedClockReset) {
     return { kind: "provider_quota", retryAt: parsedClockReset, parsedResetTime: true };
   }

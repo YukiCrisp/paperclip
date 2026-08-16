@@ -137,6 +137,40 @@ describe("readHeartbeatRunErrorFamily", () => {
     ).toBeNull();
   });
 
+  // Backstop for runs whose adapter did not tag the family itself. Same shape as
+  // the connectivity gate above — phase-bucket code plus a message gate on `error`
+  // alone — so the quota park still fires while a host runs an older adapter.
+  it("classifies an acpx session-limit failure as provider quota", () => {
+    expect(
+      readHeartbeatRunErrorFamily(
+        failedRun({
+          errorCode: "acpx_turn_failed",
+          error: "Internal error: You've hit your session limit · resets 2pm (Asia/Tokyo)",
+        }),
+      ),
+    ).toBe("provider_quota");
+  });
+
+  // Same argument as the connectivity negative control, and it matters more here:
+  // a wrong provider_quota reading parks the issue until an imagined reset, and an
+  // agent working on quota handling is exactly the one who writes "session limit"
+  // into its own reply.
+  it("ignores session-limit strings that only appear in the agent's own output", () => {
+    expect(
+      readHeartbeatRunErrorFamily(
+        failedRun({
+          errorCode: "acpx_turn_failed",
+          error: "Internal error: tool execution failed after 3 attempts",
+          resultJson: {
+            summary:
+              "I wired the park for \"You've hit your session limit · resets 2pm (Asia/Tokyo)\" " +
+              "into the recovery path, then the tool call failed.",
+          },
+        }),
+      ),
+    ).toBeNull();
+  });
+
   it("does not let the connectivity gate widen other error codes", () => {
     expect(
       readHeartbeatRunErrorFamily(

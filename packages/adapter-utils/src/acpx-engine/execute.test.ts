@@ -1652,6 +1652,100 @@ describe("gemini ACP flag selection", () => {
   }, 15_000);
 });
 
+describe("acpx provider-quota tagging", () => {
+  // The exact string an exhausted Claude seat puts on the ACP runtime error object.
+  const SESSION_LIMIT =
+    "Internal error: You've hit your session limit · resets 2pm (Asia/Tokyo)";
+  // 03:24Z is 12:24 JST, so the same day's 14:00 JST (= 05:00Z) is still ahead.
+  const FAILED_AT = Date.parse("2026-08-16T03:24:00.000Z");
+  const EXPECTED_RESET = "2026-08-16T05:00:00.000Z";
+
+  async function runFailingTurn(input: {
+    runId: string;
+    errorMessage: string;
+    agentText?: string;
+  }) {
+    const root = await makeTempRoot();
+    const execute = createAcpxEngineExecutor({
+      now: () => FAILED_AT,
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            if (input.agentText) {
+              yield {
+                type: "text_delta",
+                text: input.agentText,
+                stream: "output",
+                tag: "agent_message_chunk",
+              };
+            }
+            yield { type: "error", message: input.errorMessage };
+          })(),
+          result: Promise.resolve({
+            status: "failed",
+            error: { message: input.errorMessage },
+          }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    return await execute({
+      runId: input.runId,
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+  }
+
+  it("tags an exhausted session limit as provider_quota with the parsed reset time", async () => {
+    const result = await runFailingTurn({
+      runId: "run-quota-1",
+      errorMessage: SESSION_LIMIT,
+    });
+
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorFamily).toBe("provider_quota");
+    expect(result.retryNotBefore).toBe(EXPECTED_RESET);
+  });
+
+  // Negative control. `summary` on this path is `textParts.join("")` — the agent's
+  // own reply — so quota text there must never tag the run. Without this case the
+  // classifier could be widened to the summary and stay green, and every agent
+  // that merely discusses session limits would park its own issue.
+  it("does not tag the run when only the agent's own output mentions a session limit", async () => {
+    const result = await runFailingTurn({
+      runId: "run-quota-negative-control",
+      errorMessage: "Turn failed while applying an edit.",
+      agentText: SESSION_LIMIT,
+    });
+
+    expect(result.summary).toContain("session limit");
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.retryNotBefore).toBeUndefined();
+  });
+
+  it("leaves ordinary turn failures untagged", async () => {
+    const result = await runFailingTurn({
+      runId: "run-quota-2",
+      errorMessage: "Turn failed while applying an edit.",
+    });
+
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorFamily).toBeUndefined();
+  });
+});
+
 describe("summarizeAcpxTurnUsage", () => {
   it("uses the post-turn amount alone when the cumulative cost counter reset", () => {
     const summary = summarizeAcpxTurnUsage({
