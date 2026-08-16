@@ -111,15 +111,14 @@ describe("withAcpxHandshakeTimeout", () => {
     vi.useFakeTimers();
     try {
       let fail!: (err: Error) => void;
+      const onLateSettle = vi.fn();
+      const underlying = new Promise<string>((_resolve, reject) => {
+        fail = reject;
+      });
       const pending = withAcpxHandshakeTimeout({
         timeoutMs: 5_000,
-        start: () =>
-          new Promise<string>((_resolve, reject) => {
-            fail = reject;
-          }),
-        onLateSettle: () => {
-          throw new Error("must not be called");
-        },
+        start: () => underlying,
+        onLateSettle,
       });
       const assertion = expect(pending).rejects.toBeInstanceOf(AcpxHandshakeTimeoutError);
       await vi.advanceTimersByTimeAsync(5_000);
@@ -127,6 +126,14 @@ describe("withAcpxHandshakeTimeout", () => {
 
       fail(new Error("late spawn failure"));
       await vi.advanceTimersByTimeAsync(0);
+
+      // Asserting on the promise itself, not on process-level unhandled
+      // rejection detection: vitest reports that asynchronously and would not
+      // reliably fail this test. A handler being attached is what makes the
+      // rejection handled, and `underlying` having settled rejected is what
+      // proves the late failure actually happened rather than never arriving.
+      expect(onLateSettle).not.toHaveBeenCalled();
+      await expect(underlying).rejects.toThrow("late spawn failure");
     } finally {
       vi.useRealTimers();
     }

@@ -2703,18 +2703,38 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     let resumedSession = Boolean(handle ?? resumeSessionId);
     let clearSession = false;
 
-    // `ensureSession` takes no signal, so a watchdog kill leaves the attempt
-    // running inside acpx. If it lands after we have given up, close it —
-    // otherwise a stalled run leaks a live child and a persisted session record
-    // into a server process that outlives the run.
+    // `ensureSession` takes no signal, so a watchdog kill cannot cancel the
+    // attempt — it only stops waiting on it. A handshake that lands afterwards
+    // has already spawned a child and saved its session record, so the cleanup
+    // below is damage control, not prevention, and it is deliberately narrow:
+    //
+    //   - Persistent sessions only. On `oneshot` acpx has already closed the
+    //     client in its own `finally`, so there is nothing left to leak and
+    //     `close` would spawn a *fresh* agent child just to address a session
+    //     whose process is gone.
+    //   - Bounded. `AcpRuntimeOptions.timeoutMs` is `undefined` on local/SSH
+    //     targets (`timeoutSec` resolves to unlimited there — the exact lane
+    //     this watchdog exists for), and acpx's `withTimeout(p, undefined)` is
+    //     a bare await. An unbounded close on a sick agent would hang forever
+    //     inside a detached promise, never reaching the `client.close()` that
+    //     actually kills the child.
+    //
+    // What this cannot fix: the record acpx saved on the way in. Its id is the
+    // session key verbatim for persistent sessions, and the key is stable
+    // across runs, so a late landing overwrites whatever a retry has since put
+    // there. The retry then fails its next turn and is itself retried, which
+    // is survivable but not free — see the PR discussion.
     const closeLateHandshake = (late: AcpRuntimeHandle) => {
-      void runtime
-        .close({
-          handle: late,
-          reason: "paperclip handshake watchdog",
-          discardPersistentState: true,
-        })
-        .catch(() => {});
+      if (prepared.mode !== "persistent") return;
+      void withAcpxHandshakeTimeout({
+        timeoutMs: handshakeTimeoutMs,
+        start: () =>
+          runtime.close({
+            handle: late,
+            reason: "paperclip handshake watchdog",
+            discardPersistentState: true,
+          }),
+      }).catch(() => {});
     };
     const ensureSessionBounded = (input: Parameters<AcpRuntime["ensureSession"]>[0]) =>
       measureStartupStep(ctx, now, "acp.handshake", () =>

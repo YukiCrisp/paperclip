@@ -3264,15 +3264,66 @@ describe("ACPX handshake watchdog", () => {
   // The resume-retry path re-runs the whole handshake on a fresh session. Doing
   // that after a watchdog kill would spend the window twice, which is the exact
   // cost the watchdog exists to remove.
+  //
+  // Getting the branch genuinely live matters and is easy to fake by accident:
+  // `isCompatibleSession` rejects on its first check unless `sessionParams`
+  // carries a real `configFingerprint`, so a hand-written `{acpSessionId: ...}`
+  // leaves `canResume` false and the retry path unreachable — the test would
+  // then pass without ever touching what it claims to cover. So the prior
+  // session here comes from an actual successful run, and the assertion on
+  // `resumeSessionId` below is what proves the branch was reachable at all.
   it("does not retry a stalled handshake as if it were a resume failure", async () => {
-    let ensureSessionCalls = 0;
     const root = await makeTempRoot();
-    const execute = createAcpxEngineExecutor({
-      handshakeTimeoutMs: 25,
-      createRuntime: () =>
+    const config = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+    };
+    const runOnce = async (
+      runtimeFactory: () => never,
+      sessionParams?: Record<string, unknown>,
+    ) => {
+      const execute = createAcpxEngineExecutor({
+        handshakeTimeoutMs: 25,
+        createRuntime: runtimeFactory,
+      });
+      return (await execute({
+        runId: "run-1",
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: sessionParams ? { sessionParams } : {},
+        config,
+        context: {},
+        onLog: async () => {},
+        onMeta: async () => {},
+      } as never)) as { errorCode?: string; sessionParams?: Record<string, unknown> };
+    };
+
+    // First run establishes a real, resumable session.
+    const established = await runOnce(
+      () =>
         ({
-          ensureSession: () => {
-            ensureSessionCalls += 1;
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async () => {},
+        }) as never,
+    );
+    expect(established.sessionParams?.configFingerprint).toBeTypeOf("string");
+
+    // Second run resumes it, and the handshake stalls.
+    const ensureSessionInputs: Array<{ resumeSessionId?: string }> = [];
+    const stalled = await runOnce(
+      () =>
+        ({
+          ensureSession: (input: { resumeSessionId?: string }) => {
+            ensureSessionInputs.push(input);
             return new Promise(() => {});
           },
           startTurn: () => {
@@ -3280,24 +3331,14 @@ describe("ACPX handshake watchdog", () => {
           },
           close: async () => {},
         }) as never,
-    });
-    const result = await execute({
-      runId: "run-1",
-      agent: { id: "agent-1", companyId: "company-1" },
-      // A resumable prior session, so the resume-retry branch is live.
-      runtime: { sessionParams: { acpSessionId: "prior-session" } },
-      config: {
-        agent: "custom",
-        agentCommand: "node ./fake-acp.js",
-        stateDir: path.join(root, "state"),
-      },
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-    } as never);
+      established.sessionParams,
+    );
 
-    expect(result.errorCode).toBe("acpx_handshake_timeout");
-    expect(ensureSessionCalls).toBe(1);
+    expect(stalled.errorCode).toBe("acpx_handshake_timeout");
+    // The branch really was live: a resume was attempted...
+    expect(ensureSessionInputs[0]?.resumeSessionId).toBe("backend-session");
+    // ...and the watchdog kill did not turn into a second full window.
+    expect(ensureSessionInputs).toHaveLength(1);
   });
 
   // One escape hatch, not three: the knob that disables the event-inactivity
