@@ -10,6 +10,7 @@ import type {
   RoutineTriggerSigningMode,
   RoutineVariableType,
 } from "../constants.js";
+import type { RoutineExecutionStall } from "../routine-execution-stall.js";
 import type { RoutineSkipStreak } from "../routine-skip-streak.js";
 import type { EnvBinding } from "./secrets.js";
 import type { ExecutionWorkspaceMode, IssueExecutionWorkspaceSettings } from "./workspace-runtime.js";
@@ -242,6 +243,11 @@ export interface RoutineDetail extends Routine {
   recentRuns: RoutineRunSummary[];
   activeIssue: RoutineIssueSummary | null;
   skipStreak: RoutineSkipStreak;
+  /**
+   * How many fires the current `activeIssue` has swallowed. `null` when no execution issue
+   * is live — the absence of a live issue is not a quiet stall, it is the healthy state.
+   */
+  executionStall: RoutineExecutionStall | null;
 }
 
 export interface RoutineRunSummary extends RoutineRun {
@@ -268,4 +274,6 @@ export interface RoutineListItem extends Routine {
   lastRun: RoutineRunSummary | null;
   activeIssue: RoutineIssueSummary | null;
   skipStreak: RoutineSkipStreak;
+  /** See `RoutineDetail.executionStall`. `null` when no execution issue is live. */
+  executionStall: RoutineExecutionStall | null;
 }

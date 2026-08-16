@@ -255,6 +255,8 @@ export {
   ROUTINE_SKIP_STREAK_ALERT_REASONS,
   ROUTINE_SKIP_STREAK_ALERT_THRESHOLD,
   ROUTINE_SKIP_TOUCHED_STATES,
+  ROUTINE_EXECUTION_STALL_ALERT_THRESHOLD,
+  ROUTINE_EXECUTION_STALL_SUPPRESSED_RUN_STATUSES,
   ROUTINE_RUN_SOURCES,
   PAUSE_REASONS,
   PROJECT_COLORS,
@@ -438,6 +440,7 @@ export {
   type RoutineRunSkipReason,
   type RoutineSkipStreakAlertReason,
   type RoutineSkipTouchedState,
+  type RoutineExecutionStallSuppressedRunStatus,
   type RoutineRunSource,
   type PauseReason,
   type ApprovalType,
@@ -2135,6 +2138,12 @@ export {
   type RoutineSkipStreak,
   type RoutineSkipStreakState,
 } from "./routine-skip-streak.js";
+
+export {
+  resolveRoutineExecutionStall,
+  type RoutineExecutionStall,
+  type RoutineExecutionStallState,
+} from "./routine-execution-stall.js";
 
 export {
   paperclipConfigSchema,

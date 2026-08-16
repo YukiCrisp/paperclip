@@ -249,6 +249,11 @@ on the same responses for clients that want to apply their own threshold. Read t
 *other* routines: a streak is cleared by the subject routine's own dispatch, never by the
 observer's, so a fleet monitor sees a live count.
 
+**The streak only sees one of the two concurrency policies.** A `coalesce_if_active` routine
+that fires into a stuck execution issue records `coalesced`, which is not a skip and therefore
+*clears* the streak on every tick. Same stuck issue, same lost periods, `skipStreak.count` of
+zero forever. Use `executionStall` below for that; it covers both policies.
+
 A routine cannot read its own streak this way. The reset is written when a run is dispatched,
 before that run starts, so a routine reading `skipStreak.count` for itself from inside its own
 run gets `0` structurally — and `0` reads as "nothing was skipped", which is the silence the
@@ -268,6 +273,55 @@ surface each one reads. The server reads the trigger-facing label that lands in
 `skipped_paused` and its siblings — hence the `skipped_` prefix as a third signal. Step 3
 reads `routineRuns.status`, a closed enum (`ROUTINE_RUN_STATUSES`) whose only skip is
 `skipped`. Add a `skipped_*` member to that enum and step 3 needs the prefix test too.
+
+## Stalled Execution Issues
+
+The skip streak reads the routine. `executionStall` reads the execution issue the routine is
+firing into, which is the anchor both concurrency policies share:
+
+```json
+{
+  "executionStall": {
+    "suppressedRunCount": 4,
+    "since": "2026-08-05T00:00:00.000Z",
+    "lastSuppressedAt": "2026-08-05T04:00:00.000Z",
+    "threshold": 2,
+    "alerting": true
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `suppressedRunCount` | Fires that were `skipped` **or** `coalesced` into the current `activeIssue` |
+| `since` | When that execution issue was created |
+| `lastSuppressedAt` | Trigger time of the most recent fire that folded into it |
+| `threshold` | `suppressedRunCount` at which the issue counts as stalled |
+| `alerting` | `true` once the count reaches the threshold |
+
+`executionStall` is `null` when no execution issue is live — that is the healthy state, not a
+quiet one. It resets by moving to a new issue, not by a counter being cleared: once the stuck
+execution finishes and the next fire dispatches, the stall is read against the fresh issue.
+
+Two properties are worth stating because they are the reasons this is not folded into
+`skipStreak`:
+
+- **It counts fires, not hours.** Two fires lost is two periods lost whether the routine is
+  hourly or weekly, so one threshold is portable across cadences. `since` is there for an
+  operator who wants the wall-time, but age alone never raises the alert — a stuck issue on a
+  paused routine ages without costing a fire.
+- **It needs no reason to alert.** `skipStreak.alerting` requires an alerting `skipReason`,
+  and a coalesce records none because it is not a skip. Here the count is the evidence.
+
+Deliberate suppressions (`paused`, `no_external_activity`, `worktree_execution_cutoff`) are
+recorded with no `linkedIssueId`, so they cannot reach this count even though their status is
+also `skipped`. The run that *created* the issue carries the same `linkedIssueId` and is
+excluded too — it dispatched.
+
+For a fleet monitor: read `skipStreak.count` as "fires this routine did no work" and
+`executionStall.suppressedRunCount` as "fires this one execution issue ate". On a
+`skip_if_active` routine both move together and either alert is the same incident; on a
+`coalesce_if_active` routine only the second one ever moves.
 
 ## Agent Access Rules
 

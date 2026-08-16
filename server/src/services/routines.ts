@@ -47,6 +47,7 @@ import type {
   UpdateRoutineTrigger,
 } from "@paperclipai/shared";
 import {
+  ROUTINE_EXECUTION_STALL_SUPPRESSED_RUN_STATUSES,
   WORKSPACE_BRANCH_ROUTINE_VARIABLE,
   getBuiltinRoutineVariableValues,
   extractRoutineVariableNames,
@@ -54,6 +55,7 @@ import {
   isRoutineSkipTouchedState,
   isValidRoutineDateString,
   pluginOperationIssueOriginKind,
+  resolveRoutineExecutionStall,
   resolveRoutineSkipStreak,
   routineRevisionSnapshotSchema,
   stringifyRoutineVariableValue,
@@ -80,6 +82,11 @@ import {
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+
+type LiveExecutionIssueEntry = {
+  summary: NonNullable<RoutineListItem["activeIssue"]>;
+  createdAt: Date;
+};
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -1088,7 +1095,7 @@ export function routineService(
   }
 
   async function listLiveIssueByRoutineIds(companyId: string, routineIds: string[]) {
-    if (routineIds.length === 0) return new Map<string, RoutineListItem["activeIssue"]>();
+    if (routineIds.length === 0) return new Map<string, LiveExecutionIssueEntry>();
     const executionBoundRows = await db
       .selectDistinctOn([issues.originId], {
         originId: issues.originId,
@@ -1098,6 +1105,7 @@ export function routineService(
         status: issues.status,
         priority: issues.priority,
         updatedAt: issues.updatedAt,
+        createdAt: issues.createdAt,
       })
       .from(issues)
       .innerJoin(
@@ -1135,6 +1143,7 @@ export function routineService(
           status: issues.status,
           priority: issues.priority,
           updatedAt: issues.updatedAt,
+          createdAt: issues.createdAt,
         })
         .from(issues)
         .innerJoin(
@@ -1162,19 +1171,75 @@ export function routineService(
       }
     }
 
-    const map = new Map<string, RoutineListItem["activeIssue"]>();
+    const map = new Map<string, LiveExecutionIssueEntry>();
     for (const row of rowsByOriginId.values()) {
       if (!row.originId) continue;
       map.set(row.originId, {
-        id: row.id,
-        identifier: row.identifier,
-        title: row.title,
-        status: row.status,
-        priority: row.priority,
-        updatedAt: row.updatedAt,
+        summary: {
+          id: row.id,
+          identifier: row.identifier,
+          title: row.title,
+          status: row.status,
+          priority: row.priority,
+          updatedAt: row.updatedAt,
+        },
+        createdAt: row.createdAt,
       });
     }
     return map;
+  }
+
+  /**
+   * How many fires each live execution issue has swallowed, and when the last one landed.
+   *
+   * Counted per issue rather than per routine, because that is the one anchor both
+   * concurrency policies share: `skip_if_active` and `coalesce_if_active` write different run
+   * statuses for the same event — a fire that found the previous execution still live — and
+   * only the skip side reaches the routine's skip streak. Deliberate suppressions (paused,
+   * quiet activity gate, worktree cutoff) are recorded with `linkedIssueId: null`, so they
+   * cannot land in this count even though their status is also `skipped`.
+   */
+  async function listExecutionStallByIssueIds(companyId: string, issueIds: string[]) {
+    const map = new Map<string, { suppressedRunCount: number; lastSuppressedAt: Date | null }>();
+    if (issueIds.length === 0) return map;
+    const rows = await db
+      .select({
+        issueId: routineRuns.linkedIssueId,
+        suppressedRunCount: sql<number>`count(*)::int`,
+        lastSuppressedAt: sql<Date | null>`max(${routineRuns.triggeredAt})`,
+      })
+      .from(routineRuns)
+      .where(
+        and(
+          eq(routineRuns.companyId, companyId),
+          inArray(routineRuns.linkedIssueId, issueIds),
+          inArray(routineRuns.status, [...ROUTINE_EXECUTION_STALL_SUPPRESSED_RUN_STATUSES]),
+        ),
+      )
+      .groupBy(routineRuns.linkedIssueId);
+
+    for (const row of rows) {
+      if (!row.issueId) continue;
+      map.set(row.issueId, {
+        suppressedRunCount: row.suppressedRunCount,
+        lastSuppressedAt: row.lastSuppressedAt ?? null,
+      });
+    }
+    return map;
+  }
+
+  async function resolveExecutionStallForIssue(
+    companyId: string,
+    issue: { id: string; createdAt: Date } | null,
+  ) {
+    if (!issue) return null;
+    const stallByIssueId = await listExecutionStallByIssueIds(companyId, [issue.id]);
+    const stall = stallByIssueId.get(issue.id);
+    return resolveRoutineExecutionStall({
+      suppressedRunCount: stall?.suppressedRunCount ?? 0,
+      since: issue.createdAt,
+      lastSuppressedAt: stall?.lastSuppressedAt ?? null,
+    });
   }
 
   async function updateRoutineTouchedState(input: {
@@ -1994,24 +2059,39 @@ export function routineService(
         listLiveIssueByRoutineIds(companyId, routineIds),
         listManagedRoutineMetadata(routineIds),
       ]);
-      return rows.map((row) => ({
-        ...row,
-        managedByPlugin: managedByRoutine.get(row.id) ?? null,
-        triggers: (triggersByRoutine.get(row.id) ?? []).map((trigger) => ({
-          id: trigger.id,
-          kind: trigger.kind as RoutineListItem["triggers"][number]["kind"],
-          label: trigger.label,
-          enabled: trigger.enabled,
-          cronExpression: trigger.cronExpression,
-          timezone: trigger.timezone,
-          nextRunAt: trigger.nextRunAt,
-          lastFiredAt: trigger.lastFiredAt,
-          lastResult: trigger.lastResult,
-        })),
-        lastRun: latestRunByRoutine.get(row.id) ?? null,
-        activeIssue: activeIssueByRoutine.get(row.id) ?? null,
-        skipStreak: resolveRoutineSkipStreak(row),
-      }));
+      const stallByIssueId = await listExecutionStallByIssueIds(
+        companyId,
+        [...activeIssueByRoutine.values()].map((entry) => entry.summary.id),
+      );
+      return rows.map((row) => {
+        const liveIssue = activeIssueByRoutine.get(row.id) ?? null;
+        const stall = liveIssue ? stallByIssueId.get(liveIssue.summary.id) : undefined;
+        return {
+          ...row,
+          managedByPlugin: managedByRoutine.get(row.id) ?? null,
+          triggers: (triggersByRoutine.get(row.id) ?? []).map((trigger) => ({
+            id: trigger.id,
+            kind: trigger.kind as RoutineListItem["triggers"][number]["kind"],
+            label: trigger.label,
+            enabled: trigger.enabled,
+            cronExpression: trigger.cronExpression,
+            timezone: trigger.timezone,
+            nextRunAt: trigger.nextRunAt,
+            lastFiredAt: trigger.lastFiredAt,
+            lastResult: trigger.lastResult,
+          })),
+          lastRun: latestRunByRoutine.get(row.id) ?? null,
+          activeIssue: liveIssue?.summary ?? null,
+          skipStreak: resolveRoutineSkipStreak(row),
+          executionStall: liveIssue
+            ? resolveRoutineExecutionStall({
+              suppressedRunCount: stall?.suppressedRunCount ?? 0,
+              since: liveIssue.createdAt,
+              lastSuppressedAt: stall?.lastSuppressedAt ?? null,
+            })
+            : null,
+        };
+      });
     },
 
     getDetail: async (id: string): Promise<RoutineDetail | null> => {
@@ -2103,6 +2183,7 @@ export function routineService(
         findLiveExecutionIssue(row),
         listManagedRoutineMetadata([row.id]),
       ]);
+      const executionStall = await resolveExecutionStallForIssue(row.companyId, activeIssue);
 
       return {
         ...row,
@@ -2115,6 +2196,7 @@ export function routineService(
         recentRuns,
         activeIssue,
         skipStreak: resolveRoutineSkipStreak(row),
+        executionStall,
       };
     },
 

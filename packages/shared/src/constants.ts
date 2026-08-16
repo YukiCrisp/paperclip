@@ -623,6 +623,22 @@ export const ROUTINE_SKIP_TOUCHED_STATES = [
 ] as const;
 export type RoutineSkipTouchedState = (typeof ROUTINE_SKIP_TOUCHED_STATES)[number];
 
+// The run statuses a live execution issue produces when it swallows a later fire. Which of
+// the two a routine writes is a policy choice and not a health signal — skip_if_active
+// records "skipped", coalesce_if_active records "coalesced" — so the stall count reads both
+// and the skip streak above reads only the first. That asymmetry is the whole point: a
+// coalescing routine clears its skip streak on every tick and would otherwise fire on time
+// forever while doing nothing. Deliberate suppressions (paused, quiet activity gate,
+// worktree cutoff) never reach this list because they are recorded with no linkedIssueId.
+export const ROUTINE_EXECUTION_STALL_SUPPRESSED_RUN_STATUSES = ["skipped", "coalesced"] as const;
+export type RoutineExecutionStallSuppressedRunStatus =
+  (typeof ROUTINE_EXECUTION_STALL_SUPPRESSED_RUN_STATUSES)[number];
+
+// Counted in lost periods rather than hours, so one threshold fits an hourly routine and a
+// weekly one. Two fires folded into the same execution issue means the issue has already
+// outlived a full period of the schedule that feeds it.
+export const ROUTINE_EXECUTION_STALL_ALERT_THRESHOLD = 2;
+
 export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook"] as const;
 export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 
