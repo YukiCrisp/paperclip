@@ -34,6 +34,7 @@ import {
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
 } from "./execute.js";
+import { AcpxHandshakeTimeoutError } from "./handshake-timeout.js";
 import { runChildProcess } from "../server-utils.js";
 
 
@@ -3136,5 +3137,374 @@ describe("ACPX event-inactivity watchdog", () => {
       "ACP event inactivity watchdog: DISABLED",
     );
     expect(result.errorCode ?? null).toBe(null);
+  });
+});
+
+// The handshake that has to succeed before any turn is only bounded by acpx for
+// its last phase (`session/new`, 60s on the claude command shape). Spawn and
+// `initialize` have no bound at all, which is where production runs measured
+// 219.7s-1005.5s of dead air before the bounded phase even started.
+describe("ACPX handshake watchdog", () => {
+  // A handshake that never settles: the shape of a child that neither spawns
+  // nor errors, and of an `initialize` that is never answered.
+  function buildStalledHandshakeRuntime(input: {
+    onClose?: (reason: string, discardPersistentState: boolean | undefined) => void;
+    // Let the abandoned handshake land after the watchdog has already fired.
+    landAfterAbandon?: boolean;
+    // A `close` that never settles — the shape of an agent sick enough that the
+    // handshake stalled in the first place.
+    closeNeverSettles?: boolean;
+  }) {
+    let land: ((value: unknown) => void) | null = null;
+    const runtime = {
+      ensureSession: () =>
+        new Promise((resolve) => {
+          land = resolve;
+        }),
+      startTurn: () => {
+        throw new Error("the turn must never be reached");
+      },
+      close: (closeInput: { reason: string; discardPersistentState?: boolean }) => {
+        input.onClose?.(closeInput.reason, closeInput.discardPersistentState);
+        return input.closeNeverSettles ? new Promise<void>(() => {}) : Promise.resolve();
+      },
+    } as never;
+    return {
+      runtime,
+      landHandshake: () =>
+        land?.({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+    };
+  }
+
+  async function runStalledHandshake(
+    options: {
+      handshakeTimeoutMs?: number;
+      outputInactivityTimeoutMs?: number | null;
+      resumeSessionId?: string;
+      mode?: "persistent" | "oneshot";
+      onClose?: (reason: string, discardPersistentState: boolean | undefined) => void;
+      closeNeverSettles?: boolean;
+    } = {},
+  ) {
+    const root = await makeTempRoot();
+    const logs: Array<{ stream: string; text: string }> = [];
+    const built = buildStalledHandshakeRuntime({
+      onClose: options.onClose,
+      closeNeverSettles: options.closeNeverSettles,
+    });
+    const execute = createAcpxEngineExecutor({
+      handshakeTimeoutMs: options.handshakeTimeoutMs ?? 25,
+      createRuntime: () => built.runtime,
+    });
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        ...(options.mode ? { mode: options.mode } : {}),
+        ...(options.outputInactivityTimeoutMs !== undefined
+          ? { outputInactivityTimeoutMs: options.outputInactivityTimeoutMs }
+          : {}),
+      },
+      context: {},
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+    return { result, logs, landHandshake: built.landHandshake };
+  }
+
+  it("bounds a handshake that never completes", async () => {
+    const startedAt = Date.now();
+    const { result } = await runStalledHandshake();
+
+    expect(result.exitCode).toBe(1);
+    // NOT the generic `acpx_session_init_failed` phase bucket: the server maps
+    // this code to the transient retry ladder on the code alone. Retrying is
+    // free here in a way it never is mid-turn — no work had started yet.
+    expect(result.errorCode).toBe("acpx_handshake_timeout");
+    expect(result.errorMessage).toBe(
+      "watchdog: the ACP session handshake produced nothing for 0m 0s; " +
+        "the run was abandoned before any work started.",
+    );
+    // The wall-clock timeout did not fire; `timedOut` must stay honest.
+    expect(result.timedOut).toBe(false);
+    // Without the bound this run would have sat here until acpx's own
+    // `session/new` timer, which this stall never reaches at all.
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+  });
+
+  it("states the handshake bound in the run log before anything goes wrong", async () => {
+    const { logs } = await runStalledHandshake();
+    expect(logs.map((entry) => entry.text).join("")).toContain("ACP handshake watchdog:");
+  });
+
+  // `ensureSession` takes no signal, so the abandoned attempt keeps running. A
+  // late success must be closed or the run leaks a live child and a persisted
+  // session record into a server process that outlives it.
+  it("closes a handshake that lands after it gave up", async () => {
+    const closes: Array<{ reason: string; discard: boolean | undefined }> = [];
+    const { result, landHandshake } = await runStalledHandshake({
+      onClose: (reason, discard) => closes.push({ reason, discard }),
+    });
+    expect(result.errorCode).toBe("acpx_handshake_timeout");
+
+    expect(closes).toEqual([]);
+    landHandshake();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(closes).toEqual([
+      { reason: "paperclip handshake watchdog", discard: true },
+    ]);
+  });
+
+  // The other side of that close: on `oneshot`, acpx has already closed the
+  // client in its own `finally`, so there is nothing left to leak — and a
+  // `close` here would spawn a *fresh* agent child purely to address a session
+  // whose process is gone. The persistent leg below is an inline positive
+  // control: without it, a test asserting "no close happened" would also pass
+  // if the late-settle hook stopped being wired up at all.
+  it("does not close a late handshake on oneshot, where there is nothing left to leak", async () => {
+    const oneshotCloses: string[] = [];
+    const oneshot = await runStalledHandshake({
+      mode: "oneshot",
+      onClose: (reason) => oneshotCloses.push(reason),
+    });
+    expect(oneshot.result.errorCode).toBe("acpx_handshake_timeout");
+    oneshot.landHandshake();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(oneshotCloses).toEqual([]);
+
+    const persistentCloses: string[] = [];
+    const persistent = await runStalledHandshake({
+      mode: "persistent",
+      onClose: (reason) => persistentCloses.push(reason),
+    });
+    expect(persistent.result.errorCode).toBe("acpx_handshake_timeout");
+    persistent.landHandshake();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(persistentCloses).toEqual(["paperclip handshake watchdog"]);
+  });
+
+  // That close is itself bounded. `AcpRuntimeOptions.timeoutMs` is `undefined`
+  // on local/SSH targets — the exact lane this watchdog exists for — and acpx's
+  // `withTimeout(p, undefined)` is a bare await, so an unbounded close on a sick
+  // agent hangs forever inside a detached promise and never reaches the
+  // `client.close()` that kills the child.
+  //
+  // Fake timers are installed only for the late landing, so `getTimerCount()`
+  // counts nothing but what the close path arms: a bare
+  // `void runtime.close(...)` arms zero timers, and the window is checked at its
+  // exact edge so an unrelated timer could not stand in for it.
+  it("bounds the close of a late handshake instead of awaiting it forever", async () => {
+    const HANDSHAKE_WINDOW_MS = 25;
+    let closeCalls = 0;
+    const { result, landHandshake } = await runStalledHandshake({
+      handshakeTimeoutMs: HANDSHAKE_WINDOW_MS,
+      closeNeverSettles: true,
+      onClose: () => {
+        closeCalls += 1;
+      },
+    });
+    expect(result.errorCode).toBe("acpx_handshake_timeout");
+
+    vi.useFakeTimers();
+    try {
+      landHandshake();
+      // Flush the late-settle microtask without letting the clock move.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(closeCalls).toBe(1);
+      expect(vi.getTimerCount()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(HANDSHAKE_WINDOW_MS - 1);
+      expect(vi.getTimerCount()).toBe(1);
+      // The window expires and the still-pending close is abandoned.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The saved session id is dropped alongside that close: the record it names
+  // was discarded, so leaving it set would point the next run at nothing.
+  it("clears the saved session so the next run starts clean", async () => {
+    const { result } = await runStalledHandshake();
+    expect(result.clearSession).toBe(true);
+  });
+
+  // Runs a resume against a session an earlier, healthy run really established.
+  //
+  // Getting the resume branch genuinely live matters and is easy to fake by
+  // accident: `isCompatibleSession` rejects on its first check unless
+  // `sessionParams` carries a real `configFingerprint`, so a hand-written
+  // `{acpSessionId: ...}` leaves `canResume` false and the retry path
+  // unreachable — a test would then pass without ever touching what it claims
+  // to cover. Hence the first run here is a real one, and every caller asserts
+  // on the `resumeSessionId` the second run was handed, which is what proves
+  // the branch was reachable at all.
+  async function resumePreviousSessionWith(runtimeFactory: () => never) {
+    const root = await makeTempRoot();
+    const config = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+    };
+    const runOnce = async (
+      factory: () => never,
+      sessionParams?: Record<string, unknown>,
+    ) => {
+      const execute = createAcpxEngineExecutor({
+        handshakeTimeoutMs: 25,
+        createRuntime: factory,
+      });
+      return (await execute({
+        runId: "run-1",
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: sessionParams ? { sessionParams } : {},
+        config,
+        context: {},
+        onLog: async () => {},
+        onMeta: async () => {},
+      } as never)) as { errorCode?: string; sessionParams?: Record<string, unknown> };
+    };
+
+    // First run establishes a real, resumable session.
+    const established = await runOnce(
+      () =>
+        ({
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async () => {},
+        }) as never,
+    );
+    expect(established.sessionParams?.configFingerprint).toBeTypeOf("string");
+
+    // Second run resumes it with the caller's runtime.
+    return await runOnce(runtimeFactory, established.sessionParams);
+  }
+
+  // The resume-retry path re-runs the whole handshake on a fresh session. Doing
+  // that after a watchdog kill would spend the window twice, which is the exact
+  // cost the watchdog exists to remove.
+  it("does not retry a stalled handshake as if it were a resume failure", async () => {
+    const ensureSessionInputs: Array<{ resumeSessionId?: string }> = [];
+    const stalled = await resumePreviousSessionWith(
+      () =>
+        ({
+          ensureSession: (input: { resumeSessionId?: string }) => {
+            ensureSessionInputs.push(input);
+            return new Promise(() => {});
+          },
+          startTurn: () => {
+            throw new Error("the turn must never be reached");
+          },
+          close: async () => {},
+        }) as never,
+    );
+
+    expect(stalled.errorCode).toBe("acpx_handshake_timeout");
+    // The branch really was live: a resume was attempted...
+    expect(ensureSessionInputs[0]?.resumeSessionId).toBe("backend-session");
+    // ...and the watchdog kill did not turn into a second full window.
+    expect(ensureSessionInputs).toHaveLength(1);
+  });
+
+  // That skip is keyed on the error *class*, and today the distinction is
+  // invisible: `isResumeFailure` matches /resume|load|not found|no session|
+  // unknown session|conversation/i, and the watchdog's own wording ("the ACP
+  // session handshake produced nothing for ...") hits none of those, so the
+  // class check can be deleted with every test above still green. It exists for
+  // the day the wording changes, so that is the case under test — a watchdog
+  // error, same class through the same catch, carrying a message
+  // `isResumeFailure` does match. Message-keyed code retries and spends the
+  // window twice; class-keyed code attempts the handshake exactly once.
+  it("keeps the resume skip on the watchdog error class, not on its wording", async () => {
+    const ensureSessionInputs: Array<{ resumeSessionId?: string }> = [];
+    const restated = new AcpxHandshakeTimeoutError(25);
+    restated.message = "resume failed: unknown session for this conversation";
+    // The premise: on message alone this error is indistinguishable from the
+    // resume failure the retry path is built for.
+    expect(/resume|load|not found|no session|unknown session|conversation/i.test(restated.message))
+      .toBe(true);
+
+    const stalled = await resumePreviousSessionWith(
+      () =>
+        ({
+          ensureSession: (input: { resumeSessionId?: string }) => {
+            ensureSessionInputs.push(input);
+            return Promise.reject(restated);
+          },
+          startTurn: () => {
+            throw new Error("the turn must never be reached");
+          },
+          close: async () => {},
+        }) as never,
+    );
+
+    expect(ensureSessionInputs[0]?.resumeSessionId).toBe("backend-session");
+    expect(ensureSessionInputs).toHaveLength(1);
+    // Classification is keyed on the class for the same reason, so a
+    // resume-shaped message must not turn the code into a phase bucket either.
+    expect(stalled.errorCode).toBe("acpx_handshake_timeout");
+  });
+
+  // One escape hatch, not three: the knob that disables the event-inactivity
+  // watchdog disables this one too, and a run that opts out gets the old
+  // unbounded behaviour back rather than a second, hidden bound.
+  it("is disabled by the same knob that disables the event-inactivity watchdog", async () => {
+    const root = await makeTempRoot();
+    const logs: Array<string> = [];
+    let settled = false;
+    const execute = createAcpxEngineExecutor({
+      handshakeTimeoutMs: 25,
+      createRuntime: () =>
+        ({
+          ensureSession: () => new Promise(() => {}),
+          startTurn: () => {
+            throw new Error("the turn must never be reached");
+          },
+          close: async () => {},
+        }) as never,
+    });
+    const pending = execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        outputInactivityTimeoutMs: null,
+      },
+      context: {},
+      onLog: async (_stream: "stdout" | "stderr", text: string) => {
+        logs.push(text);
+      },
+      onMeta: async () => {},
+    } as never).then(() => {
+      settled = true;
+    });
+
+    // Many times the 25ms window: with the watchdog off nothing ends the run.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(settled).toBe(false);
+    expect(logs.join("")).toContain("ACP handshake watchdog: DISABLED");
+    void pending;
   });
 });

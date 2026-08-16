@@ -262,6 +262,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { ACPX_EVENT_INACTIVITY_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/event-inactivity";
+import { ACPX_HANDSHAKE_TIMEOUT_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/handshake-timeout";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -536,7 +537,14 @@ export function readHeartbeatRunErrorFamily(
     // Retrying is right either way: a genuine upstream stall clears on the
     // ladder, and a false positive on a legitimately slow turn is re-attempted
     // instead of escalating the issue to `blocked` on one strike.
-    run.errorCode === ACPX_EVENT_INACTIVITY_ERROR_CODE
+    run.errorCode === ACPX_EVENT_INACTIVITY_ERROR_CODE ||
+    // Same reasoning for the handshake watchdog, and the same code was already
+    // reaching `transient_upstream` before it existed: the stalls it now cuts
+    // used to run on to the ACP runtime's own `session/new` timeout, whose
+    // message `isAcpxConnectivityFailure` matches. Leaving it out would make
+    // bounding the stall *lose* the outage signal that the unbounded version
+    // produced 17 minutes later.
+    run.errorCode === ACPX_HANDSHAKE_TIMEOUT_ERROR_CODE
   ) {
     return "transient_upstream";
   }

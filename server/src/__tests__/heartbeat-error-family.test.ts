@@ -67,6 +67,34 @@ describe("readHeartbeatRunErrorFamily", () => {
     ).toBe("transient_upstream");
   });
 
+  // Bounding the handshake must not cost the outage signal it replaces. Before
+  // the watchdog these stalls ran on to acpx's own `session/new` timeout, whose
+  // message `isAcpxConnectivityFailure` matches — so the unbounded version
+  // reached `transient_upstream` 17 minutes later. Cut at 3 minutes, the run
+  // now carries the watchdog's own message, which that gate would never match.
+  it("classifies the acpx handshake watchdog as transient upstream without a message gate", () => {
+    expect(readHeartbeatRunErrorFamily(failedRun({ errorCode: "acpx_handshake_timeout" }))).toBe(
+      "transient_upstream",
+    );
+    expect(
+      readHeartbeatRunErrorFamily(
+        failedRun({
+          errorCode: "acpx_handshake_timeout",
+          error:
+            "watchdog: the ACP session handshake produced nothing for 3m 0s; " +
+            "the run was abandoned before any work started.",
+        }),
+      ),
+    ).toBe("transient_upstream");
+    // The shape it replaces, still classified the old way when acpx gets there
+    // first (a stall inside the bounded `session/new` phase).
+    expect(
+      readHeartbeatRunErrorFamily(
+        failedRun({ errorCode: "acpx_session_init_failed", error: SESSION_INIT_TIMEOUT_ERROR }),
+      ),
+    ).toBe("transient_upstream");
+  });
+
   it("still prefers a family the adapter persisted on the run", () => {
     expect(
       readHeartbeatRunErrorFamily(
