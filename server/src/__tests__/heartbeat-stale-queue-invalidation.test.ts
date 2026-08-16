@@ -1005,6 +1005,231 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(promotedRun?.agentId).toBe(peerAgentId);
   });
 
+  // ENGA-2914: wakes stacked while a run holds the issue execution lock stay in
+  // `deferred_issue_execution` until that run is released. If the run closes the
+  // issue on its way out, the leftovers must not turn into fresh execution on
+  // work that is already terminal.
+  async function seedTerminalIssueWithDeferredWake(input: {
+    terminalStatus: "done" | "cancelled";
+    // "run_finalize" reproduces the observed shape: the holder run closes the
+    // issue itself and then finalizes. "stale_cancel" covers the holder being
+    // cancelled while the issue is already terminal.
+    closedBy: "run_finalize" | "stale_cancel";
+    deferredContextExtras?: Record<string, unknown>;
+    requestedByActorType?: "user" | "agent" | "system";
+  }) {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const holderWakeupId = randomUUID();
+    const holderRunId = randomUUID();
+    const deferredWakeupId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values({
+      id: holderWakeupId,
+      companyId,
+      agentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "manual",
+      payload: { issueId },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "queued",
+      wakeupRequestId: holderWakeupId,
+      contextSnapshot: { issueId },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Closed while a wake was still deferred",
+      status: input.closedBy === "stale_cancel" ? input.terminalStatus : "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: holderRunId,
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: holderRunId })
+      .where(eq(agentWakeupRequests.id, holderWakeupId));
+    if (input.closedBy === "run_finalize") {
+      // The holder agent closes its own issue mid-run, so the deferred wake is
+      // only reached by the release-and-promote step that follows finalization.
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        await db
+          .update(issues)
+          .set({ status: input.terminalStatus })
+          .where(eq(issues.id, issueId));
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Holder run closed the issue.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    }
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeupId,
+      companyId,
+      agentId,
+      source: "comment",
+      triggerDetail: "mention",
+      reason: "issue_execution_deferred",
+      requestedByActorType: input.requestedByActorType ?? "agent",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          wakeReason: "issue_mention",
+          ...(input.deferredContextExtras ?? {}),
+        },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    return { companyId, agentId, issueId, holderRunId, deferredWakeupId };
+  }
+
+  async function readDeferredWakeOutcome(deferredWakeupId: string) {
+    const wake = await db
+      .select({
+        status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeupId))
+      .then((rows) => rows[0] ?? null);
+    const promotedRun = wake?.runId
+      ? await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, wake.runId))
+        .then((rows) => rows[0] ?? null)
+      : null;
+    return { wake, promotedRun };
+  }
+
+  async function expectDeferredWakeDiscarded(input: { deferredWakeupId: string; issueId: string; holderRunId: string }) {
+    await waitForCondition(async () => {
+      const { wake, promotedRun } = await readDeferredWakeOutcome(input.deferredWakeupId);
+      if (!wake) return false;
+      if (wake.status === "deferred_issue_execution" || wake.status === "queued") return false;
+      return !promotedRun || promotedRun.status === "cancelled";
+    }, 8_000);
+
+    const { wake, promotedRun } = await readDeferredWakeOutcome(input.deferredWakeupId);
+    const issue = await db
+      .select({ status: issues.status, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .then((rows) => rows[0] ?? null);
+    const executedRunIds = new Set(
+      mockAdapterExecute.mock.calls
+        .map(([context]) => context?.runId as string | undefined)
+        .filter((runId): runId is string => Boolean(runId)),
+    );
+
+    // The wake is consumed, not left pending, and it never becomes execution.
+    expect(wake?.status).not.toBe("deferred_issue_execution");
+    expect(wake?.status).not.toBe("queued");
+    expect(promotedRun?.status ?? "cancelled").toBe("cancelled");
+    // A terminal issue must not be revived, nor left holding an execution lock.
+    expect(issue?.status).toBe("done");
+    expect(issue?.executionRunId).toBeNull();
+    expect([...executedRunIds]).toEqual([input.holderRunId].filter((id) => executedRunIds.has(id)));
+    if (promotedRun) expect(executedRunIds.has(promotedRun.id)).toBe(false);
+  }
+
+  for (const closedBy of ["run_finalize", "stale_cancel"] as const) {
+    it(`discards a deferred issue wake when the issue reached a terminal status (${closedBy})`, async () => {
+      const fixture = await seedTerminalIssueWithDeferredWake({
+        terminalStatus: "done",
+        closedBy,
+      });
+
+      await heartbeat.resumeQueuedRuns();
+
+      await expectDeferredWakeDiscarded(fixture);
+    }, 20_000);
+
+    it(`discards an agent comment deferred wake when the issue reached a terminal status (${closedBy})`, async () => {
+      const commentId = randomUUID();
+      const fixture = await seedTerminalIssueWithDeferredWake({
+        terminalStatus: "done",
+        closedBy,
+        deferredContextExtras: { wakeCommentIds: [commentId] },
+        requestedByActorType: "agent",
+      });
+      await db.insert(issueComments).values({
+        id: commentId,
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorAgentId: fixture.agentId,
+        authorType: "agent",
+        body: "Peer follow-up posted while the holder run was still live.",
+      });
+
+      await heartbeat.resumeQueuedRuns();
+
+      // An agent comment must not revive closed work: `resume: true` is the
+      // documented way to restart follow-up work on a completed issue.
+      await expectDeferredWakeDiscarded(fixture);
+    }, 20_000);
+  }
+
+  it("still reopens and runs a user comment deferred wake on a terminal issue", async () => {
+    const commentId = randomUUID();
+    const { companyId, issueId, deferredWakeupId } = await seedTerminalIssueWithDeferredWake({
+      terminalStatus: "done",
+      closedBy: "run_finalize",
+      deferredContextExtras: { wakeCommentIds: [commentId] },
+      requestedByActorType: "user",
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "human-reviewer",
+      authorType: "user",
+      body: "Reopening: this is not actually finished.",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const { wake } = await readDeferredWakeOutcome(deferredWakeupId);
+      return Boolean(wake?.runId) && wake?.status !== "deferred_issue_execution";
+    }, 8_000);
+    await waitForCondition(async () => {
+      const { promotedRun } = await readDeferredWakeOutcome(deferredWakeupId);
+      if (!promotedRun) return false;
+      return mockAdapterExecute.mock.calls.some(([context]) => context?.runId === promotedRun.id);
+    }, 8_000);
+
+    const { wake, promotedRun } = await readDeferredWakeOutcome(deferredWakeupId);
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(wake?.runId).toBeTruthy();
+    // Reopened to `todo`, then moved to `in_progress` by the promoted run's own
+    // checkout — either way the issue must no longer be terminal.
+    expect(["todo", "in_progress"]).toContain(issue?.status);
+    expect(promotedRun?.status).not.toBe("cancelled");
+    expect(promotedRun && mockAdapterExecute.mock.calls.some(([context]) => context?.runId === promotedRun.id)).toBe(true);
+  }, 20_000);
+
   it("cancels queued runs when the issue assignee changes before the run starts", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OriginalCoder" });
     const replacementAgentId = randomUUID();

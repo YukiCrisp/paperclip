@@ -11413,6 +11413,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload: staleness.details,
     });
 
+    // Cancelling the holder frees the issue, so the wakes that were parked
+    // behind it have to be resolved here too — the same way the daily-cap gate
+    // does it. Without this they sit in `deferred_issue_execution` with no run
+    // and no finish time, because nothing else will ever release this issue.
+    // Terminal issues discard their leftovers inside the promotion loop.
+    await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
+
     return cancelled;
   }
 
@@ -15412,6 +15419,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             };
           }
+        }
+
+        // A wake stacked while this run held the execution lock must not turn
+        // into execution on work the run closed on its way out. The reopen
+        // branch above already moved every legitimate revival off the terminal
+        // status, so anything still terminal here is a leftover: promoting it
+        // would run an agent against a done/cancelled issue and re-arm the
+        // execution predicates that amplified the 2026-08-05 blackout.
+        // `resume: true` / `followUpRequested` stays exempt — that is the
+        // documented way to restart follow-up work on a completed issue.
+        const deferredResumeIntent =
+          deferredContextSeed.resumeIntent === true || deferredContextSeed.followUpRequested === true;
+        if (
+          (issue.status === "done" || issue.status === "cancelled") &&
+          !deferredResumeIntent &&
+          !allowsIssueInteractionWake(deferredContextSeed)
+        ) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: `Deferred wake discarded because issue reached terminal status (${issue.status})`,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
         }
 
         const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
