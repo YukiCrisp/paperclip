@@ -39,6 +39,12 @@ type ForkInvariant = {
   markers: string[];
   /** Optional: marker -> minimum occurrence count (catches "defined but unwired"). */
   minOccurrences?: Record<string, number>;
+  /**
+   * Optional: marker -> maximum occurrence count. A floor alone cannot see a
+   * merge that removes one wired call and adds another elsewhere — the count
+   * stays put. Capping the symbol that a removed call reverts *to* closes that.
+   */
+  maxOccurrences?: Record<string, number>;
 };
 
 const FORK_INVARIANTS: ForkInvariant[] = [
@@ -51,6 +57,15 @@ const FORK_INVARIANTS: ForkInvariant[] = [
     // A merge that keeps the helper but re-points a persist site back at the
     // clean cron tick silently un-splays that path, so count the call sites.
     minOccurrences: { "nextScheduledRunAt(": 8 },
+    // The floor above counts the splayed helper; on its own it cannot see a
+    // merge that un-splays one persist site *and* adds a call somewhere else,
+    // because 8 stays 8. So also cap the un-splayed clean tick it reverts to.
+    // At HEAD every `nextCronTickInTimeZone(` is helper-internal — 1 definition,
+    // 2 inside the pure `isSubHourlyCronExpression()` predicate, 2 inside
+    // `nextScheduledRunAt()` itself — i.e. zero persist sites call it directly.
+    // A 6th occurrence means someone put the clean tick back on a live path.
+    // (If the predicate legitimately grows a call, raise this deliberately.)
+    maxOccurrences: { "nextCronTickInTimeZone(": 5 },
   },
   {
     issue: "ENGA-2152",
@@ -111,6 +126,17 @@ describe("fork-local invariants survive upstream merges (ENGA-3057)", () => {
           `${invariant.issue} looks partially unwired in ${invariant.file}: ` +
             `"${marker}" appears ${found}x, expected at least ${min}x.`,
         ).toBeGreaterThanOrEqual(min);
+      }
+      for (const [marker, max] of Object.entries(invariant.maxOccurrences ?? {})) {
+        const found = occurrences(source, marker);
+        expect(
+          found,
+          `${invariant.issue} looks partially reverted in ${invariant.file}: ` +
+            `"${marker}" appears ${found}x, expected at most ${max}x. An upstream ` +
+            `merge most likely re-pointed a live call site back at the pre-fork ` +
+            `symbol — restore the fork-local one, or raise this ceiling on purpose ` +
+            `if the new call is unrelated to the fix this entry guards.`,
+        ).toBeLessThanOrEqual(max);
       }
     });
   }
