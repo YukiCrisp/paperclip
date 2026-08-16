@@ -34,8 +34,25 @@ import {
 import { issueService } from "../services/issues.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
-import { routineService } from "../services/routines.ts";
+import { nextCronTickInTimeZone, routineService } from "../services/routines.ts";
 import { secretService } from "../services/secrets.ts";
+
+// A trigger's persisted nextRunAt is the clean cron tick plus that trigger's
+// deterministic splay (ENGA-2157), so it is not an exact instant. Assert the
+// slot instead: at or after the expected tick, and strictly before the next
+// one. The splay arithmetic itself is covered by routine-trigger-splay.test.ts.
+function expectScheduledInSlot(
+  actual: Date | null | undefined,
+  expectedTickIso: string,
+  cronExpression: string,
+  timeZone: string,
+) {
+  const tick = new Date(expectedTickIso);
+  const followingTick = nextCronTickInTimeZone(cronExpression, timeZone, tick)!;
+  expect(actual).toBeInstanceOf(Date);
+  expect(actual!.getTime()).toBeGreaterThanOrEqual(tick.getTime());
+  expect(actual!.getTime()).toBeLessThan(followingTick.getTime());
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -2256,7 +2273,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("issue_created");
     const updatedTrigger = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
-    expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-07-16T01:10:00.000Z"));
+    expectScheduledInSlot(updatedTrigger?.nextRunAt, "2026-07-16T01:10:00.000Z", "*/10 * * * *", "UTC");
   });
 
   it("continues replaying each missed hourly tick", async () => {
@@ -2280,7 +2297,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs.filter((run) => run.status === "issue_created")).toHaveLength(1);
     expect(runs.filter((run) => run.status === "coalesced")).toHaveLength(2);
     const updatedTrigger = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
-    expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-07-16T03:00:00.000Z"));
+    expectScheduledInSlot(updatedTrigger?.nextRunAt, "2026-07-16T03:00:00.000Z", "0 * * * *", "UTC");
   });
 
   it("continues replaying missed ticks for daily schedules with multiple minute values", async () => {
@@ -2304,7 +2321,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs.filter((run) => run.status === "issue_created")).toHaveLength(1);
     expect(runs.filter((run) => run.status === "coalesced")).toHaveLength(3);
     const updatedTrigger = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
-    expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-07-16T09:00:00.000Z"));
+    expectScheduledInSlot(updatedTrigger?.nextRunAt, "2026-07-16T09:00:00.000Z", "0,30 9 * * *", "UTC");
   });
 
   it("coalesces sub-hourly schedules restricted to weekdays", async () => {
@@ -2327,7 +2344,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("issue_created");
     const updatedTrigger = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
-    expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-07-13T01:10:00.000Z"));
+    expectScheduledInSlot(updatedTrigger?.nextRunAt, "2026-07-13T01:10:00.000Z", "*/10 * * * 1-5", "UTC");
   });
 
   it("applies the armed cutoff to webhook dispatch but not manual API runs", async () => {
