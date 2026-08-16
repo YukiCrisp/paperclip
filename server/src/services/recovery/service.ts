@@ -26,6 +26,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { ACPX_EVENT_INACTIVITY_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/event-inactivity";
+import { ACPX_HANDSHAKE_TIMEOUT_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/handshake-timeout";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -340,6 +341,12 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   // construction: the watchdog is what makes an unbounded hang finite, and a
   // bounded retry is the only useful thing to do with the run it ended.
   ACPX_EVENT_INACTIVITY_ERROR_CODE,
+  // The acpx handshake watchdog cut a session that never came up. Retryable for
+  // a stronger reason than the watchdog above: the turn had not started, so a
+  // retry loses no work at all. Sharing the transient policy with the codes
+  // around it is also what keeps a host-side outage counting as one episode
+  // instead of a string of unrelated single strikes.
+  ACPX_HANDSHAKE_TIMEOUT_ERROR_CODE,
   "provider_quota",
   "timeout",
 ]);

@@ -3138,3 +3138,209 @@ describe("ACPX event-inactivity watchdog", () => {
     expect(result.errorCode ?? null).toBe(null);
   });
 });
+
+// The handshake that has to succeed before any turn is only bounded by acpx for
+// its last phase (`session/new`, 60s on the claude command shape). Spawn and
+// `initialize` have no bound at all, which is where production runs measured
+// 219.7s-1005.5s of dead air before the bounded phase even started.
+describe("ACPX handshake watchdog", () => {
+  // A handshake that never settles: the shape of a child that neither spawns
+  // nor errors, and of an `initialize` that is never answered.
+  function buildStalledHandshakeRuntime(input: {
+    onClose?: (reason: string, discardPersistentState: boolean | undefined) => void;
+    // Let the abandoned handshake land after the watchdog has already fired.
+    landAfterAbandon?: boolean;
+  }) {
+    let land: ((value: unknown) => void) | null = null;
+    const runtime = {
+      ensureSession: () =>
+        new Promise((resolve) => {
+          land = resolve;
+        }),
+      startTurn: () => {
+        throw new Error("the turn must never be reached");
+      },
+      close: async (closeInput: { reason: string; discardPersistentState?: boolean }) => {
+        input.onClose?.(closeInput.reason, closeInput.discardPersistentState);
+      },
+    } as never;
+    return {
+      runtime,
+      landHandshake: () =>
+        land?.({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+    };
+  }
+
+  async function runStalledHandshake(
+    options: {
+      handshakeTimeoutMs?: number;
+      outputInactivityTimeoutMs?: number | null;
+      resumeSessionId?: string;
+      onClose?: (reason: string, discardPersistentState: boolean | undefined) => void;
+    } = {},
+  ) {
+    const root = await makeTempRoot();
+    const logs: Array<{ stream: string; text: string }> = [];
+    const built = buildStalledHandshakeRuntime({ onClose: options.onClose });
+    const execute = createAcpxEngineExecutor({
+      handshakeTimeoutMs: options.handshakeTimeoutMs ?? 25,
+      createRuntime: () => built.runtime,
+    });
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        ...(options.outputInactivityTimeoutMs !== undefined
+          ? { outputInactivityTimeoutMs: options.outputInactivityTimeoutMs }
+          : {}),
+      },
+      context: {},
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+    return { result, logs, landHandshake: built.landHandshake };
+  }
+
+  it("bounds a handshake that never completes", async () => {
+    const startedAt = Date.now();
+    const { result } = await runStalledHandshake();
+
+    expect(result.exitCode).toBe(1);
+    // NOT the generic `acpx_session_init_failed` phase bucket: the server maps
+    // this code to the transient retry ladder on the code alone. Retrying is
+    // free here in a way it never is mid-turn — no work had started yet.
+    expect(result.errorCode).toBe("acpx_handshake_timeout");
+    expect(result.errorMessage).toBe(
+      "watchdog: the ACP session handshake produced nothing for 0m 0s; " +
+        "the run was abandoned before any work started.",
+    );
+    // The wall-clock timeout did not fire; `timedOut` must stay honest.
+    expect(result.timedOut).toBe(false);
+    // Without the bound this run would have sat here until acpx's own
+    // `session/new` timer, which this stall never reaches at all.
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+  });
+
+  it("states the handshake bound in the run log before anything goes wrong", async () => {
+    const { logs } = await runStalledHandshake();
+    expect(logs.map((entry) => entry.text).join("")).toContain("ACP handshake watchdog:");
+  });
+
+  // `ensureSession` takes no signal, so the abandoned attempt keeps running. A
+  // late success must be closed or the run leaks a live child and a persisted
+  // session record into a server process that outlives it.
+  it("closes a handshake that lands after it gave up", async () => {
+    const closes: Array<{ reason: string; discard: boolean | undefined }> = [];
+    const { result, landHandshake } = await runStalledHandshake({
+      onClose: (reason, discard) => closes.push({ reason, discard }),
+    });
+    expect(result.errorCode).toBe("acpx_handshake_timeout");
+
+    expect(closes).toEqual([]);
+    landHandshake();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(closes).toEqual([
+      { reason: "paperclip handshake watchdog", discard: true },
+    ]);
+  });
+
+  // The saved session id is dropped alongside that close: the record it names
+  // was discarded, so leaving it set would point the next run at nothing.
+  it("clears the saved session so the next run starts clean", async () => {
+    const { result } = await runStalledHandshake();
+    expect(result.clearSession).toBe(true);
+  });
+
+  // The resume-retry path re-runs the whole handshake on a fresh session. Doing
+  // that after a watchdog kill would spend the window twice, which is the exact
+  // cost the watchdog exists to remove.
+  it("does not retry a stalled handshake as if it were a resume failure", async () => {
+    let ensureSessionCalls = 0;
+    const root = await makeTempRoot();
+    const execute = createAcpxEngineExecutor({
+      handshakeTimeoutMs: 25,
+      createRuntime: () =>
+        ({
+          ensureSession: () => {
+            ensureSessionCalls += 1;
+            return new Promise(() => {});
+          },
+          startTurn: () => {
+            throw new Error("the turn must never be reached");
+          },
+          close: async () => {},
+        }) as never,
+    });
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      // A resumable prior session, so the resume-retry branch is live.
+      runtime: { sessionParams: { acpSessionId: "prior-session" } },
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("acpx_handshake_timeout");
+    expect(ensureSessionCalls).toBe(1);
+  });
+
+  // One escape hatch, not three: the knob that disables the event-inactivity
+  // watchdog disables this one too, and a run that opts out gets the old
+  // unbounded behaviour back rather than a second, hidden bound.
+  it("is disabled by the same knob that disables the event-inactivity watchdog", async () => {
+    const root = await makeTempRoot();
+    const logs: Array<string> = [];
+    let settled = false;
+    const execute = createAcpxEngineExecutor({
+      handshakeTimeoutMs: 25,
+      createRuntime: () =>
+        ({
+          ensureSession: () => new Promise(() => {}),
+          startTurn: () => {
+            throw new Error("the turn must never be reached");
+          },
+          close: async () => {},
+        }) as never,
+    });
+    const pending = execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        outputInactivityTimeoutMs: null,
+      },
+      context: {},
+      onLog: async (_stream: "stdout" | "stderr", text: string) => {
+        logs.push(text);
+      },
+      onMeta: async () => {},
+    } as never).then(() => {
+      settled = true;
+    });
+
+    // Many times the 25ms window: with the watchdog off nothing ends the run.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(settled).toBe(false);
+    expect(logs.join("")).toContain("ACP handshake watchdog: DISABLED");
+    void pending;
+  });
+});

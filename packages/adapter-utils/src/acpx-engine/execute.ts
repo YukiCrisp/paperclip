@@ -93,6 +93,13 @@ import {
   resolveAcpxEventInactivityTimeout,
   type AcpxEventInactivityResolution,
 } from "./event-inactivity.js";
+import {
+  ACPX_HANDSHAKE_TIMEOUT_ERROR_CODE,
+  acpxHandshakeTimeoutMs,
+  formatAcpxHandshakeTimeoutStartLogLine,
+  isAcpxHandshakeTimeoutError,
+  withAcpxHandshakeTimeout,
+} from "./handshake-timeout.js";
 import { measureStartupStep } from "./startup-timing.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -299,6 +306,13 @@ export interface AcpxEngineExecutorOptions {
    * pair is 10 minutes vs 45.
    */
   firstEventTimeoutMs?: number;
+  /**
+   * Override for the handshake watchdog window
+   * (`DEFAULT_ACPX_HANDSHAKE_TIMEOUT_MS`). Not an operator knob either, and
+   * capped/disabled by the same `adapterConfig.outputInactivityTimeoutMs`. It
+   * exists so a test can drive the watchdog without waiting 3 real minutes.
+   */
+  handshakeTimeoutMs?: number;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -2287,6 +2301,15 @@ function classifyError(
     ...(stackPreview ? { stackPreview } : {}),
     ...(phase ? { phase } : {}),
   };
+  // Before every message-shaped rule below: the handshake watchdog is
+  // Paperclip-authored and identified by class, so it must never be re-read as
+  // whatever its wording happens to look like.
+  if (isAcpxHandshakeTimeoutError(err)) {
+    return {
+      errorCode: ACPX_HANDSHAKE_TIMEOUT_ERROR_CODE,
+      errorMeta: { category: "watchdog", ...baseMeta },
+    };
+  }
   const lower = message.toLowerCase();
   const authLike = lower.includes("auth") || lower.includes("login") || lower.includes("credential");
   if (authLike) {
@@ -2626,6 +2649,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       "stderr",
       `[paperclip] ${formatAcpxEventInactivityStartLogLine(prepared.eventInactivity, deps.firstEventTimeoutMs)}\n`,
     );
+    // Both lines above only describe the turn. The handshake that has to happen
+    // first has its own bound and its own failure shape, so it gets its own line.
+    const handshakeTimeoutMs = acpxHandshakeTimeoutMs(
+      acpxEventInactivityTimeoutMs(prepared.eventInactivity),
+      deps.handshakeTimeoutMs,
+    );
+    await ctx.onLog(
+      "stderr",
+      `[paperclip] ${formatAcpxHandshakeTimeoutStartLogLine(handshakeTimeoutMs)}\n`,
+    );
     await cleanupIdleHandles({ handles: warmHandles, now: now(), idleMs: warmIdleMs });
 
     const previousParams = parseObject(ctx.runtime.sessionParams);
@@ -2670,23 +2703,49 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     let resumedSession = Boolean(handle ?? resumeSessionId);
     let clearSession = false;
 
+    // `ensureSession` takes no signal, so a watchdog kill leaves the attempt
+    // running inside acpx. If it lands after we have given up, close it —
+    // otherwise a stalled run leaks a live child and a persisted session record
+    // into a server process that outlives the run.
+    const closeLateHandshake = (late: AcpRuntimeHandle) => {
+      void runtime
+        .close({
+          handle: late,
+          reason: "paperclip handshake watchdog",
+          discardPersistentState: true,
+        })
+        .catch(() => {});
+    };
+    const ensureSessionBounded = (input: Parameters<AcpRuntime["ensureSession"]>[0]) =>
+      measureStartupStep(ctx, now, "acp.handshake", () =>
+        withAcpxHandshakeTimeout({
+          timeoutMs: handshakeTimeoutMs,
+          start: () => runtime.ensureSession(input),
+          onLateSettle: closeLateHandshake,
+        }),
+      );
+
     try {
       if (!handle) {
         try {
           // Step 7 — acp.handshake: ACP session establishment (session/new or
           // resume). A throwing handshake still reports its duration before the
           // resume-retry path below runs.
-          handle = await measureStartupStep(ctx, now, "acp.handshake", () =>
-            runtime.ensureSession({
-              sessionKey: prepared.sessionKey,
-              agent: prepared.acpxAgent,
-              mode: prepared.mode,
-              cwd: prepared.cwd,
-              resumeSessionId,
-              sessionOptions: { env: prepared.env },
-            }),
-          );
+          handle = await ensureSessionBounded({
+            sessionKey: prepared.sessionKey,
+            agent: prepared.acpxAgent,
+            mode: prepared.mode,
+            cwd: prepared.cwd,
+            resumeSessionId,
+            sessionOptions: { env: prepared.env },
+          });
         } catch (err) {
+          // A watchdog kill is never a resume failure. Retrying a fresh session
+          // after one would spend the window a second time, which is the exact
+          // cost the watchdog exists to stop — and it is checked by class here
+          // rather than left to `isResumeFailure`'s message match, so the
+          // message stays free to change.
+          if (isAcpxHandshakeTimeoutError(err)) throw err;
           if (!resumeSessionId || !isResumeFailure(err)) throw err;
           clearSession = true;
           resumedSession = false;
@@ -2694,15 +2753,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             "stdout",
             `[paperclip] ACPX resume session "${resumeSessionId}" is unavailable; retrying with a fresh session.\n`,
           );
-          handle = await measureStartupStep(ctx, now, "acp.handshake", () =>
-            runtime.ensureSession({
-              sessionKey: prepared.sessionKey,
-              agent: prepared.acpxAgent,
-              mode: prepared.mode,
-              cwd: prepared.cwd,
-              sessionOptions: { env: prepared.env },
-            }),
-          );
+          handle = await ensureSessionBounded({
+            sessionKey: prepared.sessionKey,
+            agent: prepared.acpxAgent,
+            mode: prepared.mode,
+            cwd: prepared.cwd,
+            sessionOptions: { env: prepared.env },
+          });
         }
       }
     } catch (err) {
@@ -2722,7 +2779,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         ...classified,
         ...billingFields,
         model: prepared.requestedModel || null,
-        clearSession,
+        // A watchdog kill also drops the saved session id. The abandoned
+        // handshake is closed with `discardPersistentState`, so whatever it was
+        // resuming is gone; keeping the id would point the next run at a record
+        // that no longer exists.
+        clearSession: clearSession || isAcpxHandshakeTimeoutError(err),
         resultJson: { phase: "ensure_session" },
         summary: message,
       };
