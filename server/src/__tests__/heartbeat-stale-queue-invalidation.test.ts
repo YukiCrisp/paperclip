@@ -1022,18 +1022,34 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     ...ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     NON_COMMENT_WAKE_REASON,
   ]);
+  // Mention wakes are the one comment reason the routes still emit after the
+  // issue is closed (routes/issues.ts:8830, :10436 have no closed-status guard,
+  // while the assignee `issue_commented` wake right above them does). The gate
+  // mirrors that split, so this list is the keep side and the next one is the
+  // discard side.
+  const TERMINAL_EXEMPT_COMMENT_WAKE_REASONS = ["issue_comment_mentioned"];
   // Derived from the production set, minus the reason that routes into the reopen
-  // branch above the gate. If production grows a fourth comment reason, it joins
-  // the discard cases here automatically instead of quietly going uncovered.
+  // branch above the gate, minus the exempt ones. If production grows a fourth
+  // comment reason, it joins the discard cases here automatically instead of
+  // quietly going uncovered.
   const AGENT_COMMENT_WAKE_REASONS = [...ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS]
     .filter((reason) => reason !== "issue_reopened_via_comment")
+    .filter((reason) => !TERMINAL_EXEMPT_COMMENT_WAKE_REASONS.includes(reason))
     .sort();
 
-  // The `for` loops below turn this list into test cases, so shrinking it removes
+  // The `for` loops below turn these lists into test cases, so shrinking one removes
   // cases silently — the suite reports fewer tests and zero failures, which reads
-  // exactly like "still covered". Pin the contents so a hand-edited list fails loudly.
+  // exactly like "still covered". Pin the contents so a hand-edited list fails loudly,
+  // and pin that the two halves still partition the production comment set: a fourth
+  // reason added upstream has to land in one of them rather than fall out of both.
   it("derives the agent comment discard cases from the production wake reason set", () => {
-    expect(AGENT_COMMENT_WAKE_REASONS).toEqual(["issue_commented", "issue_comment_mentioned"].sort());
+    expect(AGENT_COMMENT_WAKE_REASONS).toEqual(["issue_commented"]);
+    expect(TERMINAL_EXEMPT_COMMENT_WAKE_REASONS).toEqual(["issue_comment_mentioned"]);
+    expect([...AGENT_COMMENT_WAKE_REASONS, ...TERMINAL_EXEMPT_COMMENT_WAKE_REASONS].sort()).toEqual(
+      [...ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS]
+        .filter((reason) => reason !== "issue_reopened_via_comment")
+        .sort(),
+    );
     expect(ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has("issue_reopened_via_comment")).toBe(true);
     expect(PRODUCTION_WAKE_REASONS.has("issue_mention")).toBe(false);
   });
@@ -1275,8 +1291,50 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     }
   }
 
-  // Keep-side coverage. The gate's only remaining escape hatch is the documented
-  // `resume: true` payload, which routes/issues.ts always writes as the pair
+  // Keep-side coverage for the mention exemption. Same fixture as the discard
+  // cases above — agent actor, agent-authored comment, issue closed underneath —
+  // so the only difference between red and green here is the wake reason. Without
+  // this the exemption could be deleted and every test would stay green, which is
+  // how the reported bug survived in the first place.
+  for (const wakeReason of TERMINAL_EXEMPT_COMMENT_WAKE_REASONS) {
+    it(`still promotes an agent ${wakeReason} deferred wake on a terminal issue`, async () => {
+      const commentId = randomUUID();
+      const fixture = await seedTerminalIssueWithDeferredWake({
+        terminalStatus: "done",
+        closedBy: "run_finalize",
+        wakeReason,
+        deferredContextExtras: { wakeCommentIds: [commentId], source: "comment.mention" },
+        requestedByActorType: "agent",
+      });
+      await db.insert(issueComments).values({
+        id: commentId,
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorAgentId: fixture.agentId,
+        authorType: "agent",
+        body: "@Mentioned Agent please pick this up.",
+      });
+
+      await heartbeat.resumeQueuedRuns();
+
+      // A mention posted directly on an already-closed issue wakes the mentioned
+      // agent (the route emits it with no closed-status guard). The deferred copy
+      // has to behave the same way, or the message is delivered or dropped
+      // depending on whether an unrelated run happened to hold the lock.
+      const { promotedRun } = await expectDeferredWakePromoted(fixture.deferredWakeupId);
+      const issue = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId))
+        .then((rows) => rows[0] ?? null);
+      // Delivery only: the mention must not reopen the issue.
+      expect(issue?.status).toBe("done");
+      expect(promotedRun?.status).not.toBe("cancelled");
+    }, 20_000);
+  }
+
+  // Keep-side coverage for the documented `resume: true` payload, which
+  // routes/issues.ts always writes as the pair
   // `{ resumeIntent: true, followUpRequested: true }`. Each arm of the `||` gets
   // its own case so dropping one of them cannot stay green.
   for (const resumeField of ["resumeIntent", "followUpRequested"] as const) {

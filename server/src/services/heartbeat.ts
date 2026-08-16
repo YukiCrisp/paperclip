@@ -15428,23 +15428,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // would run an agent against a done/cancelled issue and re-arm the
         // execution predicates that amplified the 2026-08-05 blackout.
         //
-        // Comment-sourced wakes get no exemption here. Every production comment
-        // wake reason (`issue_commented` / `issue_comment_mentioned` /
-        // `issue_reopened_via_comment`) satisfies `allowsIssueInteractionWake`,
-        // so exempting them would mean this gate never fires on the shape that
-        // was actually reported — an agent's own comment starting a fresh run on
-        // a closed issue. The revivals worth keeping are the human ones, and the
-        // reopen branch above has already taken them off `done`/`cancelled` by
-        // the time we get here.
+        // A blanket `allowsIssueInteractionWake` exemption is wrong here: it
+        // covers every production comment reason (`issue_commented` /
+        // `issue_comment_mentioned` / `issue_reopened_via_comment`), so the gate
+        // would never fire on the shape that was actually reported — an agent's
+        // own comment starting a fresh run on a closed issue. The split the
+        // comment routes already make is the one to mirror:
+        //
+        //   - assignee `issue_commented` wakes are suppressed outright once the
+        //     issue is closed (routes/issues.ts:8791, :10372 —
+        //     `selfComment || isClosedIssueStatus(...)`), and an agent comment on
+        //     a closed issue creates no wake at all. A deferred one that only
+        //     survived because a run held the lock is the same class, so it is
+        //     discarded here rather than promoted.
+        //   - mention wakes are emitted with no closed-status guard
+        //     (routes/issues.ts:8830, :10436). A mention posted on an already
+        //     closed issue wakes the mentioned agent today; dropping the deferred
+        //     copy would deliver or lose the same message depending on whether
+        //     some unrelated run happened to hold the lock. Keep it.
         //
         // `resume: true` / `followUpRequested` stays exempt — that is the
         // documented way to restart follow-up work on a completed issue, and it
         // is the same predicate the claim-time terminal gate exempts.
         const deferredResumeIntent =
           deferredContextSeed.resumeIntent === true || deferredContextSeed.followUpRequested === true;
+        const deferredWakeIsMention = deferredWakeReason === "issue_comment_mentioned";
         if (
           (issue.status === "done" || issue.status === "cancelled") &&
-          !deferredResumeIntent
+          !deferredResumeIntent &&
+          !deferredWakeIsMention
         ) {
           await tx
             .update(agentWakeupRequests)
