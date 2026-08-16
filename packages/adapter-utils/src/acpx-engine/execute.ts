@@ -2799,10 +2799,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         ...classified,
         ...billingFields,
         model: prepared.requestedModel || null,
-        // A watchdog kill also drops the saved session id. The abandoned
-        // handshake is closed with `discardPersistentState`, so whatever it was
-        // resuming is gone; keeping the id would point the next run at a record
-        // that no longer exists.
+        // A watchdog kill also drops the saved session id — not because the
+        // record is known to be gone (it is discarded only when the abandoned
+        // handshake lands late AND the mode is persistent, while the case this
+        // watchdog exists for is the one that never lands at all), but because
+        // its state is unknowable from here: nothing can cancel the attempt, so
+        // it may still be writing that record after this run has returned.
+        // Starting the next run fresh is the only choice that does not depend
+        // on when a handshake we already gave up on decides to finish.
         clearSession: clearSession || isAcpxHandshakeTimeoutError(err),
         resultJson: { phase: "ensure_session" },
         summary: message,
