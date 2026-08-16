@@ -1047,7 +1047,20 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         + `use one of ${[...PRODUCTION_WAKE_REASONS].sort().join(", ")}.`,
       );
     }
-    return { issueId, wakeReason, ...(extras ?? {}) };
+    const context: Record<string, unknown> = { issueId, taskId: issueId, wakeReason, ...(extras ?? {}) };
+    // A deferred wake never stores the raw contextSnapshot its caller passed; it
+    // stores what `enrichWakeContextSnapshot` produced (heartbeat.ts:4409), and
+    // that writes the singular `commentId` / `wakeCommentId` alongside the array
+    // whenever any comment id is present. Seeding only the array is the same
+    // class of drift as the fake wakeReason: a shape production never emits,
+    // read by a different helper (`deriveCommentId`) than the one under test.
+    const commentIds = context.wakeCommentIds;
+    if (Array.isArray(commentIds) && commentIds.length > 0) {
+      const latest = commentIds[commentIds.length - 1];
+      context.commentId = latest;
+      context.wakeCommentId = latest;
+    }
+    return context;
   }
 
   async function seedTerminalIssueWithDeferredWake(input: {
