@@ -1446,6 +1446,127 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
   });
 
+  it("reports a stalled execution issue for a coalescing routine, whose skip streak never moves", async () => {
+    // ENGA-3040. The skip streak cannot see this failure: a coalesce is not a skip, so every
+    // tick *clears* the streak. Same stuck issue, same lost periods, opposite streak reading
+    // from the skip_if_active test above — which is why the stall is counted on the execution
+    // issue instead of on the routine's run labels.
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    expect(routine.concurrencyPolicy).toBe("coalesce_if_active");
+    const previousRunId = randomUUID();
+    const liveHeartbeatRunId = randomUUID();
+
+    const stuckIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "in_progress",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: new Date("2026-08-05T00:00:00.000Z"),
+      linkedIssueId: stuckIssue.id,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: liveHeartbeatRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: stuckIssue.id },
+      startedAt: new Date("2026-08-05T00:01:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: liveHeartbeatRunId,
+        executionRunId: liveHeartbeatRunId,
+        executionLockedAt: new Date("2026-08-05T00:01:00.000Z"),
+      })
+      .where(eq(issues.id, stuckIssue.id));
+
+    const beforeAnyFire = await svc.getDetail(routine.id);
+    // The run that created the issue carries the same linkedIssueId; it dispatched, so it
+    // must not be counted as a fire the issue swallowed.
+    expect(beforeAnyFire?.executionStall).toMatchObject({
+      suppressedRunCount: 0,
+      lastSuppressedAt: null,
+      threshold: 2,
+      alerting: false,
+    });
+    expect(beforeAnyFire?.executionStall?.since?.getTime()).toBe(stuckIssue.createdAt.getTime());
+
+    const firstCoalesce = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(firstCoalesce.status).toBe("coalesced");
+    expect(firstCoalesce.skipReason).toBeNull();
+
+    const afterFirst = await svc.getDetail(routine.id);
+    expect(afterFirst?.executionStall).toMatchObject({ suppressedRunCount: 1, alerting: false });
+    expect(afterFirst?.executionStall?.lastSuppressedAt).toBeInstanceOf(Date);
+    expect(afterFirst?.skipStreak).toMatchObject({ count: 0, alerting: false });
+
+    const secondCoalesce = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(secondCoalesce.status).toBe("coalesced");
+
+    const afterSecond = await svc.getDetail(routine.id);
+    expect(afterSecond?.executionStall).toMatchObject({
+      suppressedRunCount: 2,
+      threshold: 2,
+      alerting: true,
+    });
+    // The signal the streak alone would have missed: two periods lost, streak still zero.
+    expect(afterSecond?.skipStreak).toMatchObject({ count: 0, alerting: false });
+    expect(afterSecond?.executionStall?.since?.getTime()).toBe(stuckIssue.createdAt.getTime());
+
+    const listed = await svc.list(companyId);
+    expect(listed.find((item) => item.id === routine.id)?.executionStall).toMatchObject({
+      suppressedRunCount: 2,
+      alerting: true,
+    });
+
+    // A deliberate suppression records no linked issue, so it cannot inflate the count of
+    // fires this execution issue ate — the two are different failures and stay separate.
+    await db.insert(routineRuns).values({
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "schedule",
+      status: "skipped",
+      skipReason: "paused",
+      triggeredAt: new Date("2026-08-05T04:00:00.000Z"),
+      linkedIssueId: null,
+    });
+    const afterPausedSkip = await svc.getDetail(routine.id);
+    expect(afterPausedSkip?.executionStall?.suppressedRunCount).toBe(2);
+
+    // Finishing the stuck execution lets the next firing dispatch into a fresh issue, and the
+    // stall is read against that issue — so the alert clears without any counter reset.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed" })
+      .where(eq(heartbeatRuns.id, liveHeartbeatRunId));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, stuckIssue.id));
+
+    const dispatched = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(dispatched.status).toBe("issue_created");
+
+    const afterDispatch = await svc.getDetail(routine.id);
+    expect(afterDispatch?.activeIssue?.id).toBe(dispatched.linkedIssueId);
+    expect(afterDispatch?.executionStall).toMatchObject({ suppressedRunCount: 0, alerting: false });
+  });
+
   it("does not coalesce live routine runs with different resolved variables", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const variableRoutine = await svc.create(
