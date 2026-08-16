@@ -58,6 +58,7 @@ import {
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
+import { extractQuotaRetryNotBefore, isProviderQuotaText } from "@paperclipai/adapter-utils/quota-text";
 import {
   createAcpRuntime,
   createAgentRegistry,
@@ -2126,6 +2127,32 @@ function resultErrorMessage(result: AcpRuntimeTurnResult): string | null {
   return result.error.message;
 }
 
+/**
+ * Tag an exhausted provider quota so the server can park the issue until the
+ * limit clears instead of re-dispatching it into the same wall. Without this the
+ * acpx failure lands as a bare `acpx_turn_failed`, which the recovery path reads
+ * as a stranded issue and answers with a fresh run plus a recovery action — two
+ * runs per failure, repeated until the quota resets on its own.
+ *
+ * `errorMessage` is the only admissible input. It is the ACP runtime's own error
+ * object; the sibling `summary` field is `textParts.join("")`, i.e. the agent's
+ * assistant output, so gating on it would park an issue for an hour whenever an
+ * agent merely wrote "session limit" in a reply — most likely of all for an agent
+ * working on this very code path. The same argument, for the same reason, gates
+ * the connectivity classifier on the server side.
+ */
+function acpxProviderQuotaFields(
+  errorMessage: string | null | undefined,
+  nowMs: number,
+): Pick<AdapterExecutionResult, "errorFamily" | "retryNotBefore"> | Record<string, never> {
+  if (!isProviderQuotaText(errorMessage)) return {};
+  const retryAt = extractQuotaRetryNotBefore(errorMessage, new Date(nowMs));
+  return {
+    errorFamily: "provider_quota" as const,
+    ...(retryAt ? { retryNotBefore: retryAt.toISOString() } : {}),
+  };
+}
+
 function usageBreakdownsEqual(
   left: AcpRuntimeUsageBreakdown,
   right: AcpRuntimeUsageBreakdown,
@@ -3084,6 +3111,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             : timedOut
               ? "acpx_timeout"
               : null,
+        ...(timedOut || eventInactivityFired
+          ? {}
+          : acpxProviderQuotaFields(errorMessage, now())),
         sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
         sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
         sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -3152,6 +3182,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           : eventInactivityFired
             ? ACPX_EVENT_INACTIVITY_ERROR_CODE
             : classified.errorCode,
+        ...(timedOut || eventInactivityFired
+          ? {}
+          : acpxProviderQuotaFields(message, now())),
         errorMeta: classified.errorMeta,
         ...billingFields,
         model: prepared.requestedModel || null,

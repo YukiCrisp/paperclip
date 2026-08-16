@@ -262,6 +262,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { ACPX_EVENT_INACTIVITY_ERROR_CODE } from "@paperclipai/adapter-utils/acpx-engine/event-inactivity";
+import { isProviderQuotaText } from "@paperclipai/adapter-utils/quota-text";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -485,10 +486,10 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
 // acpx phase buckets. These are *generic* codes — the adapter's error classifier
 // falls back to them for any failure raised during `ensure_session`/`turn`, so a
 // real model-side turn failure lands on the same code as a host that cannot reach
-// the API. Mapping them to `transient_upstream` unconditionally would hide genuine
-// failures behind the retry ladder, so the codes only qualify together with the
-// message gate below.
-const ACPX_CONNECTIVITY_FAILURE_CODES = new Set<string>([
+// the API, and as one whose provider quota is exhausted. Mapping them to any one
+// family unconditionally would hide genuine failures behind that family's
+// handling, so the codes only ever qualify together with a message gate.
+const ACPX_PHASE_FAILURE_CODES = new Set<string>([
   "acpx_turn_failed",
   "acpx_session_init_failed",
 ]);
@@ -504,7 +505,7 @@ const ACPX_CONNECTIVITY_ERROR_RE =
 function isAcpxConnectivityFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode">,
 ) {
-  if (!run.errorCode || !ACPX_CONNECTIVITY_FAILURE_CODES.has(run.errorCode)) return false;
+  if (!run.errorCode || !ACPX_PHASE_FAILURE_CODES.has(run.errorCode)) return false;
   // `error` only. It is the adapter's own `errorMessage` — engine/protocol text — and
   // is the sole carrier that actually holds these strings in production (all 34 of the
   // observed outage runs matched on this column alone). Notably NOT `resultJson.summary`:
@@ -513,6 +514,22 @@ function isAcpxConnectivityFailure(
   // genuine turn failure as transient whenever the agent happened to write "ECONNREFUSED"
   // or "socket hang up" in its reply — most likely of all for an agent fixing this code.
   return typeof run.error === "string" && ACPX_CONNECTIVITY_ERROR_RE.test(run.error);
+}
+
+// Same shape, same reason as `isAcpxConnectivityFailure`: the phase buckets are
+// generic, so they only qualify together with a message gate, and the gate reads
+// `run.error` alone. `resultJson.summary` on this path is the agent's own
+// assistant output, so an agent that merely typed "session limit" in its reply
+// would otherwise park its own issue until the imagined reset.
+//
+// This is the backstop for runs whose adapter did not tag `errorFamily` itself
+// (an older adapter build, or a host that has not picked up the engine change):
+// the family is then derived server-side and the quota park still fires.
+function isAcpxProviderQuotaFailure(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode">,
+) {
+  if (!run.errorCode || !ACPX_PHASE_FAILURE_CODES.has(run.errorCode)) return false;
+  return typeof run.error === "string" && isProviderQuotaText(run.error);
 }
 
 export function readHeartbeatRunErrorFamily(
@@ -539,6 +556,12 @@ export function readHeartbeatRunErrorFamily(
     run.errorCode === ACPX_EVENT_INACTIVITY_ERROR_CODE
   ) {
     return "transient_upstream";
+  }
+  // Checked before the connectivity gate: an exhausted quota is not something a
+  // retry ladder can outrun, and reading it as `transient_upstream` would spend
+  // the ladder's attempts inside the closed window.
+  if (isAcpxProviderQuotaFailure(run)) {
+    return "provider_quota";
   }
   if (isAcpxConnectivityFailure(run)) {
     return "transient_upstream";
