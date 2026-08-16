@@ -1340,6 +1340,72 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
   });
 
+  // ENGA-2914: a leftover heartbeat run pointed at closed work must not keep a
+  // skip_if_active routine silent. This is the amplifier half of the 2026-08-05
+  // blackout (ENGA-2912): one stuck execution issue silently ate every fire.
+  for (const terminalStatus of ["done", "cancelled"] as const) {
+    it(`does not count a ${terminalStatus} execution issue as live even while a heartbeat run still points at it`, async () => {
+      const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+      const previousRunId = randomUUID();
+      const liveHeartbeatRunId = randomUUID();
+
+      await db
+        .update(routines)
+        .set({ concurrencyPolicy: "skip_if_active" })
+        .where(eq(routines.id, routine.id));
+
+      const closedIssue = await issueSvc.create(companyId, {
+        projectId: routine.projectId,
+        title: routine.title,
+        description: routine.description,
+        status: "in_progress",
+        priority: routine.priority,
+        assigneeAgentId: routine.assigneeAgentId,
+        originKind: "routine_execution",
+        originId: routine.id,
+        originRunId: previousRunId,
+      });
+
+      await db.insert(routineRuns).values({
+        id: previousRunId,
+        companyId,
+        routineId: routine.id,
+        triggerId: null,
+        source: "manual",
+        status: "issue_created",
+        triggeredAt: new Date("2026-08-05T00:00:00.000Z"),
+        linkedIssueId: closedIssue.id,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: liveHeartbeatRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: { issueId: closedIssue.id },
+        startedAt: new Date("2026-08-05T00:01:00.000Z"),
+      });
+      // The issue reaches a terminal status while the run row is still live —
+      // exactly the window ENGA-2914 observed unconsumed deferred wakes in.
+      await db
+        .update(issues)
+        .set({
+          status: terminalStatus,
+          checkoutRunId: liveHeartbeatRunId,
+          executionRunId: liveHeartbeatRunId,
+          executionLockedAt: new Date("2026-08-05T00:01:00.000Z"),
+        })
+        .where(eq(issues.id, closedIssue.id));
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+      expect(run.status).toBe("issue_created");
+      expect(run.skipReason).toBeNull();
+      expect(run.linkedIssueId).not.toBe(closedIssue.id);
+    });
+  }
+
   it("counts consecutive skips against a stuck execution issue and alerts once the streak crosses the threshold", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const previousRunId = randomUUID();

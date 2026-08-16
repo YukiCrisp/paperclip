@@ -1177,17 +1177,46 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
       gateway.releaseFirstWait();
 
-      // The deferred wake still promotes (so the agent gets the message), but
-      // the issue must remain `done` because the only referenced comment is
-      // self-authored by the run that is now ending.
-      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      // The issue must stay `done`: the only referenced comment is self-authored
+      // by the run that is now ending, so there is no reopen.
+      //
+      // ENGA-2914: the deferred wake is now discarded rather than promoted. It is
+      // an `issue_commented` wake, and a comment posted on an already-closed issue
+      // never produces one (routes/issues.ts:10372 suppresses the assignee wake on
+      // `selfComment || isClosedIssueStatus(...)`, and this comment is both). This
+      // one only existed because the issue was still open when it was written, and
+      // promoting it re-runs the agent against work it just closed — with its own
+      // message. `resume: true` is the documented way to restart follow-up work.
+      const readSelfCommentWake = async () => {
+        const rows = await db
+          .select({
+            status: agentWakeupRequests.status,
+            runId: agentWakeupRequests.runId,
+            error: agentWakeupRequests.error,
+            payload: agentWakeupRequests.payload,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+            ),
+          );
+        return rows.find((row) => (row.payload as { commentId?: string } | null)?.commentId === selfComment.id)
+          ?? null;
+      };
+      await waitFor(async () => (await readSelfCommentWake())?.status === "cancelled", 90_000);
+      const selfCommentWake = await readSelfCommentWake();
+      expect(selfCommentWake?.runId).toBeNull();
+      expect(selfCommentWake?.error).toContain("terminal status");
       await waitFor(async () => {
         const runs = await db
           .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        return runs.length === 1 && runs.every((run) => run.status === "succeeded");
       }, 90_000);
+      expect(gateway.getAgentPayloads().length).toBe(1);
 
       const issueAfterPromotion = await db
         .select({

@@ -11413,6 +11413,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload: staleness.details,
     });
 
+    // Cancelling the holder frees the issue, so the wakes that were parked
+    // behind it have to be resolved here too — the same way the daily-cap gate
+    // does it. Without this they sit in `deferred_issue_execution` with no run
+    // and no finish time, because nothing else will ever release this issue.
+    // Terminal issues discard their leftovers inside the promotion loop.
+    await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
+
     return cancelled;
   }
 
@@ -15412,6 +15419,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             };
           }
+        }
+
+        // A wake stacked while this run held the execution lock must not turn
+        // into execution on work the run closed on its way out. The reopen
+        // branch above already moved every legitimate revival off the terminal
+        // status, so anything still terminal here is a leftover: promoting it
+        // would run an agent against a done/cancelled issue and re-arm the
+        // execution predicates that amplified the 2026-08-05 blackout.
+        //
+        // A blanket `allowsIssueInteractionWake` exemption is wrong here: it
+        // covers every production comment reason (`issue_commented` /
+        // `issue_comment_mentioned` / `issue_reopened_via_comment`), so the gate
+        // would never fire on the shape that was actually reported — an agent's
+        // own comment starting a fresh run on a closed issue. The split the
+        // comment routes already make is the one to mirror:
+        //
+        //   - assignee `issue_commented` wakes are suppressed outright once the
+        //     issue is closed (routes/issues.ts:8791, :10372 —
+        //     `selfComment || isClosedIssueStatus(...)`), and an agent comment on
+        //     a closed issue creates no wake at all. A deferred one that only
+        //     survived because a run held the lock is the same class, so it is
+        //     discarded here rather than promoted.
+        //   - mention wakes are emitted with no closed-status guard
+        //     (routes/issues.ts:8830, :10436). A mention posted on an already
+        //     closed issue wakes the mentioned agent today; dropping the deferred
+        //     copy would deliver or lose the same message depending on whether
+        //     some unrelated run happened to hold the lock. Keep it.
+        //
+        // `resume: true` / `followUpRequested` stays exempt — that is the
+        // documented way to restart follow-up work on a completed issue, and it
+        // is the same predicate the claim-time terminal gate exempts.
+        const deferredResumeIntent =
+          deferredContextSeed.resumeIntent === true || deferredContextSeed.followUpRequested === true;
+        const deferredWakeIsMention = deferredWakeReason === "issue_comment_mentioned";
+        if (
+          (issue.status === "done" || issue.status === "cancelled") &&
+          !deferredResumeIntent &&
+          !deferredWakeIsMention
+        ) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: `Deferred wake discarded because issue reached terminal status (${issue.status})`,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
         }
 
         const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
