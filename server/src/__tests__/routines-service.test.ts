@@ -1567,6 +1567,27 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(afterDispatch?.executionStall).toMatchObject({ suppressedRunCount: 0, alerting: false });
   });
 
+  it("answers no live execution issue with a present null, on both surfaces and through JSON", async () => {
+    // ENGA-3315 hand-off. `null` is the healthy answer here, so a reader cannot tell "no
+    // execution issue is live" from "this build predates the field" by the value — only by
+    // whether the key is there. `res.json` keeps `null` but drops `undefined`, so answering
+    // the healthy case with `undefined` (or with a zeroed object) would either erase the
+    // discriminator or make healthy look like a stall that has not started yet.
+    const { companyId, routine, svc } = await seedFixture();
+
+    const detail = await svc.getDetail(routine.id);
+    expect(detail?.activeIssue).toBeNull();
+    expect(detail).toHaveProperty("executionStall", null);
+
+    const listed = (await svc.list(companyId)).find((item) => item.id === routine.id);
+    expect(listed?.activeIssue).toBeNull();
+    expect(listed).toHaveProperty("executionStall", null);
+
+    // What the API body actually carries, which is all the reader gets to look at.
+    expect(JSON.parse(JSON.stringify(detail))).toHaveProperty("executionStall", null);
+    expect(JSON.parse(JSON.stringify(listed))).toHaveProperty("executionStall", null);
+  });
+
   it("does not coalesce live routine runs with different resolved variables", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const variableRoutine = await svc.create(
